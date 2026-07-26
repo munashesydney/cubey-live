@@ -21,7 +21,8 @@ REACT_FUNCTION_DECLARATION = types.FunctionDeclaration(
                 description=(
                     "The visual reaction type to express on the display: "
                     "'hurt' (when kicked or damaged), 'alert' (when obstacle detected or moved), "
-                    "'happy' (warm/friendly), 'low_battery' (power low), or 'normal'."
+                    "'happy' (warm/friendly), 'surprised' (shocked/unexpected), "
+                    "'skeptical' (confused/questioning), 'low_battery' (power low), or 'normal'."
                 ),
             )
         },

@@ -144,6 +144,8 @@ class DeveloperWindow(ctk.CTkToplevel):
             ("🔋 CRITICAL BATTERY 5%", "[CRITICAL BATTERY 5%]", "#CBA6F7", "#CA9EE6"),
             ("💦 WATER SPILLED", "[WATER SPILLED ON SENSORS]", "#89B4FA", "#85C1DC"),
             ("✋ HUMAN WAVING", "[HUMAN WAVING HAND]", "#A6E3A1", "#81C8BE"),
+            ("😮 SURPRISED / SHOCKED", "[SURPRISE GIFT GIVEN]", "#74C7EC", "#89DCEB"),
+            ("🤨 TRICK QUESTION", "[HUMAN ASKS TRICK QUESTION]", "#F2CDCD", "#F5E0DC"),
         ]
 
         for idx, (label, payload, color, hover_color) in enumerate(events):
