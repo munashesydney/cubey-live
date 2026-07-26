@@ -1,16 +1,18 @@
 """
 Cubeo Robot Face Screen module.
-Delegates all visual rendering, blinking, and emotional state changes to EyeAnimationEngine.
+High-performance 2x Super-Sampled PIL Anti-Aliased Graphics Engine rendering silky smooth,
+commercial-grade solid white capsule eyes with perfect circular black pupils.
 """
 
 import tkinter as tk
 import customtkinter as ctk
+from PIL import Image, ImageDraw, ImageTk
 from typing import Callable, Optional
 
 from src.gui.screens.animations import EyeAnimationEngine
 
 class RobotFaceScreen(ctk.CTkFrame):
-    """Screen displaying Cubeo's animated OLED robot face."""
+    """Screen displaying Cubeo's animated OLED robot face with 2x SSAA anti-aliased Pillow rendering."""
 
     def __init__(self, master, on_open_developer_console: Optional[Callable[[], None]] = None, **kwargs):
         super().__init__(master, fg_color="#0A0A0F", corner_radius=0, **kwargs)
@@ -22,6 +24,9 @@ class RobotFaceScreen(ctk.CTkFrame):
 
         # Instantiate Animation Engine
         self.animation_engine = EyeAnimationEngine(redraw_callback=self._draw_face)
+
+        # Image cache reference for Tkinter Garbage Collector
+        self._tk_img: Optional[ImageTk.PhotoImage] = None
 
         # Create 100% full-bleed drawing canvas
         self.canvas = tk.Canvas(
@@ -66,7 +71,7 @@ class RobotFaceScreen(ctk.CTkFrame):
     def _schedule_random_blink(self) -> None:
         """Schedule random eye blink."""
         import random
-        delay_ms = int(random.uniform(2500, 5000))
+        delay_ms = int(random.uniform(2800, 5200))
         self.after(delay_ms, self._trigger_blink)
 
     def _trigger_blink(self) -> None:
@@ -80,60 +85,80 @@ class RobotFaceScreen(ctk.CTkFrame):
         self.after(16, self._animation_loop)
 
     def _draw_face(self) -> None:
-        """Draw Cubeo capsule eyes on canvas based on animation engine parameters."""
-        self.canvas.delete("all")
-
+        """Render ultra-crisp 2x super-sampled anti-aliased PIL image of Cubeo eyes onto canvas."""
         w = self.canvas.winfo_width()
         h = self.canvas.winfo_height()
 
-        if w <= 1 or h <= 1:
+        if w <= 10 or h <= 10:
             return
 
-        left_center_x = w * 0.38
-        right_center_x = w * 0.62
-        center_y = h * 0.50
+        # 2x Super-Sampling factor for silky smooth subpixel anti-aliasing
+        scale = 2
+        sw = w * scale
+        sh = h * scale
 
-        scale_factor = min(w / 1104.0, h / 631.0)
-        scale_factor = max(0.4, scale_factor)
+        # Create PIL high-resolution canvas
+        pil_img = Image.new("RGBA", (sw, sh), (10, 10, 15, 255))
+        draw = ImageDraw.Draw(pil_img)
 
-        eye_w = self.base_eye_width * scale_factor
+        # Scale eye dimensions
+        base_scale = min(w / 1104.0, h / 631.0)
+        base_scale = max(0.4, base_scale)
+
+        eye_w = self.base_eye_width * base_scale * scale
         eye_h = max(
-            6,
-            self.base_eye_height * scale_factor * self.animation_engine.height_pct * self.animation_engine.height_scale_mult
+            8 * scale,
+            self.base_eye_height * base_scale * scale * self.animation_engine.effective_height_scale
         )
+
+        # Apply Micro-Gaze Saccades and Pain Jitter offsets
+        gaze_x = (self.animation_engine.gaze_offset_x + self.animation_engine.jitter_offset_x) * scale
+        gaze_y = (self.animation_engine.gaze_offset_y + self.animation_engine.jitter_offset_y) * scale
+
+        left_cx = (w * 0.38 * scale) + gaze_x
+        right_cx = (w * 0.62 * scale) + gaze_x
+        cy = (h * 0.50 * scale) + gaze_y
 
         color = self.animation_engine.current_color
         core_color = self.animation_engine.current_core_color
 
-        self._draw_capsule_eye(left_center_x, center_y, eye_w, eye_h, color, core_color)
-        self._draw_capsule_eye(right_center_x, center_y, eye_w, eye_h, color, core_color)
+        # Draw eyes on high-res PIL canvas
+        self._draw_pil_capsule_eye(draw, left_cx, cy, eye_w, eye_h, color, core_color)
+        self._draw_pil_capsule_eye(draw, right_cx, cy, eye_w, eye_h, color, core_color)
 
-    def _draw_capsule_eye(self, cx: float, cy: float, width: float, height: float, color: str, core_color: str) -> None:
-        """Draw capsule shape centered at (cx, cy)."""
+        # Downsample to target size with Lanczos anti-aliasing filter
+        final_img = pil_img.resize((w, h), resample=Image.Resampling.LANCZOS)
+        
+        self._tk_img = ImageTk.PhotoImage(final_img)
+        self.canvas.delete("all")
+        self.canvas.create_image(0, 0, image=self._tk_img, anchor="nw")
+
+    def _draw_pil_capsule_eye(
+        self,
+        draw: ImageDraw.ImageDraw,
+        cx: float,
+        cy: float,
+        width: float,
+        height: float,
+        color: str,
+        core_color: str
+    ) -> None:
+        """Draw clean, borderless rounded capsule eye with circular black pupil."""
         x1 = cx - width / 2
         y1 = cy - height / 2
         x2 = cx + width / 2
         y2 = cy + height / 2
 
-        r = min(width / 2, height / 2)
+        radius = min(width / 2, height / 2)
 
-        if height <= width:
-            self.canvas.create_oval(x1, y1, x2, y2, fill=color, outline="")
-        else:
-            self.canvas.create_oval(x1, y1, x2, y1 + width, fill=color, outline="")
-            self.canvas.create_oval(x1, y2 - width, x2, y2, fill=color, outline="")
-            self.canvas.create_rectangle(x1, y1 + r, x2, y2 - r, fill=color, outline="")
+        # Layer 1: Solid White (or emotion color) Rounded Capsule
+        draw.rounded_rectangle([x1, y1, x2, y2], radius=radius, fill=color)
 
-            core_w = width * 0.4
-            core_h = max(4, (height - width) * 0.5)
-            self.canvas.create_rectangle(
-                cx - core_w / 2,
-                cy - core_h / 2,
-                cx + core_w / 2,
-                cy + core_h / 2,
-                fill=core_color,
-                outline=""
-            )
+        # Layer 2: Perfect Circular Black Pupil
+        if height > width * 0.4:
+            pupil_diameter = width * 0.42
+            pr = pupil_diameter / 2.0
+            draw.ellipse([cx - pr, cy - pr, cx + pr, cy + pr], fill=core_color)
 
     def trigger_reaction(self, reaction_type: str) -> None:
         """Trigger an emotional eye reaction using EyeAnimationEngine."""
