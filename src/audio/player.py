@@ -21,8 +21,14 @@ class AudioPlayer:
         self.audio_queue: queue.Queue[bytes] = queue.Queue()
         self.stream: Optional[sd.RawOutputStream] = None
         self.is_playing = False
+        self._is_actively_speaking = False
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
+
+    @property
+    def is_speaking(self) -> bool:
+        """Returns True if speakers are actively playing audio or have queued audio chunks."""
+        return self.is_playing and (self._is_actively_speaking or not self.audio_queue.empty())
 
     def start(self) -> None:
         """Start the speaker audio playback thread with low-latency settings."""
@@ -30,6 +36,7 @@ class AudioPlayer:
             return
             
         self.is_playing = True
+        self._is_actively_speaking = False
         self._stop_event.clear()
         
         try:
@@ -53,6 +60,7 @@ class AudioPlayer:
     def stop(self) -> None:
         """Stop playback thread and close output stream."""
         self.is_playing = False
+        self._is_actively_speaking = False
         self._stop_event.set()
         self.clear()
         
@@ -76,6 +84,7 @@ class AudioPlayer:
 
     def clear(self) -> None:
         """Instant Interruption (Barge-in): Flush all enqueued audio chunks immediately."""
+        self._is_actively_speaking = False
         count = 0
         while not self.audio_queue.empty():
             try:
@@ -84,7 +93,8 @@ class AudioPlayer:
                 count += 1
             except queue.Empty:
                 break
-        logger.info("Instant Interruption: Cleared %d buffered audio chunks from player queue.", count)
+        if count > 0:
+            logger.info("Instant Interruption: Cleared %d buffered audio chunks from player queue.", count)
 
     def _playback_loop(self) -> None:
         """Worker thread continuously reading audio chunks from queue and writing to speakers."""
@@ -92,10 +102,13 @@ class AudioPlayer:
             try:
                 chunk = self.audio_queue.get(timeout=0.05)
                 if chunk and self.stream and self.is_playing:
+                    self._is_actively_speaking = True
                     self.stream.write(chunk)
                 self.audio_queue.task_done()
             except queue.Empty:
+                self._is_actively_speaking = False
                 continue
             except Exception as e:
+                self._is_actively_speaking = False
                 if self.is_playing:
                     logger.error("Error writing audio chunk to speaker: %s", e)

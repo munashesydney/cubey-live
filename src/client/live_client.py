@@ -1,11 +1,13 @@
 """
 Gemini Multimodal Live API Client using google-genai SDK.
-Handles real-time audio streaming, AI tool calls (react tool), response handling, and text interruptions.
+Handles real-time audio streaming, AI tool calls (react tool), response handling,
+text interruptions, and Volume-Thresholded Acoustic Echo Gating for barge-in.
 """
 
 import asyncio
 import logging
 import time
+import numpy as np
 from typing import Callable, Optional
 from google import genai
 from google.genai import types
@@ -24,8 +26,18 @@ ROBOT_SYSTEM_INSTRUCTION = (
     "CRITICAL TOOL INSTRUCTION: You have access to the 'react' tool. Whenever you experience physical "
     "interactions or physical event text in brackets like [HUMAN KICKED YOU], [OBSTACLE IN PATH], "
     "[WATER SPILLED ON SENSORS], or [CRITICAL BATTERY 5%], you MUST autonomously call the 'react' tool "
-    "with the corresponding reaction_type ('hurt', 'alert', 'happy', 'low_battery') AND speak your reaction out loud."
+    "with the corresponding reaction_type ('hurt', 'alert', 'happy', 'surprised', 'skeptical', 'low_battery') AND speak your reaction out loud."
 )
+
+def compute_pcm_rms(audio_data: bytes) -> float:
+    """Calculate RMS volume level of 16-bit PCM mono audio chunk (0.0 to 1.0)."""
+    if not audio_data:
+        return 0.0
+    arr = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32)
+    if len(arr) == 0:
+        return 0.0
+    rms = np.sqrt(np.mean(arr ** 2)) / 32768.0
+    return float(rms)
 
 class GeminiLiveClient:
     """Manages WebSocket connection to Gemini Multimodal Live API with Tool Calling."""
@@ -55,6 +67,9 @@ class GeminiLiveClient:
         self._stop_event = asyncio.Event()
 
         self._pause_mic_until: float = 0.0
+
+        # Minimum RMS volume threshold required to interrupt AI while AI is speaking
+        self.voice_interruption_threshold = 0.12
 
         # Initialize official GenAI client
         self.genai_client = genai.Client(
@@ -86,7 +101,6 @@ class GeminiLiveClient:
         self._stop_event.clear()
         self.set_status("Connecting to Gemini Live API...")
 
-        # Configure Live API connection parameters with AI Tool Registration
         try:
             live_config = types.LiveConnectConfig(
                 response_modalities=[types.Modality.AUDIO],
@@ -188,14 +202,29 @@ class GeminiLiveClient:
             self.log(f"❌ Failed to send text payload: {e}")
 
     async def _send_audio_loop(self) -> None:
-        """Task continuously reading mic PCM chunks and streaming to WebSocket."""
+        """
+        Task continuously reading mic PCM chunks and streaming to WebSocket.
+        Applies Volume-Thresholded Mic Gating while AI speaker is actively playing.
+        """
         try:
             while self.is_connected and self._session is not None:
                 audio_data = await self.recorder.audio_queue.get()
                 
+                # Check mic pause window (after text interruption dispatch)
                 if time.time() < self._pause_mic_until:
                     self.recorder.audio_queue.task_done()
                     continue
+
+                # Threshold mic gate while AI speaker is actively playing audio
+                if self.player.is_speaking:
+                    rms = compute_pcm_rms(audio_data)
+                    # If RMS is below threshold (0.12), drop chunk to suppress speaker echo feedback.
+                    # If RMS >= 0.12, genuine human voice is speaking loud enough to interrupt!
+                    if rms < self.voice_interruption_threshold:
+                        self.recorder.audio_queue.task_done()
+                        continue
+                    else:
+                        self.log(f"🎙️ [Human Voice Interruption] Mic RMS {rms:.3f} >= {self.voice_interruption_threshold}")
 
                 if audio_data and self._session:
                     await self._session.send_realtime_input(
