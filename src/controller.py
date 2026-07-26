@@ -106,7 +106,10 @@ class ApplicationController:
             self.client.stop_session()
 
     def send_interruption(self, text_payload: str) -> None:
-        """Schedule instant text interruption on background asyncio thread."""
+        """Schedule instant text interruption on background asyncio thread and trigger GUI face reaction."""
+        if self.gui and self.gui.winfo_exists():
+            self.gui.trigger_robot_reaction(text_payload)
+
         if self.client and self.async_loop and self.async_loop.is_running():
             asyncio.run_coroutine_threadsafe(
                 self.client.interrupt_with_text(text_payload),
