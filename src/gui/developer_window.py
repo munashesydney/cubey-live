@@ -234,29 +234,45 @@ class DeveloperWindow(ctk.CTkToplevel):
 
     def set_status(self, status: str) -> None:
         """Thread-safe update to connection status."""
-        self.status_label.configure(text=f"Status: {status}")
-        if "Connected" in status or "Live" in status:
-            self.is_session_active = True
-        elif "Disconnected" in status or "Idle" in status:
-            self.is_session_active = False
-        self._update_session_button_state()
+        try:
+            if self.winfo_exists():
+                self.status_label.configure(text=f"Status: {status}")
+                if "Connected" in status or "Live" in status:
+                    self.is_session_active = True
+                elif "Disconnected" in status or "Idle" in status:
+                    self.is_session_active = False
+                self._update_session_button_state()
+        except Exception:
+            pass
 
     def update_mic_level(self, level: float) -> None:
         """Thread-safe update to mic volume meter."""
-        self.mic_meter.set(level)
+        try:
+            if self.winfo_exists() and hasattr(self, 'mic_meter') and self.mic_meter.winfo_exists():
+                self.mic_meter.set(level)
+        except Exception:
+            pass
 
     def append_transcript(self, role: str, text: str) -> None:
         """Thread-safe append to transcript text box."""
-        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-        formatted = f"[{timestamp}] {role}: {text}\n"
-        self.transcript_box.insert("end", formatted)
-        self.transcript_box.see("end")
+        try:
+            if self.winfo_exists() and hasattr(self, 'transcript_box') and self.transcript_box.winfo_exists():
+                timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+                formatted = f"[{timestamp}] {role}: {text}\n"
+                self.transcript_box.insert("end", formatted)
+                self.transcript_box.see("end")
+        except Exception:
+            pass
 
     def append_log(self, message: str) -> None:
         """Thread-safe append to system log box."""
-        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-        self.log_box.insert("end", f"[{timestamp}] {message}\n")
-        self.log_box.see("end")
+        try:
+            if self.winfo_exists() and hasattr(self, 'log_box') and self.log_box.winfo_exists():
+                timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+                self.log_box.insert("end", f"[{timestamp}] {message}\n")
+                self.log_box.see("end")
+        except Exception:
+            pass
 
     def _update_session_button_state(self) -> None:
         """Update button appearance based on session state."""

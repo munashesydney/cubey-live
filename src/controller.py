@@ -125,8 +125,11 @@ class ApplicationController:
 
     def _on_mic_level_changed(self, level: float) -> None:
         """Callback from audio recorder (runs thread-safely)."""
-        if self.gui and self.gui.winfo_exists():
-            self.gui.update_mic_level(level)
+        try:
+            if self.gui and self.gui.winfo_exists():
+                self.gui.update_mic_level(level)
+        except Exception:
+            pass
 
     def _on_status_changed(self, status: str) -> None:
         """Callback when Live client connection status changes."""
