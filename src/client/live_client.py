@@ -1,6 +1,6 @@
 """
 Gemini Multimodal Live API Client using google-genai SDK.
-Handles real-time audio streaming, response handling, and text interruptions (barge-in).
+Handles real-time audio streaming, AI tool calls (react tool), response handling, and text interruptions.
 """
 
 import asyncio
@@ -13,22 +13,22 @@ from google.genai import types
 from src.config import AppConfig
 from src.audio.recorder import AudioRecorder
 from src.audio.player import AudioPlayer
+from src.client.tools import REACT_TOOL_DECLARATION, execute_react_tool
 
 logger = logging.getLogger(__name__)
 
-# System instruction for the robot AI persona with strict interruption handling
+# System instruction instructing Gemini to call the 'react' tool autonomously
 ROBOT_SYSTEM_INSTRUCTION = (
     "You are an AI embodied in a physical robot agent. You communicate naturally using speech. "
     "Respond concisely, warmly, and expressively in real time. "
-    "CRITICAL INSTRUCTION: Whenever you receive any physical event enclosed in brackets, "
-    "such as [HUMAN KICKED YOU], [OBSTACLE IN PATH], [WATER SPILLED ON SENSORS], or [HUMAN MOVED OUT OF FRAME], "
-    "you MUST IMMEDIATELY cut off whatever you were talking about and react out loud in spoken voice "
-    "right away to that specific incident (e.g. 'OUCH! Why did you kick me?!' or 'Whoa, an obstacle!'). "
-    "Always speak your reaction out loud with high emotion and expressiveness."
+    "CRITICAL TOOL INSTRUCTION: You have access to the 'react' tool. Whenever you experience physical "
+    "interactions or physical event text in brackets like [HUMAN KICKED YOU], [OBSTACLE IN PATH], "
+    "[WATER SPILLED ON SENSORS], or [CRITICAL BATTERY 5%], you MUST autonomously call the 'react' tool "
+    "with the corresponding reaction_type ('hurt', 'alert', 'happy', 'low_battery') AND speak your reaction out loud."
 )
 
 class GeminiLiveClient:
-    """Manages WebSocket connection to Gemini Multimodal Live API."""
+    """Manages WebSocket connection to Gemini Multimodal Live API with Tool Calling."""
 
     def __init__(
         self,
@@ -36,8 +36,9 @@ class GeminiLiveClient:
         recorder: AudioRecorder,
         player: AudioPlayer,
         on_status_change: Optional[Callable[[str], None]] = None,
-        on_transcript: Optional[Callable[[str, str], None]] = None, # role, text
+        on_transcript: Optional[Callable[[str, str], None]] = None,
         on_log: Optional[Callable[[str], None]] = None,
+        on_tool_reaction: Optional[Callable[[str], None]] = None,
     ):
         self.config = config
         self.recorder = recorder
@@ -45,6 +46,7 @@ class GeminiLiveClient:
         self.on_status_change = on_status_change
         self.on_transcript = on_transcript
         self.on_log = on_log
+        self.on_tool_reaction = on_tool_reaction
 
         self.is_connected = False
         self._session = None
@@ -52,10 +54,9 @@ class GeminiLiveClient:
         self._tasks: list[asyncio.Task] = []
         self._stop_event = asyncio.Event()
 
-        # Temporary pause flag to prevent mic noise collision during text interruption
         self._pause_mic_until: float = 0.0
 
-        # Initialize official GenAI client with v1alpha options for Live API
+        # Initialize official GenAI client
         self.genai_client = genai.Client(
             api_key=self.config.api_key,
             http_options={'api_version': 'v1alpha'}
@@ -85,10 +86,11 @@ class GeminiLiveClient:
         self._stop_event.clear()
         self.set_status("Connecting to Gemini Live API...")
 
-        # Configure Live API connection parameters
+        # Configure Live API connection parameters with AI Tool Registration
         try:
             live_config = types.LiveConnectConfig(
                 response_modalities=[types.Modality.AUDIO],
+                tools=[REACT_TOOL_DECLARATION],  # Register react tool
                 speech_config=types.SpeechConfig(
                     voice_config=types.VoiceConfig(
                         prebuilt_voice_config=types.PrebuiltVoiceConfig(
@@ -107,7 +109,7 @@ class GeminiLiveClient:
             return
 
         try:
-            self.log(f"Initiating WebSocket connection (Model: {self.config.model})...")
+            self.log(f"Initiating WebSocket connection with Tool Use (Model: {self.config.model})...")
             async with self.genai_client.aio.live.connect(
                 model=self.config.model,
                 config=live_config
@@ -115,7 +117,7 @@ class GeminiLiveClient:
                 self._session = session
                 self.is_connected = True
                 self.set_status("Connected & Live 🟢")
-                self.log(f"Connected to model '{self.config.model}' with voice '{self.config.voice_name}'")
+                self.log(f"Connected to model '{self.config.model}' with registered 'react' tool.")
 
                 # Start audio recorder and player
                 self.player.start()
@@ -126,7 +128,6 @@ class GeminiLiveClient:
                 receive_task = asyncio.create_task(self._receive_responses_loop())
                 self._tasks = [send_task, receive_task]
 
-                # Wait until session stop requested or task fails
                 await self._stop_event.wait()
                 self.log("Stopping Live session tasks...")
                 
@@ -159,29 +160,22 @@ class GeminiLiveClient:
 
     async def interrupt_with_text(self, text_payload: str) -> None:
         """
-        Instant Text Interruption (Barge-in):
-        1. Instantly flushes current speaker audio queue (<10ms cutoff).
-        2. Briefly pauses mic audio stream to prevent ambient noise collision.
-        3. Sends LiveClientContent payload over WebSocket with turn_complete=True.
-        4. Forces Gemini to immediately react out loud in speech to the event.
+        Send text interruption context to Gemini Live:
+        Gemini receives the event and decides autonomously whether to invoke the 'react' tool.
         """
         if not self.is_connected or self._session is None:
             self.log("⚠️ Cannot send interruption: Live session is not connected.")
             return
 
-        # 1. Flush local speaker playback buffer immediately
         self.player.clear()
-        
-        # 2. Briefly pause microphone audio sending (500ms) to ensure clean turn boundary
         self._pause_mic_until = time.time() + 0.5
         
-        self.log(f"⚡ [INTERRUPTION TRIGGERED]: '{text_payload}'")
+        self.log(f"⚡ [EVENT CONTEXT SENT TO AI]: '{text_payload}'")
 
         if self.on_transcript:
             self.on_transcript("User Event", f"⚡ {text_payload}")
 
         try:
-            # 3. Send text interruption (ClientContent) over open WebSocket using SDK's dedicated method
             await self._session.send_client_content(
                 turns=types.Content(
                     role="user",
@@ -189,9 +183,9 @@ class GeminiLiveClient:
                 ),
                 turn_complete=True
             )
-            self.log("Sent client content interruption payload to Gemini Live API.")
+            self.log("Sent client content payload to Gemini Live API.")
         except Exception as e:
-            self.log(f"❌ Failed to send text interruption: {e}")
+            self.log(f"❌ Failed to send text payload: {e}")
 
     async def _send_audio_loop(self) -> None:
         """Task continuously reading mic PCM chunks and streaming to WebSocket."""
@@ -199,7 +193,6 @@ class GeminiLiveClient:
             while self.is_connected and self._session is not None:
                 audio_data = await self.recorder.audio_queue.get()
                 
-                # Check if mic audio sending is temporarily paused for text interruption
                 if time.time() < self._pause_mic_until:
                     self.recorder.audio_queue.task_done()
                     continue
@@ -215,19 +208,49 @@ class GeminiLiveClient:
             self.log(f"Error in send audio loop: {e}")
 
     async def _receive_responses_loop(self) -> None:
-        """Task receiving real-time audio responses from WebSocket."""
+        """Task receiving real-time audio responses and processing incoming AI tool calls."""
         try:
             while self.is_connected and self._session is not None:
                 async for response in self._session.receive():
+                    # Handle AI Tool Calls (Function Calling)
+                    tool_call = response.tool_call
+                    if tool_call is not None:
+                        for fn_call in tool_call.function_calls:
+                            if fn_call.name == "react":
+                                args = fn_call.args or {}
+                                reaction_type = args.get("reaction_type", "hurt")
+                                
+                                self.log(f"🔧 [AI Tool Call]: react(reaction_type='{reaction_type}')")
+                                
+                                # Execute react tool logic
+                                result_dict = execute_react_tool(
+                                    reaction_type=reaction_type,
+                                    on_trigger_reaction=self._dispatch_tool_reaction
+                                )
+
+                                # Return tool response frame back over WebSocket
+                                try:
+                                    await self._session.send_tool_response(
+                                        function_responses=[
+                                            types.FunctionResponse(
+                                                name=fn_call.name,
+                                                id=fn_call.id,
+                                                response=result_dict
+                                            )
+                                        ]
+                                    )
+                                    self.log(f"✓ Returned tool_response for '{fn_call.name}'")
+                                except Exception as tool_err:
+                                    self.log(f"❌ Error sending tool response: {tool_err}")
+
                     server_content = response.server_content
                     if server_content is None:
                         continue
 
-                    # Handle model speech / audio turn
+                    # Handle model speech turn
                     model_turn = server_content.model_turn
                     if model_turn is not None:
                         for part in model_turn.parts:
-                            # Audio PCM chunk
                             if part.inline_data and part.inline_data.data:
                                 self.player.play_chunk(part.inline_data.data)
 
@@ -236,10 +259,12 @@ class GeminiLiveClient:
                         self.player.clear()
                         self.log("⚡ [Server Barge-in Detected] Gemini cut off generation.")
 
-                    if server_content.turn_complete:
-                        logger.debug("Turn complete.")
-
         except asyncio.CancelledError:
             pass
         except Exception as e:
             self.log(f"Error in receive responses loop: {e}")
+
+    def _dispatch_tool_reaction(self, reaction_type: str) -> None:
+        """Thread-safely dispatch tool reaction to GUI on main thread."""
+        if self.on_tool_reaction and self._loop:
+            self._loop.call_soon_threadsafe(self.on_tool_reaction, reaction_type)

@@ -1,6 +1,7 @@
 """
 CustomTkinter GUI Shell for Gemini Live Robot.
-Features Top Navigation Bar switching between Cubeo Robot Face and Developers Dashboard.
+Renders a 100% full-bleed OLED Cubeo Robot Face with strict 110.4 : 63.1 aspect ratio locking.
+Opens dedicated Developer Control Window via corner button, right-click, or 'D' hotkey.
 """
 
 import asyncio
@@ -9,8 +10,8 @@ import customtkinter as ctk
 from typing import Callable, Optional
 
 from src.config import AppConfig
-from src.gui.components import HeaderToolbar, StatusBar
-from src.gui.screens import RobotFaceScreen, DeveloperScreen
+from src.gui.screens.robot_face_screen import RobotFaceScreen
+from src.gui.developer_window import DeveloperWindow
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +20,7 @@ ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
 class GeminiLiveApp(ctk.CTk):
-    """Main CustomTkinter GUI application with view navigation and component layout."""
+    """Main CustomTkinter GUI application enforcing 110.4:63.1 aspect ratio."""
 
     def __init__(
         self,
@@ -36,139 +37,82 @@ class GeminiLiveApp(ctk.CTk):
         self.on_stop_session = on_stop_session
         self.on_send_interruption = on_send_interruption
 
-        # Window settings
-        self.title("🤖 Cubeo - Gemini Live Robot Simulator")
-        self.geometry("1100 x 740")
-        self.minsize(950, 620)
+        # Window title & initial resolution (110.4 : 63.1 ratio)
+        self.title("🤖 Cubeo Robot Face")
+        self.geometry("1104x631")
+        self.minsize(552, 316)
+
+        # Enforce native OS aspect ratio lock (1104:631) from all corners
+        try:
+            self.aspect(1104, 631, 1104, 631)
+        except Exception as e:
+            logger.warning("Native aspect ratio lock warning: %s", e)
 
         # Internal state
         self.is_session_active = False
-        self.current_screen_name = "ROBOT_FACE"
+        self.is_muted = False
+        self.dev_window: Optional[DeveloperWindow] = None
 
-        # Build UI layout with modular components
-        self._create_header_component()
-        self._create_navigation_bar()
-        self._create_screen_container()
-        self._create_status_bar_component()
-
-        # Show default main screen (Robot Face)
-        self.show_screen("ROBOT_FACE")
-
-    def _create_header_component(self) -> None:
-        """Create modular top header toolbar component."""
-        self.header_toolbar = HeaderToolbar(
+        # Build 100% full-bleed Robot Face display
+        self.robot_face = RobotFaceScreen(
             self,
-            on_toggle_session=self._toggle_session,
-            on_toggle_mute=self._toggle_mute
+            on_open_developer_console=self.toggle_developer_console
         )
-        self.header_toolbar.pack(fill="x", padx=15, pady=(12, 5))
+        self.robot_face.pack(fill="both", expand=True)
 
-    def _create_navigation_bar(self) -> None:
-        """Create tab navigation bar to switch between Robot Face and Developers Dashboard."""
-        self.nav_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.nav_frame.pack(fill="x", padx=15, pady=(4, 6))
+        # Bind hotkeys & mouse triggers for Developer Console
+        self.bind("<Key-d>", lambda e: self.toggle_developer_console())
+        self.bind("<Key-D>", lambda e: self.toggle_developer_console())
+        self.bind("<Button-3>", lambda e: self.toggle_developer_console())  # Right-click
 
-        # Tab buttons
-        self.btn_robot_face = ctk.CTkButton(
-            self.nav_frame,
-            text="🤖 Robot Face",
-            font=ctk.CTkFont(size=13, weight="bold"),
-            fg_color="#89B4FA",
-            hover_color="#B4BEFE",
-            text_color="#11111B",
-            width=140,
-            height=32,
-            command=lambda: self.show_screen("ROBOT_FACE")
-        )
-        self.btn_robot_face.pack(side="left", padx=(0, 6))
-
-        self.btn_developers = ctk.CTkButton(
-            self.nav_frame,
-            text="🛠️ Developers",
-            font=ctk.CTkFont(size=13, weight="bold"),
-            fg_color="#313244",
-            hover_color="#45475A",
-            text_color="#CDD6F4",
-            width=140,
-            height=32,
-            command=lambda: self.show_screen("DEVELOPERS")
-        )
-        self.btn_developers.pack(side="left")
-
-    def _create_screen_container(self) -> None:
-        """Create dynamic container holding screen frames."""
-        self.screen_container = ctk.CTkFrame(self, fg_color="transparent")
-        self.screen_container.pack(fill="both", expand=True, padx=15, pady=(0, 6))
-
-        # Instantiate screens
-        self.robot_face_screen = RobotFaceScreen(self.screen_container)
-        self.developer_screen = DeveloperScreen(
-            self.screen_container,
-            config=self.config,
-            on_send_interruption=self.on_send_interruption
-        )
-
-    def _create_status_bar_component(self) -> None:
-        """Create modular bottom status bar component."""
-        self.status_bar = StatusBar(
-            self,
-            model_name=self.config.model,
-            voice_name=self.config.voice_name
-        )
-        self.status_bar.pack(fill="x", side="bottom")
-
-    def show_screen(self, screen_name: str) -> None:
-        """Switch visible active screen (ROBOT_FACE or DEVELOPERS)."""
-        self.current_screen_name = screen_name
-
-        # Hide both screens first
-        self.robot_face_screen.pack_forget()
-        self.developer_screen.pack_forget()
-
-        if screen_name == "ROBOT_FACE":
-            self.robot_face_screen.pack(fill="both", expand=True)
-            self.btn_robot_face.configure(fg_color="#89B4FA", text_color="#11111B")
-            self.btn_developers.configure(fg_color="#313244", text_color="#CDD6F4")
+    def toggle_developer_console(self) -> None:
+        """Open or focus the Developer Control Window."""
+        if self.dev_window is None or not self.dev_window.winfo_exists():
+            self.dev_window = DeveloperWindow(
+                master=self,
+                config=self.config,
+                on_start_session=self.on_start_session,
+                on_stop_session=self.on_stop_session,
+                on_send_interruption=self.on_send_interruption,
+                on_toggle_mute=self._toggle_mute,
+                is_session_active=self.is_session_active
+            )
         else:
-            self.developer_screen.pack(fill="both", expand=True)
-            self.btn_developers.configure(fg_color="#89B4FA", text_color="#11111B")
-            self.btn_robot_face.configure(fg_color="#313244", text_color="#CDD6F4")
+            self.dev_window.lift()
+            self.dev_window.focus()
 
     def set_status(self, status: str) -> None:
-        """Thread-safe update to status bar and session button."""
-        self.status_bar.set_status(status)
+        """Thread-safe update to status."""
         if "Connected" in status or "Live" in status:
             self.is_session_active = True
-            self.header_toolbar.set_session_state(True)
         elif "Disconnected" in status or "Idle" in status:
             self.is_session_active = False
-            self.header_toolbar.set_session_state(False)
+
+        if self.dev_window and self.dev_window.winfo_exists():
+            self.dev_window.set_status(status)
 
     def update_mic_level(self, level: float) -> None:
         """Thread-safe update to mic volume meter."""
-        self.header_toolbar.update_mic_level(level)
+        if self.dev_window and self.dev_window.winfo_exists():
+            self.dev_window.update_mic_level(level)
 
     def append_transcript(self, role: str, text: str) -> None:
-        """Forward transcript to developer screen."""
-        self.developer_screen.append_transcript(role, text)
+        """Forward transcript to developer window if open."""
+        if self.dev_window and self.dev_window.winfo_exists():
+            self.dev_window.append_transcript(role, text)
 
     def append_log(self, message: str) -> None:
-        """Forward log message to developer screen."""
-        self.developer_screen.append_log(message)
+        """Forward log message to developer window if open."""
+        if self.dev_window and self.dev_window.winfo_exists():
+            self.dev_window.append_log(message)
 
     def trigger_robot_reaction(self, event_payload: str) -> None:
         """Trigger visual reaction animation on Cubeo face."""
-        self.robot_face_screen.trigger_reaction(event_payload)
-
-    def _toggle_session(self) -> None:
-        """Handler for Start/Stop session button."""
-        if not self.is_session_active:
-            self.on_start_session()
-        else:
-            self.on_stop_session()
+        self.robot_face.trigger_reaction(event_payload)
 
     def _toggle_mute(self, is_muted: bool) -> None:
-        """Handler for mute switch."""
+        """Handler for mute switch in developer window."""
+        self.is_muted = is_muted
         if hasattr(self, 'client') and self.client and self.client.recorder:
             self.client.recorder.set_muted(is_muted)
         self.append_log(f"Microphone Mute: {'ON' if is_muted else 'OFF'}")

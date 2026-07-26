@@ -16,7 +16,7 @@ from src.gui.app import GeminiLiveApp
 logger = logging.getLogger(__name__)
 
 class ApplicationController:
-    """Coordinates asyncio worker thread, live client session, and CustomTkinter GUI."""
+    """Coordinates asyncio worker thread, live client session with AI tool calls, and CustomTkinter GUI."""
 
     def __init__(self):
         self.config = config
@@ -56,14 +56,15 @@ class ApplicationController:
             on_level_change=self._on_mic_level_changed
         )
 
-        # 3. Create Gemini Live Client
+        # 3. Create Gemini Live Client with Tool Reaction Callback
         self.client = GeminiLiveClient(
             config=self.config,
             recorder=self.recorder,
             player=self.player,
             on_status_change=self._on_status_changed,
             on_transcript=self._on_transcript_received,
-            on_log=self._on_log_received
+            on_log=self._on_log_received,
+            on_tool_reaction=self._on_tool_reaction_triggered
         )
 
         # 4. Create CustomTkinter GUI app
@@ -106,15 +107,21 @@ class ApplicationController:
             self.client.stop_session()
 
     def send_interruption(self, text_payload: str) -> None:
-        """Schedule instant text interruption on background asyncio thread and trigger GUI face reaction."""
-        if self.gui and self.gui.winfo_exists():
-            self.gui.trigger_robot_reaction(text_payload)
-
+        """
+        Schedule instant text interruption on background asyncio thread.
+        Note: The GUI face reaction is NOT hardcoded here—Gemini receives the event
+        and decides autonomously whether to invoke the 'react' tool.
+        """
         if self.client and self.async_loop and self.async_loop.is_running():
             asyncio.run_coroutine_threadsafe(
                 self.client.interrupt_with_text(text_payload),
                 self.async_loop
             )
+
+    def _on_tool_reaction_triggered(self, reaction_type: str) -> None:
+        """Callback invoked when Gemini Live calls the 'react' tool."""
+        if self.gui and self.gui.winfo_exists():
+            self.gui.trigger_robot_reaction(reaction_type)
 
     def _on_mic_level_changed(self, level: float) -> None:
         """Callback from audio recorder (runs thread-safely)."""
