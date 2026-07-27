@@ -196,26 +196,32 @@ class RobotFaceScreen(ctk.CTkFrame):
         color: str,
         core_color: str,
     ) -> None:
-        """Render individual EMO eye on isolated canvas, transform (rotate/shear), and composite onto main image."""
+        """Render individual EMO eye on isolated canvas with 3x SSAA for ultra-crisp edges, then composite."""
         pad = int(max(width, height) * 0.8) + 40
-        canvas_w = int(width + pad)
-        canvas_h = int(height + pad)
+        final_w = int(width + pad)
+        final_h = int(height + pad)
+        
+        ssaa = 3
+        canvas_w = final_w * ssaa
+        canvas_h = final_h * ssaa
 
         eye_img = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
         draw = ImageDraw.Draw(eye_img)
 
         ecx = canvas_w / 2.0
         ecy = canvas_h / 2.0
-        hw = width / 2.0
-        hh = height / 2.0
+        w_s = width * ssaa
+        h_s = height * ssaa
+        hw = w_s / 2.0
+        hh = h_s / 2.0
 
         if shape_mode == "crescent_happy":
             # Image 2 style: Happy curved crescent arc eyes (^ ^)
-            self._draw_crescent_arc_eye(draw, ecx, ecy, width, height, is_left_eye, color)
+            self._draw_crescent_arc_eye(draw, ecx, ecy, w_s, h_s, is_left_eye, color)
 
         elif shape_mode == "trapezoid_slant":
             # Image 1 style: Slanted angry / determined / hurt trapezoid eyes (\ /)
-            self._draw_trapezoid_slant_eye(draw, ecx, ecy, width, height, is_left_eye, slant_deg, color, core_color)
+            self._draw_trapezoid_slant_eye(draw, ecx, ecy, w_s, h_s, is_left_eye, slant_deg, color, core_color)
 
         elif shape_mode == "wide_oval":
             # Image 3 style: Wide excited / surprised oval eyes (O O)
@@ -236,16 +242,22 @@ class RobotFaceScreen(ctk.CTkFrame):
 
         # Top eyelid clipping mask if applicable
         if eyelid_top > 0.01:
-            lid_h = height * eyelid_top
-            draw.rectangle([ecx - hw - 20, ecy - hh - 20, ecx + hw + 20, ecy - hh + lid_h], fill=(0, 0, 0, 0))
+            lid_h = h_s * eyelid_top
+            draw.rectangle([ecx - hw - 20*ssaa, ecy - hh - 20*ssaa, ecx + hw + 20*ssaa, ecy - hh + lid_h], fill=(0, 0, 0, 0))
 
-        # Rotate transform for 3D perspective slant
+        # Downscale for SSAA crisp anti-aliasing
+        eye_img = eye_img.resize((final_w, final_h), resample=Image.Resampling.LANCZOS)
+
+        ecx_unscaled = final_w / 2.0
+        ecy_unscaled = final_h / 2.0
+
+        # Rotate transform for 3D perspective slant AFTER downscaling (Fixes severe lag)
         if abs(slant_deg) > 0.1:
-            eye_img = eye_img.rotate(-slant_deg, resample=Image.Resampling.BICUBIC, center=(ecx, ecy))
+            eye_img = eye_img.rotate(-slant_deg, resample=Image.Resampling.BICUBIC, center=(ecx_unscaled, ecy_unscaled))
 
         # Paste rendered transformed eye onto main canvas
-        px = int(cx - ecx)
-        py = int(cy - ecy)
+        px = int(cx - ecx_unscaled)
+        py = int(cy - ecy_unscaled)
         pil_img.paste(eye_img, (px, py), eye_img)
 
     def _draw_crescent_arc_eye(
