@@ -105,7 +105,7 @@ class EyeAnimationEngine:
         self.target_eyelid_top_r = 0.0
 
         self.shape_mode = "capsule"  # "capsule", "crescent_happy", "trapezoid_slant", "wide_oval"
-        self.target_shape_mode = "capsule"
+        self.pending_shape_mode = None
 
         self.height_scale_mult = 1.0
         self.width_scale_mult = 1.0
@@ -196,6 +196,14 @@ class EyeAnimationEngine:
         # 3. Update Blinking Cycle
         self._update_blink_cycle()
 
+        # Check for pending shape change masked by blink
+        if self.pending_shape_mode and self.pending_shape_mode != self.shape_mode:
+            if not self.is_blinking:
+                self.start_blink("TRANSITION")
+            elif self.blink_step >= self.max_blink_steps / 2.0:
+                self.shape_mode = self.pending_shape_mode
+                self.pending_shape_mode = None
+
         # 4. Spring Physics Lerp for Slants, Shear, Squish, and Eyelids
         lerp_speed = 0.18
         self.slant_left += (self.target_slant_l - self.slant_left) * lerp_speed
@@ -236,6 +244,8 @@ class EyeAnimationEngine:
             self.blink_step = 0
             if mode:
                 self.blink_mode = mode
+                if mode == "TRANSITION":
+                    self.max_blink_steps = 12
             else:
                 # Random blink pattern selection
                 r = random.random()
@@ -301,6 +311,14 @@ class EyeAnimationEngine:
                 val = max(0.1, 1.0 - (self.blink_step / half) * 0.9)
             else:
                 val = min(1.0, 0.1 + ((self.blink_step - half) / half) * 0.9)
+            self.blink_scale_l = val
+            self.blink_scale_r = val
+
+        elif self.blink_mode == "TRANSITION":
+            if self.blink_step <= half:
+                val = max(0.01, 1.0 - smoothstep(self.blink_step / half) * 0.99)
+            else:
+                val = min(1.0, 0.01 + smoothstep((self.blink_step - half) / half) * 0.99)
             self.blink_scale_l = val
             self.blink_scale_r = val
 
@@ -385,8 +403,7 @@ class EyeAnimationEngine:
 
         elif chosen == "ARC_SMILE_PULSE":
             self.action_duration = 1.8
-            self.shape_mode = "crescent_happy"
-            self.target_shape_mode = "crescent_happy"
+            self.pending_shape_mode = "crescent_happy"
             self.target_squish_l_y = 0.55
             self.target_squish_r_y = 0.55
 
@@ -439,8 +456,12 @@ class EyeAnimationEngine:
             self.target_squish_r_y = 1.0
             self.target_eyelid_top_l = 0.0
             self.target_eyelid_top_r = 0.0
-            self.shape_mode = "capsule"
-            self.target_shape_mode = "capsule"
+            if self.shape_mode != "capsule":
+                self.pending_shape_mode = "capsule"
+            
+            # Fix gaze snap back by starting interpolation from CURRENT gaze
+            self.start_gaze_x = self.gaze_x
+            self.start_gaze_y = self.gaze_y
             self.target_gaze_x = 0.0
             self.target_gaze_y = 0.0
             self.saccade_t = 0.0
@@ -458,8 +479,7 @@ class EyeAnimationEngine:
         self.height_scale_mult = reaction.height_scale_mult
         self.width_scale_mult = reaction.width_scale_mult
 
-        self.shape_mode = reaction.shape_mode
-        self.target_shape_mode = reaction.shape_mode
+        self.pending_shape_mode = reaction.shape_mode
 
         self.target_slant_l = reaction.slant_angle
         self.target_slant_r = -reaction.slant_angle if reaction.shape_mode == "trapezoid_slant" else reaction.slant_angle
@@ -491,8 +511,8 @@ class EyeAnimationEngine:
             self.target_squish_r_y = 1.0
             self.target_eyelid_top_l = 0.0
             self.target_eyelid_top_r = 0.0
-            self.shape_mode = "capsule"
-            self.target_shape_mode = "capsule"
+            if self.shape_mode != "capsule":
+                self.pending_shape_mode = "capsule"
             self.jitter_offset_x = 0.0
             self.jitter_offset_y = 0.0
             self.redraw_callback()
