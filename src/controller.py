@@ -121,27 +121,27 @@ class ApplicationController:
     def _on_tool_reaction_triggered(self, reaction_type: str) -> None:
         """Callback invoked when Gemini Live calls the 'react' tool."""
         if self.gui and self.gui.winfo_exists():
-            self.gui.trigger_robot_reaction(reaction_type)
+            self.gui.after(0, self.gui.trigger_robot_reaction, reaction_type)
 
     def _on_mic_level_changed(self, level: float) -> None:
         """Callback from audio recorder (runs thread-safely)."""
         try:
             if self.gui and self.gui.winfo_exists():
-                self.gui.update_mic_level(level)
+                self.gui.after(0, self.gui.update_mic_level, level)
         except Exception:
             pass
 
     def _on_status_changed(self, status: str) -> None:
         """Callback when Live client connection status changes."""
         if self.gui and self.gui.winfo_exists():
-            self.gui.set_status(status)
+            self.gui.after(0, self.gui.set_status, status)
 
     def _on_transcript_received(self, role: str, text: str) -> None:
         """Callback when transcript text is received from Gemini or User event."""
         if self.gui and self.gui.winfo_exists():
-            self.gui.append_transcript(role, text)
+            self.gui.after(0, self.gui.append_transcript, role, text)
 
     def _on_log_received(self, message: str) -> None:
         """Callback for log messages."""
         if self.gui and self.gui.winfo_exists():
-            self.gui.append_log(message)
+            self.gui.after(0, self.gui.append_log, message)
