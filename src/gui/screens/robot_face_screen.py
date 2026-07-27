@@ -276,12 +276,10 @@ class RobotFaceScreen(ctk.CTkFrame):
         # Draw thick smooth stroke curve
         draw.line(points, fill=color, width=int(thickness), joint="curve")
 
-        # Add rounded pill caps at the start and end of the crescent
+        # Add rounded joints at EVERY point to patch Pillow's thick-line rendering cracks
         r = thickness / 2.0
-        x_start, y_start = points[0]
-        x_end, y_end = points[-1]
-        draw.ellipse([x_start - r, y_start - r, x_start + r, y_start + r], fill=color)
-        draw.ellipse([x_end - r, y_end - r, x_end + r, y_end + r], fill=color)
+        for px, py in points:
+            draw.ellipse([px - r, py - r, px + r, py + r], fill=color)
 
     def _draw_trapezoid_slant_eye(
         self,
