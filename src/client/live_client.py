@@ -15,12 +15,16 @@ from google.genai import types
 from src.config import AppConfig
 from src.audio.recorder import AudioRecorder
 from src.audio.player import AudioPlayer
-from src.client.tools import REACT_TOOL_DECLARATION, execute_react_tool
+from src.client.tools import (
+    MESSAGES_TOOL_DECLARATION,
+    REACT_TOOL_DECLARATION,
+    execute_messages_tool,
+    execute_react_tool,
+)
+from src.services.embeddings import EmbeddingService
+from src.services.stt import LocalTranscriptService
 
 logger = logging.getLogger(__name__)
-
-# Avoid a hard dependency on faster-whisper at import time.
-from src.stt import LocalTranscriptService  # noqa: E402  (lazy import inside service)
 
 # System instruction instructing Gemini to call the 'react' tool autonomously
 ROBOT_SYSTEM_INSTRUCTION = (
@@ -56,6 +60,7 @@ class GeminiLiveClient:
         on_tool_reaction: Optional[Callable[[str], None]] = None,
         on_session_ended: Optional[Callable[[], None]] = None,
         transcript_service: Optional[LocalTranscriptService] = None,
+        embedding_service: Optional[EmbeddingService] = None,
     ):
         self.config = config
         self.recorder = recorder
@@ -66,6 +71,7 @@ class GeminiLiveClient:
         self.on_tool_reaction = on_tool_reaction
         self.on_session_ended = on_session_ended
         self.transcript_service = transcript_service
+        self.embedding_service = embedding_service
 
         self.is_connected = False
         self._session = None
@@ -112,7 +118,7 @@ class GeminiLiveClient:
         try:
             live_config = types.LiveConnectConfig(
                 response_modalities=[types.Modality.AUDIO],
-                tools=[REACT_TOOL_DECLARATION],  # Register react tool
+                tools=[REACT_TOOL_DECLARATION, MESSAGES_TOOL_DECLARATION],  # Register react tool
                 speech_config=types.SpeechConfig(
                     voice_config=types.VoiceConfig(
                         prebuilt_voice_config=types.PrebuiltVoiceConfig(
@@ -268,6 +274,35 @@ class GeminiLiveClient:
                                 result_dict = execute_react_tool(
                                     reaction_type=reaction_type,
                                     on_trigger_reaction=self._dispatch_tool_reaction
+                                )
+
+                                # Return tool response frame back over WebSocket
+                                try:
+                                    await self._session.send_tool_response(
+                                        function_responses=[
+                                            types.FunctionResponse(
+                                                name=fn_call.name,
+                                                id=fn_call.id,
+                                                response=result_dict
+                                            )
+                                        ]
+                                    )
+                                    self.log(f"✓ Returned tool_response for '{fn_call.name}'")
+                                except Exception as tool_err:
+                                    self.log(f"❌ Error sending tool response: {tool_err}")
+
+                            elif fn_call.name == "messages":
+                                args = fn_call.args or {}
+                                query = args.get("query", "")
+                                limit = args.get("limit")
+
+                                self.log(f"🔍 [AI Tool Call]: messages(query='{query}')")
+
+                                # Search stored conversation history via embeddings
+                                result_dict = execute_messages_tool(
+                                    query=query,
+                                    limit=limit,
+                                    embedding_service=self.embedding_service
                                 )
 
                                 # Return tool response frame back over WebSocket

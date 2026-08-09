@@ -49,6 +49,21 @@ def create_message(
         return _create(s)
 
 
+def get_message(
+    message_id: int,
+    session: Optional[Session] = None,
+) -> Optional[Message]:
+    """Fetch a single message by primary key."""
+
+    def _get(s: Session) -> Optional[Message]:
+        return s.get(Message, message_id)
+
+    if session is not None:
+        return _get(session)
+    with get_session() as s:
+        return _get(s)
+
+
 def list_messages(
     conversation_id: int,
     limit: int = 500,

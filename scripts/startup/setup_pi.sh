@@ -124,6 +124,21 @@ print("STT models ready.")
 PY
 
 # ---------------------------------------------------------------------------
+# Pre-download embedding model (fastembed)
+# ---------------------------------------------------------------------------
+EMBEDDING_MODEL="${EMBEDDING_MODEL:-BAAI/bge-small-en-v1.5}"
+
+echo "==> Pre-downloading embedding model (${EMBEDDING_MODEL})..."
+"${VENV}/bin/python" - "${EMBEDDING_MODEL}" <<'PY'
+import sys
+
+from fastembed import TextEmbedding
+
+TextEmbedding(sys.argv[1])
+print("Embedding model ready.")
+PY
+
+# ---------------------------------------------------------------------------
 # Audio sanity check
 # ---------------------------------------------------------------------------
 echo "==> Detected audio devices (note the input/output indices):"

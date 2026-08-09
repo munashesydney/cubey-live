@@ -2,5 +2,12 @@
 
 from src.db.models.conversation import Conversation, ConversationStatus
 from src.db.models.message import Message, MessageRole
+from src.db.models.message_embedding import MessageEmbedding
 
-__all__ = ["Conversation", "ConversationStatus", "Message", "MessageRole"]
+__all__ = [
+    "Conversation",
+    "ConversationStatus",
+    "Message",
+    "MessageEmbedding",
+    "MessageRole",
+]

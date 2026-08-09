@@ -40,6 +40,9 @@ class AppConfig:
     stt_model_size: str = os.getenv("STT_MODEL_SIZE", "small")
     stt_language: str = os.getenv("STT_LANGUAGE", "en")
 
+    # Local embeddings (fastembed) for semantic memory over past messages.
+    embedding_model: str = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+
     def validate(self) -> None:
         """Validate critical configuration fields."""
         if not self.api_key:

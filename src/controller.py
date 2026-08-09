@@ -17,10 +17,12 @@ from src.db import (
     create_conversation,
     create_message,
     end_conversation,
+    save_message_embedding,
     update_conversation,
 )
+from src.services.embeddings import EmbeddingService
 from src.gui.app import GeminiLiveApp
-from src.stt import LocalTranscriptService
+from src.services.stt import LocalTranscriptService
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +63,9 @@ class ApplicationController:
             language=config.stt_language,
             on_result=self._on_transcript_received,
         )
+
+        # On-device embeddings (fastembed) for semantic memory over messages.
+        self.embedding_service = EmbeddingService(model_name=config.embedding_model)
 
         self._session_task: Optional[asyncio.Task] = None
 
@@ -105,7 +110,8 @@ class ApplicationController:
             on_log=self._on_log_received,
             on_tool_reaction=self._on_tool_reaction_triggered,
             on_session_ended=self._on_session_ended,
-            transcript_service=self.transcript_service
+            transcript_service=self.transcript_service,
+            embedding_service=self.embedding_service
         )
 
         # 4. Create CustomTkinter GUI app
@@ -235,7 +241,10 @@ class ApplicationController:
             return
         message_role = _map_message_role(role)
         try:
-            create_message(conversation_id, role=message_role, content=text)
+            message = create_message(conversation_id, role=message_role, content=text)
+            # Semantic memory: embed conversation lines (not sensor events).
+            if message_role in (MessageRole.USER, MessageRole.MODEL):
+                self._embed_message(message)
             # Auto-title the conversation from its first user/external input.
             if (
                 not self._conversation_titled
@@ -247,3 +256,16 @@ class ApplicationController:
                     self._conversation_titled = True
         except Exception as e:
             logger.warning("Failed to persist message: %s", e)
+
+    def _embed_message(self, message) -> None:
+        """Embed a message and store the vector (best-effort, never blocks the
+        transcript path on failure)."""
+        try:
+            vector = self.embedding_service.embed(message.content)
+            save_message_embedding(
+                message_id=message.id,
+                model_name=self.embedding_service.model_name,
+                embedding=vector,
+            )
+        except Exception as e:
+            logger.warning("Failed to embed message #%s: %s", message.id, e)
