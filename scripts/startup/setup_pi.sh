@@ -57,6 +57,7 @@ sudo apt-get install -y \
     portaudio19-dev libasound2-dev \
     libgomp1 \
     libjpeg-dev libpng-dev zlib1g-dev \
+    cmake build-essential \
     alsa-utils ffmpeg
 
 # ---------------------------------------------------------------------------

@@ -16,6 +16,7 @@ from src.db import (
     list_messages,
 )
 from src.gui.local_chat_window import LocalChatWindow
+from src.gui.memory_window import MemoryWindow
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,7 @@ class DeveloperWindow(ctk.CTkToplevel):
         self.is_session_active = is_session_active
 
         self.local_chat_win: Optional[LocalChatWindow] = None
+        self.memory_win: Optional[MemoryWindow] = None
 
         # Window properties
         self.title("🛠️ Cubeo Developer Console")
@@ -126,6 +128,20 @@ class DeveloperWindow(ctk.CTkToplevel):
             command=self._open_local_chat
         )
         self.local_chat_btn.pack(side="left", padx=5)
+
+        # Memory Bank Window Button
+        self.memory_btn = ctk.CTkButton(
+            controls_box,
+            text="🧠 Memories",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            fg_color="#74C7EC",
+            hover_color="#89DCEB",
+            text_color="#11111B",
+            width=120,
+            height=34,
+            command=self._open_memory_window
+        )
+        self.memory_btn.pack(side="left", padx=5)
 
         # Main Split Grid
         self.main_grid = ctk.CTkFrame(self, fg_color="transparent")
@@ -269,6 +285,15 @@ class DeveloperWindow(ctk.CTkToplevel):
             self.local_chat_win.lift()
             self.local_chat_win.focus()
 
+    def _open_memory_window(self) -> None:
+        """Open or focus the dedicated Memory Bank Window."""
+        if self.memory_win is None or not self.memory_win.winfo_exists():
+            self.memory_win = MemoryWindow(master=self)
+        else:
+            self.memory_win.refresh_memories()
+            self.memory_win.lift()
+            self.memory_win.focus()
+
     def set_status(self, status: str) -> None:
         """Thread-safe update to connection status."""
         try:
@@ -367,7 +392,13 @@ class DeveloperWindow(ctk.CTkToplevel):
     def refresh_conversations(self) -> None:
         """Reload the conversation list from the database."""
         try:
-            conversations = list_conversations(limit=100)
+            # Gemini Live conversations only — local LLM chats are shown in
+            # the local chat window (legacy rows without a type count as live).
+            conversations = [
+                conv
+                for conv in list_conversations(limit=100)
+                if (conv.metadata_json or {}).get("type") != "local_llm"
+            ]
         except Exception as e:
             logger.warning("Failed to load conversations: %s", e)
             return

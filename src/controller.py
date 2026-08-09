@@ -207,7 +207,10 @@ class ApplicationController:
     def _begin_conversation(self) -> None:
         """Create a new ACTIVE conversation row for the upcoming live session."""
         try:
-            conversation = create_conversation(session_id=uuid.uuid4().hex)
+            conversation = create_conversation(
+                session_id=uuid.uuid4().hex,
+                metadata={"type": "live", "model": self.config.model},
+            )
             self._active_conversation_id = conversation.id
             self._conversation_titled = False
             logger.info("Started conversation #%s", conversation.id)

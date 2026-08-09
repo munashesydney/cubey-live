@@ -17,7 +17,6 @@ from src.db import (
     create_message,
     list_conversations,
     list_messages,
-    update_conversation,
 )
 from src.services.local_llm import LocalLLMService
 
@@ -239,11 +238,13 @@ class LocalChatWindow(ctk.CTkToplevel):
 
         for conv in convos:
             meta = conv.metadata_json or {}
-            label_prefix = "🦙 " if meta.get("type") == "local_llm" else "💬 "
+            # This window shows local LLM chats only.
+            if meta.get("type") != "local_llm":
+                continue
             title = conv.title or f"Conversation #{conv.id}"
             time_str = conv.started_at.strftime("%b %d %H:%M") if conv.started_at else ""
-            label = f"{label_prefix}{title[:30]} ({time_str})"
-            
+            label = f"🦙 {title[:30]} ({time_str})"
+
             self.conversations_map[label] = conv.id
             options.append(label)
 

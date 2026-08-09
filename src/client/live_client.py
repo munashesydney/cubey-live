@@ -16,8 +16,10 @@ from src.config import AppConfig
 from src.audio.recorder import AudioRecorder
 from src.audio.player import AudioPlayer
 from src.client.tools import (
+    MEMORIES_TOOL_DECLARATION,
     MESSAGES_TOOL_DECLARATION,
     REACT_TOOL_DECLARATION,
+    execute_memories_tool,
     execute_messages_tool,
     execute_react_tool,
 )
@@ -33,7 +35,10 @@ ROBOT_SYSTEM_INSTRUCTION = (
     "CRITICAL TOOL INSTRUCTION: You have access to the 'react' tool. Whenever you experience physical "
     "interactions or physical event text in brackets like [HUMAN KICKED YOU], [OBSTACLE IN PATH], "
     "[WATER SPILLED ON SENSORS], or [CRITICAL BATTERY 5%], you MUST autonomously call the 'react' tool "
-    "with the corresponding reaction_type ('hurt', 'alert', 'happy', 'surprised', 'skeptical', 'low_battery') AND speak your reaction out loud."
+    "with the corresponding reaction_type ('hurt', 'alert', 'happy', 'surprised', 'skeptical', 'low_battery') AND speak your reaction out loud. "
+    "MEMORY: Use the 'memories' tool to remember durable facts about the user (names, preferences, "
+    "important life details) and to recall them whenever they become relevant. "
+    "Use the 'messages' tool to search past conversation history for things said before."
 )
 
 def compute_pcm_rms(audio_data: bytes) -> float:
@@ -118,7 +123,11 @@ class GeminiLiveClient:
         try:
             live_config = types.LiveConnectConfig(
                 response_modalities=[types.Modality.AUDIO],
-                tools=[REACT_TOOL_DECLARATION, MESSAGES_TOOL_DECLARATION],  # Register react tool
+                tools=[
+                    REACT_TOOL_DECLARATION,
+                    MESSAGES_TOOL_DECLARATION,
+                    MEMORIES_TOOL_DECLARATION,
+                ],  # Register react tool
                 speech_config=types.SpeechConfig(
                     voice_config=types.VoiceConfig(
                         prebuilt_voice_config=types.PrebuiltVoiceConfig(
@@ -302,6 +311,42 @@ class GeminiLiveClient:
                                 result_dict = execute_messages_tool(
                                     query=query,
                                     limit=limit,
+                                    embedding_service=self.embedding_service
+                                )
+
+                                # Return tool response frame back over WebSocket
+                                try:
+                                    await self._session.send_tool_response(
+                                        function_responses=[
+                                            types.FunctionResponse(
+                                                name=fn_call.name,
+                                                id=fn_call.id,
+                                                response=result_dict
+                                            )
+                                        ]
+                                    )
+                                    self.log(f"✓ Returned tool_response for '{fn_call.name}'")
+                                except Exception as tool_err:
+                                    self.log(f"❌ Error sending tool response: {tool_err}")
+
+                            elif fn_call.name == "memories":
+                                args = fn_call.args or {}
+
+                                self.log(
+                                    "🧠 [AI Tool Call]: memories(action='{}', memory_id={})".format(
+                                        args.get("action"), args.get("memory_id")
+                                    )
+                                )
+
+                                # Add / update / search durable memories
+                                result_dict = execute_memories_tool(
+                                    action=args.get("action"),
+                                    content=args.get("content"),
+                                    category=args.get("category"),
+                                    importance=args.get("importance"),
+                                    memory_id=args.get("memory_id"),
+                                    query=args.get("query"),
+                                    limit=args.get("limit"),
                                     embedding_service=self.embedding_service
                                 )
 
