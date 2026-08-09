@@ -1,0 +1,26 @@
+# Cubey — Gemini Live Robot (systemd unit template)
+#
+# setup_pi.sh substitutes the __PLACEHOLDERS__ with real values and installs
+# this file to /etc/systemd/system/cubey.service.
+#
+# The GUI needs a running desktop session on the chosen DISPLAY (usually :0
+# with the auto-login desktop). XDG_RUNTIME_DIR must match the service user.
+
+[Unit]
+Description=Cubey - Gemini Live Robot
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+Environment=DISPLAY=__DISPLAY__
+Environment=XDG_RUNTIME_DIR=__XDG_RUNTIME_DIR__
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=__PROJECT_ROOT__
+ExecStart=__VENV_PYTHON__ __PROJECT_ROOT__/main.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
