@@ -25,25 +25,49 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# PyAV ships with faster-whisper and has a proper low-pass resampler. Linear
+# interpolation is only a last-resort fallback (it aliases on downsampling).
+try:
+    import av as _av
+except ImportError:  # pragma: no cover - av is a faster-whisper dependency
+    _av = None
+
 USER_SAMPLE_RATE = 16000
 MODEL_SAMPLE_RATE = 24000
 
-# Energy-based VAD parameters (chunk = 512 frames @ 16 kHz = 32 ms).
-_VAD_SPEECH_THRESHOLD = 0.03   # normalized RMS; more sensitive than barge-in gating
-_VAD_SILENCE_CHUNKS = 30       # ~1 s of quiet -> end of utterance
-_MIN_UTTERANCE_SECONDS = 0.3   # ignore blips shorter than this
+# VAD parameters (chunk = 512 frames @ 16 kHz = 32 ms).
+_VAD_SPEECH_THRESHOLD = 0.03   # normalized RMS; marks "is this chunk speech or not"
+_VAD_SILENCE_CHUNKS = 62       # ~2 s of quiet ends a user turn
+_MIN_UTTERANCE_SECONDS = 0.5   # ignore blips shorter than this
 
 # Suppress whisper hallucinating text on silence/non-speech audio.
 _HALLUCINATION_SILENCE_THRESHOLD = 0.5
 
 
 def resample_pcm16(data: bytes, src_rate: int, dst_rate: int) -> bytes:
-    """Resample 16-bit PCM mono bytes from src_rate to dst_rate (linear interp)."""
+    """Resample 16-bit PCM mono bytes from src_rate to dst_rate.
+
+    Uses PyAV's high-quality resampler (available wherever faster-whisper is
+    installed); falls back to linear interpolation if PyAV is unavailable.
+    """
     if src_rate == dst_rate:
         return data
     samples = np.frombuffer(data, dtype=np.int16)
-    if len(samples) < 2:
+    if len(samples) == 0:
         return b""
+    if _av is not None:
+        try:
+            resampler = _av.AudioResampler(format="s16", layout="mono", rate=dst_rate)
+            frame = _av.AudioFrame.from_ndarray(
+                samples.reshape(1, -1), format="s16", layout="mono"
+            )
+            frame.sample_rate = src_rate
+            out_frames = list(resampler.resample(frame))
+            if out_frames:
+                arr = np.concatenate([f.to_ndarray() for f in out_frames], axis=1)
+                return arr[0].astype(np.int16).tobytes()
+        except Exception as e:
+            logger.warning("PyAV resampler failed (%s); using linear interpolation", e)
     out_len = int(round(len(samples) * dst_rate / src_rate))
     if out_len < 1:
         return b""
@@ -56,13 +80,19 @@ class LocalTranscriptService:
     """
     Background STT pipeline for both sides of a conversation.
 
-    - User audio is segmented into utterances with a simple energy VAD and each
-      utterance is transcribed in order.
-    - Model audio is buffered per turn and transcribed when `flush_model_turn`
-      is called (i.e. the live API reports turn completion or interruption).
-    - Results are emitted via `on_result(role, text)` in conversation order:
-      a model turn is only transcribed after any in-flight user utterance has
-      finished, and all whisper inference is serialized.
+    Accuracy-first design (everything runs in the background, so latency is
+    not the priority). Whisper is far more accurate on coherent, turn-sized
+    audio than on fragments, so both sides buffer and transcribe whole turns:
+
+    - User audio accumulates into a turn buffer. A turn ends after ~2 s of
+      silence or when `flush_user_turn` is called (the model started
+      replying), and the whole turn is transcribed in one shot.
+    - Model audio is buffered whole per turn and transcribed in one chunk on
+      `flush_model_turn`, with faster-whisper's Silero `vad_filter` stripping
+      pauses/trailing silence before decoding.
+    - All whisper inference disables `condition_on_previous_text` (prevents
+      repetition loops) and runs serialized, and results are emitted in
+      conversation order: a model turn waits for any in-flight user turn.
     """
 
     def __init__(
@@ -82,6 +112,7 @@ class LocalTranscriptService:
         self._user_queue: "queue.Queue[bytes]" = queue.Queue()
         self._model_queue: "queue.Queue[bytes]" = queue.Queue()
         self._flush_model = threading.Event()
+        self._flush_user = threading.Event()
         self._stop = threading.Event()
 
         # Serializes whisper inference (CTranslate2 models are not safe for
@@ -89,9 +120,12 @@ class LocalTranscriptService:
         self._whisper_lock = threading.Lock()
         self._emit_lock = threading.Lock()
 
-        # Set while the user worker is transcribing, so the model worker can
-        # hold off and keep the transcript in conversation order.
+        # Set while the user worker is transcribing a turn, and a handshake
+        # event that the model worker waits on so a model reply is always
+        # transcribed after the user turn that triggered it.
         self._user_transcribing = threading.Event()
+        self._user_turn_done = threading.Event()
+        self._user_turn_done.set()
 
         self._model = None  # lazy faster-whisper model
         self._user_thread: Optional[threading.Thread] = None
@@ -99,7 +133,6 @@ class LocalTranscriptService:
 
         # VAD state
         self._user_buffer = bytearray()
-        self._in_speech = False
         self._silence_chunks = 0
         self._model_buffer = bytearray()
 
@@ -145,6 +178,13 @@ class LocalTranscriptService:
         if pcm_24k:
             self._model_queue.put(pcm_24k)
 
+    def flush_user_turn(self) -> None:
+        """Signal that the user's current turn is over (e.g. the model began
+        replying), so its audio can be transcribed now. Idempotent."""
+        self._flush_user.set()
+        # Model turns must wait for this user turn to be transcribed.
+        self._user_turn_done.clear()
+
     def flush_model_turn(self) -> None:
         """Signal that the current model turn is over; transcribe its audio."""
         self._flush_model.set()
@@ -154,16 +194,32 @@ class LocalTranscriptService:
     # ------------------------------------------------------------------
 
     def _user_worker(self) -> None:
-        """VAD-segment mic audio and transcribe utterances in order."""
+        """Accumulate mic audio into turns and transcribe each turn in order."""
         while not self._stop.is_set():
             try:
                 chunk = self._user_queue.get(timeout=0.2)
             except queue.Empty:
-                continue
-            if not chunk:
-                break
-            self._feed_user_chunk(chunk)
-        self._flush_user_utterance()
+                chunk = None
+            # A flush request (the model began replying) must be honored
+            # promptly even while mic chunks keep flowing — the microphone
+            # feeds continuously, so the queue almost never goes empty.
+            if self._flush_user.is_set():
+                self._flush_user.clear()
+                if chunk:
+                    self._feed_user_chunk(chunk)
+                # Capture any chunks that arrived around the flush signal.
+                while True:
+                    try:
+                        extra = self._user_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if not extra:
+                        break
+                    self._feed_user_chunk(extra)
+                self._flush_user_turn()
+            elif chunk:
+                self._feed_user_chunk(chunk)
+        self._flush_user_turn()
 
     def _model_worker(self) -> None:
         """Buffer model audio and transcribe one turn per flush request."""
@@ -191,39 +247,54 @@ class LocalTranscriptService:
         rms = float(np.sqrt(np.mean(np.square(samples.astype(np.float32))))) / 32768.0
         if rms >= _VAD_SPEECH_THRESHOLD:
             self._user_buffer += chunk
-            self._in_speech = True
             self._silence_chunks = 0
-        elif self._in_speech:
-            self._user_buffer += chunk  # keep trailing silence for context
+        elif self._user_buffer:
+            self._user_buffer += chunk  # trailing silence for whisper context
             self._silence_chunks += 1
             if self._silence_chunks >= _VAD_SILENCE_CHUNKS:
-                self._flush_user_utterance()
+                self._flush_user_turn()
         # Leading silence before any speech is dropped.
 
-    def _flush_user_utterance(self) -> None:
-        if not self._user_buffer or not self._in_speech:
-            self._user_buffer.clear()
-            self._in_speech = False
-            self._silence_chunks = 0
-            return
-        audio = bytes(self._user_buffer)
-        self._user_buffer.clear()
-        self._in_speech = False
-        self._silence_chunks = 0
-        min_bytes = int(_MIN_UTTERANCE_SECONDS * USER_SAMPLE_RATE * 2)
-        if len(audio) < min_bytes:
-            return
-        self._user_transcribing.set()
+    def _flush_user_turn(self) -> None:
         try:
-            text = self._transcribe(audio)
-            if text:
-                self._emit("user", text)
-        except Exception as e:
-            logger.warning("User STT failed: %s", e)
+            if not self._user_buffer:
+                return
+            audio = bytes(self._user_buffer)
+            self._user_buffer.clear()
+            self._silence_chunks = 0
+            min_bytes = int(_MIN_UTTERANCE_SECONDS * USER_SAMPLE_RATE * 2)
+            if len(audio) < min_bytes:
+                return
+            self._user_transcribing.set()
+            try:
+                text = self._transcribe(audio, vad_filter=True)
+                if text:
+                    self._emit("user", text)
+            except Exception as e:
+                logger.warning("User STT failed: %s", e)
+            finally:
+                self._user_transcribing.clear()
         finally:
-            self._user_transcribing.clear()
+            # Always release the model worker, even if there was no audio.
+            self._user_turn_done.set()
 
     def _process_model_turn(self) -> None:
+        # Keep the transcript in order: a model reply belongs after the user
+        # turn that triggered it. The client clears `_user_turn_done` when the
+        # model begins replying; the user worker re-sets it after its
+        # transcription completes.
+        while not self._user_turn_done.is_set() and not self._stop.is_set():
+            time.sleep(0.1)
+        # Capture anything that arrived while we waited, so a turn is never
+        # transcribed missing its tail chunks (and tails never leak into the
+        # next turn's buffer).
+        while True:
+            try:
+                chunk = self._model_queue.get_nowait()
+            except queue.Empty:
+                break
+            if chunk:
+                self._model_buffer += chunk
         if not self._model_buffer:
             return
         audio = bytes(self._model_buffer)
@@ -231,13 +302,9 @@ class LocalTranscriptService:
         min_bytes = int(_MIN_UTTERANCE_SECONDS * MODEL_SAMPLE_RATE * 2)
         if len(audio) < min_bytes:
             return
-        # Keep the transcript in order: a model reply belongs after the user
-        # utterance that triggered it.
-        while self._user_transcribing.is_set() and not self._stop.is_set():
-            time.sleep(0.1)
         try:
             pcm_16k = resample_pcm16(audio, MODEL_SAMPLE_RATE, USER_SAMPLE_RATE)
-            text = self._transcribe(pcm_16k)
+            text = self._transcribe(pcm_16k, vad_filter=True)
             if text:
                 self._emit("model", text)
         except Exception as e:
@@ -263,15 +330,24 @@ class LocalTranscriptService:
             )
         return self._model
 
-    def _transcribe(self, audio: bytes) -> str:
-        """Transcribe 16 kHz 16-bit PCM mono bytes to text."""
+    def _transcribe(self, audio: bytes, *, vad_filter: bool = False) -> str:
+        """
+        Transcribe 16 kHz 16-bit PCM mono bytes to text.
+
+        `vad_filter` lets faster-whisper's Silero VAD strip non-speech
+        (pauses, trailing silence) before decoding — used on the model side,
+        whose whole-turn buffers are the main hallucination source. Decoding
+        never conditions on previous text, which prevents repetition loops.
+        """
         model = self._get_model()
         samples = np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0
         with self._whisper_lock:
             segments, _info = model.transcribe(
                 samples,
                 language=self.language,
+                condition_on_previous_text=False,
                 hallucination_silence_threshold=_HALLUCINATION_SILENCE_THRESHOLD,
+                vad_filter=vad_filter,
             )
             text = " ".join(segment.text.strip() for segment in segments).strip()
         return text

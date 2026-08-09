@@ -295,8 +295,9 @@ class GeminiLiveClient:
                         for part in model_turn.parts:
                             if part.inline_data and part.inline_data.data:
                                 self.player.play_chunk(part.inline_data.data)
-                                # Feed the same audio to local STT for history.
                                 if self.transcript_service:
+                                    # The model replying ends the user's turn.
+                                    self.transcript_service.flush_user_turn()
                                     self.transcript_service.feed_model_audio(
                                         part.inline_data.data
                                     )
