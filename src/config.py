@@ -43,6 +43,15 @@ class AppConfig:
     # Local embeddings (fastembed) for semantic memory over past messages.
     embedding_model: str = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
 
+    # Native Local LLM Parameters (llama-cpp-python)
+    local_model_repo_id: str = os.getenv("LOCAL_MODEL_REPO_ID", "bartowski/Qwen_Qwen3.5-2B-GGUF")
+    local_model_filename: str = os.getenv("LOCAL_MODEL_FILENAME", "Qwen_Qwen3.5-2B-Q4_K_M.gguf")
+    local_model_n_ctx: int = int(os.getenv("LOCAL_MODEL_N_CTX", "4096"))
+    local_model_system_prompt: str = os.getenv(
+        "LOCAL_MODEL_SYSTEM_PROMPT",
+        "You are Qwen3.5, a helpful, intelligent local AI assistant embedded inside Cubey."
+    )
+
     def validate(self) -> None:
         """Validate critical configuration fields."""
         if not self.api_key:

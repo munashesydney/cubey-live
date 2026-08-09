@@ -139,6 +139,25 @@ print("Embedding model ready.")
 PY
 
 # ---------------------------------------------------------------------------
+# Pre-download Local LLM model (Qwen 2B GGUF)
+# ---------------------------------------------------------------------------
+echo "==> Pre-downloading Local LLM model..."
+"${VENV}/bin/python" - "${PROJECT_ROOT}" <<'PY'
+import sys
+import os
+from huggingface_hub import hf_hub_download
+
+project_root = sys.argv[1]
+repo_id = os.getenv("LOCAL_MODEL_REPO_ID", "bartowski/Qwen_Qwen3.5-2B-GGUF")
+filename = os.getenv("LOCAL_MODEL_FILENAME", "Qwen_Qwen3.5-2B-Q4_K_M.gguf")
+models_dir = os.path.join(project_root, "data", "models")
+
+print(f"Downloading {filename} from {repo_id} to {models_dir} (this is ~1.4GB and will take some time)...")
+hf_hub_download(repo_id=repo_id, filename=filename, local_dir=models_dir, local_dir_use_symlinks=False)
+print("Local LLM model ready.")
+PY
+
+# ---------------------------------------------------------------------------
 # Audio sanity check
 # ---------------------------------------------------------------------------
 echo "==> Detected audio devices (note the input/output indices):"

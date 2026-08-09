@@ -15,6 +15,7 @@ from src.db import (
     list_conversations,
     list_messages,
 )
+from src.gui.local_chat_window import LocalChatWindow
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,8 @@ class DeveloperWindow(ctk.CTkToplevel):
         self.on_send_interruption = on_send_interruption
         self.on_toggle_mute = on_toggle_mute
         self.is_session_active = is_session_active
+
+        self.local_chat_win: Optional[LocalChatWindow] = None
 
         # Window properties
         self.title("🛠️ Cubeo Developer Console")
@@ -109,6 +112,20 @@ class DeveloperWindow(ctk.CTkToplevel):
         )
         self.session_button.pack(side="left", padx=5)
         self._update_session_button_state()
+
+        # Local Chat Window Button
+        self.local_chat_btn = ctk.CTkButton(
+            controls_box,
+            text="🦙 Local Qwen Chat",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            fg_color="#CBA6F7",
+            hover_color="#B4BEFE",
+            text_color="#11111B",
+            width=150,
+            height=34,
+            command=self._open_local_chat
+        )
+        self.local_chat_btn.pack(side="left", padx=5)
 
         # Main Split Grid
         self.main_grid = ctk.CTkFrame(self, fg_color="transparent")
@@ -243,6 +260,14 @@ class DeveloperWindow(ctk.CTkToplevel):
             text_color="#BAC2DE"
         )
         self.status_label.pack(side="left", padx=15, pady=2)
+
+    def _open_local_chat(self) -> None:
+        """Open or focus the dedicated Local Qwen3.5 Chat Window."""
+        if self.local_chat_win is None or not self.local_chat_win.winfo_exists():
+            self.local_chat_win = LocalChatWindow(master=self, app_config=self.config)
+        else:
+            self.local_chat_win.lift()
+            self.local_chat_win.focus()
 
     def set_status(self, status: str) -> None:
         """Thread-safe update to connection status."""
