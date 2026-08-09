@@ -15,7 +15,14 @@ from google.genai import types
 from src.config import AppConfig
 from src.audio.recorder import AudioRecorder
 from src.audio.player import AudioPlayer
-from src.client.tools import REACT_TOOL_DECLARATION, execute_react_tool
+from src.client.tools import (
+    MESSAGES_TOOL_DECLARATION,
+    REACT_TOOL_DECLARATION,
+    execute_messages_tool,
+    execute_react_tool,
+)
+from src.services.embeddings import EmbeddingService
+from src.services.stt import LocalTranscriptService
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +58,9 @@ class GeminiLiveClient:
         on_transcript: Optional[Callable[[str, str], None]] = None,
         on_log: Optional[Callable[[str], None]] = None,
         on_tool_reaction: Optional[Callable[[str], None]] = None,
+        on_session_ended: Optional[Callable[[], None]] = None,
+        transcript_service: Optional[LocalTranscriptService] = None,
+        embedding_service: Optional[EmbeddingService] = None,
     ):
         self.config = config
         self.recorder = recorder
@@ -59,12 +69,16 @@ class GeminiLiveClient:
         self.on_transcript = on_transcript
         self.on_log = on_log
         self.on_tool_reaction = on_tool_reaction
+        self.on_session_ended = on_session_ended
+        self.transcript_service = transcript_service
+        self.embedding_service = embedding_service
 
         self.is_connected = False
         self._session = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._tasks: list[asyncio.Task] = []
         self._stop_event = asyncio.Event()
+        self._model_text_buffer: list[str] = []
 
         self._pause_mic_until: float = 0.0
 
@@ -104,7 +118,7 @@ class GeminiLiveClient:
         try:
             live_config = types.LiveConnectConfig(
                 response_modalities=[types.Modality.AUDIO],
-                tools=[REACT_TOOL_DECLARATION],  # Register react tool
+                tools=[REACT_TOOL_DECLARATION, MESSAGES_TOOL_DECLARATION],  # Register react tool
                 speech_config=types.SpeechConfig(
                     voice_config=types.VoiceConfig(
                         prebuilt_voice_config=types.PrebuiltVoiceConfig(
@@ -167,6 +181,11 @@ class GeminiLiveClient:
                 self.set_status("Disconnected (Error) 🔴")
             else:
                 self.set_status("Disconnected 🔴")
+            if self.on_session_ended:
+                try:
+                    self.on_session_ended()
+                except Exception as e:
+                    logger.exception("on_session_ended callback failed: %s", e)
 
     def stop_session(self) -> None:
         """Signal live session to shut down."""
@@ -272,6 +291,35 @@ class GeminiLiveClient:
                                 except Exception as tool_err:
                                     self.log(f"❌ Error sending tool response: {tool_err}")
 
+                            elif fn_call.name == "messages":
+                                args = fn_call.args or {}
+                                query = args.get("query", "")
+                                limit = args.get("limit")
+
+                                self.log(f"🔍 [AI Tool Call]: messages(query='{query}')")
+
+                                # Search stored conversation history via embeddings
+                                result_dict = execute_messages_tool(
+                                    query=query,
+                                    limit=limit,
+                                    embedding_service=self.embedding_service
+                                )
+
+                                # Return tool response frame back over WebSocket
+                                try:
+                                    await self._session.send_tool_response(
+                                        function_responses=[
+                                            types.FunctionResponse(
+                                                name=fn_call.name,
+                                                id=fn_call.id,
+                                                response=result_dict
+                                            )
+                                        ]
+                                    )
+                                    self.log(f"✓ Returned tool_response for '{fn_call.name}'")
+                                except Exception as tool_err:
+                                    self.log(f"❌ Error sending tool response: {tool_err}")
+
                     server_content = response.server_content
                     if server_content is None:
                         continue
@@ -282,9 +330,26 @@ class GeminiLiveClient:
                         for part in model_turn.parts:
                             if part.inline_data and part.inline_data.data:
                                 self.player.play_chunk(part.inline_data.data)
+                                if self.transcript_service:
+                                    # The model replying ends the user's turn.
+                                    self.transcript_service.flush_user_turn()
+                                    self.transcript_service.feed_model_audio(
+                                        part.inline_data.data
+                                    )
+                            if part.text:
+                                self._model_text_buffer.append(part.text)
+
+                    # Flush accumulated model text at the end of its turn
+                    if server_content.turn_complete:
+                        self._flush_model_text()
+                        if self.transcript_service:
+                            self.transcript_service.flush_model_turn()
 
                     # Handle server-side barge-in / interruption signal
                     if server_content.interrupted:
+                        self._flush_model_text()
+                        if self.transcript_service:
+                            self.transcript_service.flush_model_turn()
                         self.player.clear()
                         self.log("⚡ [Server Barge-in Detected] Gemini cut off generation.")
 
@@ -292,6 +357,13 @@ class GeminiLiveClient:
             pass
         except Exception as e:
             self.log(f"Error in receive responses loop: {e}")
+
+    def _flush_model_text(self) -> None:
+        """Emit accumulated model text as one transcript line and reset the buffer."""
+        text = " ".join(part.strip() for part in self._model_text_buffer if part.strip())
+        self._model_text_buffer = []
+        if text and self.on_transcript:
+            self.on_transcript("Model", text)
 
     def _dispatch_tool_reaction(self, reaction_type: str) -> None:
         """Thread-safely dispatch tool reaction to GUI on main thread."""

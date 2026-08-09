@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+#
+# setup_pi.sh — one-shot bootstrap for running Cubey on a fresh Raspberry Pi.
+#
+# Assumes the project folder is already on the Pi (scp/USB). Run as your
+# normal desktop user (the one that logs into the screen), not root:
+#
+#     bash scripts/startup/setup_pi.sh
+#
+# Installs system packages, Python dependencies, .env, database migrations,
+# pre-downloads the faster-whisper + Silero VAD models, and (by default)
+# installs a systemd service so Cubey starts automatically at boot.
+# Pass --no-autostart to skip the systemd service.
+#
+# Idempotent: safe to re-run at any time.
+#
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Locate the project root (this script lives in <project>/scripts/startup).
+# ---------------------------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+# ---------------------------------------------------------------------------
+# Preflight checks
+# ---------------------------------------------------------------------------
+if [[ "$(uname -m)" != "aarch64" && "$(uname -m)" != "arm64" ]]; then
+    echo "ERROR: 64-bit Raspberry Pi OS is required (found: $(uname -m))." >&2
+    echo "faster-whisper needs arm64 wheels; reinstall Raspberry Pi OS 64-bit." >&2
+    exit 1
+fi
+
+if [[ $EUID -eq 0 ]]; then
+    echo "ERROR: run this script as your normal desktop user, not root." >&2
+    echo "The virtualenv and systemd service must belong to your login user." >&2
+    exit 1
+fi
+
+if [[ ! -f "${PROJECT_ROOT}/requirements.txt" || ! -f "${PROJECT_ROOT}/main.py" ]]; then
+    echo "ERROR: could not find the Cubey project at: ${PROJECT_ROOT}" >&2
+    echo "Make sure the project folder is on the Pi and run:" >&2
+    echo "  bash scripts/startup/setup_pi.sh" >&2
+    exit 1
+fi
+
+echo "==> Cubey setup on $(hostname) ($(uname -m))"
+echo "    Project root: ${PROJECT_ROOT}"
+
+# ---------------------------------------------------------------------------
+# System packages
+# ---------------------------------------------------------------------------
+echo "==> Installing system packages (may take a while)..."
+sudo apt-get update
+sudo apt-get install -y \
+    python3-venv python3-pip python3-tk \
+    portaudio19-dev libasound2-dev \
+    libgomp1 \
+    libjpeg-dev libpng-dev zlib1g-dev \
+    alsa-utils ffmpeg
+
+# ---------------------------------------------------------------------------
+# Python virtualenv + dependencies
+# ---------------------------------------------------------------------------
+VENV="${PROJECT_ROOT}/.venv"
+if [[ ! -x "${VENV}/bin/python" ]]; then
+    echo "==> Creating Python virtualenv..."
+    python3 -m venv "${VENV}"
+fi
+
+echo "==> Installing Python dependencies..."
+"${VENV}/bin/pip" install --upgrade pip setuptools wheel
+"${VENV}/bin/pip" install -r "${PROJECT_ROOT}/requirements.txt"
+
+# ---------------------------------------------------------------------------
+# .env (API key)
+# ---------------------------------------------------------------------------
+if [[ ! -f "${PROJECT_ROOT}/.env" ]]; then
+    cp "${PROJECT_ROOT}/env.example" "${PROJECT_ROOT}/.env"
+fi
+
+if grep -q "GEMINI_API_KEY=your_gemini_api_key_here" "${PROJECT_ROOT}/.env"; then
+    read -r -p "Enter your GEMINI_API_KEY (blank to skip, edit .env later): " KEY
+    if [[ -n "${KEY}" ]]; then
+        sed -i "s|^GEMINI_API_KEY=.*|GEMINI_API_KEY=${KEY}|" "${PROJECT_ROOT}/.env"
+        echo "GEMINI_API_KEY written to .env"
+    else
+        echo "Skipped — set GEMINI_API_KEY in ${PROJECT_ROOT}/.env before first run."
+    fi
+fi
+chmod 600 "${PROJECT_ROOT}/.env"
+
+# ---------------------------------------------------------------------------
+# Database migrations
+# ---------------------------------------------------------------------------
+echo "==> Running database migrations..."
+(
+    cd "${PROJECT_ROOT}"
+    "${VENV}/bin/python" -m alembic upgrade head
+)
+
+# ---------------------------------------------------------------------------
+# Pre-download STT models (whisper 'small' + Silero VAD)
+# ---------------------------------------------------------------------------
+echo "==> Pre-downloading faster-whisper model and Silero VAD..."
+set -a
+# shellcheck disable=SC1091
+[ -f "${PROJECT_ROOT}/.env" ] && source "${PROJECT_ROOT}/.env"
+set +a
+STT_MODEL_SIZE="${STT_MODEL_SIZE:-small}"
+
+"${VENV}/bin/python" - "${STT_MODEL_SIZE}" <<'PY'
+import sys
+
+import numpy as np
+from faster_whisper import WhisperModel
+
+size = sys.argv[1]
+print(f"Loading faster-whisper '{size}' (downloads on first run)...")
+model = WhisperModel(size, device="cpu", compute_type="int8")
+# A silence transcribe with vad_filter also pulls the Silero VAD model.
+model.transcribe(np.zeros(16000, dtype=np.float32), language="en", vad_filter=True)
+print("STT models ready.")
+PY
+
+# ---------------------------------------------------------------------------
+# Pre-download embedding model (fastembed)
+# ---------------------------------------------------------------------------
+EMBEDDING_MODEL="${EMBEDDING_MODEL:-BAAI/bge-small-en-v1.5}"
+
+echo "==> Pre-downloading embedding model (${EMBEDDING_MODEL})..."
+"${VENV}/bin/python" - "${EMBEDDING_MODEL}" <<'PY'
+import sys
+
+from fastembed import TextEmbedding
+
+TextEmbedding(sys.argv[1])
+print("Embedding model ready.")
+PY
+
+# ---------------------------------------------------------------------------
+# Audio sanity check
+# ---------------------------------------------------------------------------
+echo "==> Detected audio devices (note the input/output indices):"
+"${VENV}/bin/python" -c "import sounddevice as sd; print(sd.query_devices())" || true
+
+# ---------------------------------------------------------------------------
+# Boot autostart (systemd)
+# ---------------------------------------------------------------------------
+if [[ "${1:-}" == "--no-autostart" ]]; then
+    echo "==> Skipping boot autostart (--no-autostart)."
+else
+    echo "==> Installing boot autostart (systemd service)..."
+    sed -e "s|__USER__|${USER}|g" \
+        -e "s|__PROJECT_ROOT__|${PROJECT_ROOT}|g" \
+        -e "s|__VENV_PYTHON__|${VENV}/bin/python|g" \
+        -e "s|__XDG_RUNTIME_DIR__|/run/user/$(id -u)|g" \
+        -e "s|__DISPLAY__|:0|g" \
+        "${SCRIPT_DIR}/cubey.service" \
+        | tr -d '\r' \
+        | sudo tee /etc/systemd/system/cubey.service > /dev/null
+
+    sudo systemctl daemon-reload
+    sudo systemctl enable cubey.service
+    if sudo systemctl start cubey.service; then
+        echo "==> Cubey autostart installed and started."
+    else
+        echo "Warning: cubey.service did not start cleanly. Logs: journalctl -u cubey -n 50" >&2
+    fi
+    echo "    Disable later with: sudo systemctl disable --now cubey"
+fi
+
+# ---------------------------------------------------------------------------
+# Done
+# ---------------------------------------------------------------------------
+echo
+echo "==> Setup complete!"
+echo "    Manual start:  ${VENV}/bin/python ${PROJECT_ROOT}/main.py"
+echo "    Or use:        bash ${SCRIPT_DIR}/run.sh"
+echo
+echo "    If audio picks the wrong device, configure it with:"
+echo "      sudo raspi-config  (System Options > Audio)"

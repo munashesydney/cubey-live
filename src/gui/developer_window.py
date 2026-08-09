@@ -9,6 +9,12 @@ import customtkinter as ctk
 from typing import Callable, Optional
 
 from src.config import AppConfig
+from src.db import (
+    ConversationStatus,
+    get_conversation,
+    list_conversations,
+    list_messages,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -222,6 +228,10 @@ class DeveloperWindow(ctk.CTkToplevel):
         )
         self.log_box.pack(fill="both", expand=True, padx=5, pady=5)
 
+        # Tab 3: Saved Conversations
+        self.tab_convos = self.right_panel.add("🗂️ Conversations")
+        self._build_conversations_tab()
+
         # Bottom Status Bar
         self.status_bar = ctk.CTkFrame(self, height=26, fg_color="#11111B")
         self.status_bar.pack(fill="x", side="bottom")
@@ -241,8 +251,10 @@ class DeveloperWindow(ctk.CTkToplevel):
                 self.status_label.configure(text=f"Status: {status}")
                 if "Connected" in status or "Live" in status:
                     self.is_session_active = True
+                    self.after(200, self.refresh_conversations)
                 elif "Disconnected" in status or "Idle" in status:
                     self.is_session_active = False
+                    self.after(200, self.refresh_conversations)
                 self._update_session_button_state()
         except Exception:
             pass
@@ -275,6 +287,126 @@ class DeveloperWindow(ctk.CTkToplevel):
                 self.log_box.see("end")
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # Conversations tab
+    # ------------------------------------------------------------------
+
+    def _build_conversations_tab(self) -> None:
+        """Build the saved-conversations list + message detail view."""
+        toolbar = ctk.CTkFrame(self.tab_convos, fg_color="transparent")
+        toolbar.pack(fill="x", padx=8, pady=(8, 2))
+
+        self.convo_count_label = ctk.CTkLabel(
+            toolbar,
+            text="",
+            font=ctk.CTkFont(size=11),
+            text_color="#BAC2DE"
+        )
+        self.convo_count_label.pack(side="left")
+
+        ctk.CTkButton(
+            toolbar,
+            text="🔄 Refresh",
+            width=90,
+            height=28,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            fg_color="#89B4FA",
+            hover_color="#B4BEFE",
+            text_color="#11111B",
+            command=self.refresh_conversations
+        ).pack(side="right")
+
+        body = ctk.CTkFrame(self.tab_convos, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=8, pady=(2, 8))
+        body.columnconfigure(0, weight=2)
+        body.columnconfigure(1, weight=3)
+        body.rowconfigure(0, weight=1)
+
+        self.convo_list_frame = ctk.CTkScrollableFrame(
+            body, fg_color="#1E1E2E", corner_radius=8
+        )
+        self.convo_list_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+
+        self.convo_detail_box = ctk.CTkTextbox(
+            body,
+            font=ctk.CTkFont(family="Consolas", size=11),
+            wrap="word",
+            fg_color="#1E1E2E",
+            text_color="#CDD6F4"
+        )
+        self.convo_detail_box.grid(row=0, column=1, sticky="nsew")
+
+        self.refresh_conversations()
+
+    def refresh_conversations(self) -> None:
+        """Reload the conversation list from the database."""
+        try:
+            conversations = list_conversations(limit=100)
+        except Exception as e:
+            logger.warning("Failed to load conversations: %s", e)
+            return
+
+        for child in self.convo_list_frame.winfo_children():
+            child.destroy()
+
+        self.convo_count_label.configure(text=f"{len(conversations)} conversation(s)")
+
+        for conv in conversations:
+            btn = ctk.CTkButton(
+                self.convo_list_frame,
+                text=self._format_conversation(conv),
+                anchor="w",
+                height=38,
+                corner_radius=6,
+                fg_color="#313244",
+                hover_color="#45475A",
+                text_color="#CDD6F4",
+                font=ctk.CTkFont(size=11),
+                command=lambda cid=conv.id: self._show_conversation(cid)
+            )
+            btn.pack(fill="x", padx=4, pady=2)
+
+    @staticmethod
+    def _format_conversation(conv) -> str:
+        """One-line summary used for each row in the conversation list."""
+        title = (conv.title or "(untitled)")[:28]
+        started = conv.started_at.strftime("%Y-%m-%d %H:%M") if conv.started_at else "?"
+        icon = {
+            ConversationStatus.ACTIVE: "🟢",
+            ConversationStatus.COMPLETED: "⚪",
+            ConversationStatus.ARCHIVED: "🗄️",
+        }.get(conv.status, "·")
+        return f"{icon} {title}\n{started} · {conv.session_id[:8]}"
+
+    def _show_conversation(self, conversation_id: int) -> None:
+        """Render the selected conversation's messages in the detail box."""
+        try:
+            conv = get_conversation(conversation_id=conversation_id)
+            messages = list_messages(conversation_id=conversation_id, limit=500)
+        except Exception as e:
+            logger.warning("Failed to load conversation #%s: %s", conversation_id, e)
+            return
+
+        self.convo_detail_box.delete("1.0", "end")
+        if conv is None:
+            self.convo_detail_box.insert("end", "(conversation not found)\n")
+            return
+
+        title = conv.title or "(untitled)"
+        started = conv.started_at.strftime("%Y-%m-%d %H:%M") if conv.started_at else "?"
+        ended = conv.ended_at.strftime("%Y-%m-%d %H:%M") if conv.ended_at else "still active"
+        self.convo_detail_box.insert(
+            "end",
+            f"#{conv.id} · {title} · {conv.status.value}\n"
+            f"{started} → {ended} · {conv.session_id}\n"
+            + "=" * 60 + "\n",
+        )
+        for msg in messages:
+            self.convo_detail_box.insert(
+                "end", f"[{msg.role.value}] {msg.content}\n\n"
+            )
+        self.convo_detail_box.see("1.0")
 
     def _update_session_button_state(self) -> None:
         """Update button appearance based on session state."""

@@ -1,0 +1,66 @@
+# Cubey Database Migrations
+
+Alembic manages the schema for Cubey's SQLite database (`data/cubey.db`).
+
+## How it's wired
+
+- **`alembic.ini`** — Alembic config. `script_location` points here; the
+  database URL is intentionally *not* hardcoded here.
+- **`migrations/env.py`** — pulls the URL from `src/config.py`
+  (`DATABASE_URL`, default `sqlite:///data/cubey.db`) and points
+  `target_metadata` at `src.db.Base.metadata`, so `autogenerate` diffs the
+  ORM models against the live database.
+- **`migrations/versions/`** — one file per revision, applied in order.
+
+The schema's source of truth is the ORM models in `src/db/models/`. The
+migration scripts are reviewed, committed versions of the changes.
+
+## Commands
+
+Run these from the project root (`python -m alembic` works everywhere,
+including Windows):
+
+| Task | Command |
+|---|---|
+| Apply all pending migrations | `python -m alembic upgrade head` |
+| Upgrade to a specific revision | `python -m alembic upgrade <rev_id>` |
+| Roll back one revision | `python -m alembic downgrade -1` |
+| Roll back everything | `python -m alembic downgrade base` |
+| Check for model/database drift | `python -m alembic check` |
+| Show current revision | `python -m alembic current` |
+| Show revision history | `python -m alembic history` |
+
+## Workflow for schema changes
+
+1. Edit the model (e.g. `src/db/models/conversation.py`) or add a new model.
+2. Make sure the new model is imported from `src/db/models/__init__.py` so
+   Alembic can see it.
+3. Generate a draft revision:
+   `python -m alembic revision --autogenerate -m "describe the change"`
+4. **Review the generated file** — autogenerate is a draft, not gospel.
+   Check that `upgrade()` and `downgrade()` are symmetric and correct.
+5. Apply it: `python -m alembic upgrade head`
+6. Run `python -m alembic check` to confirm models and database agree.
+
+On a fresh clone: install `requirements.txt`, then `alembic upgrade head`
+creates `data/cubey.db` (the folder is created automatically) with no data.
+
+## Notes for future devs
+
+- **The DB file is gitignored.** Never commit `data/cubey.db`; migrations
+  are the contract. This is what lets a fresh clone recreate the schema.
+- **SQLite specifics** — connections run in WAL mode with
+  `foreign_keys=ON` and a 5 s `busy_timeout` (set in `src/db/base.py`).
+  These apply on every connection, so the GUI thread and the asyncio worker
+  thread can both touch the database.
+- **Enums** are stored as lowercase strings (`active`, `completed`,
+  `archived`) via `values_callable` on `ConversationStatus`, with a
+  `CheckConstraint` enforcing the domain at the DB level. If you add enum
+  values, update both the enum and the constraint, and regenerate.
+- **Timestamps** are timezone-aware UTC on the Python side. SQLite stores
+  them as naive UTC strings, so treat any returned `DateTime` as UTC.
+- **Don't hand-edit applied revisions.** If a migration is already applied
+  to a database, change it by adding a new revision instead. The exception
+  is the initial revision while nothing real is stored yet.
+- Windows users: plain `alembic` may not be on PATH in every environment;
+  `python -m alembic` is always safe.
