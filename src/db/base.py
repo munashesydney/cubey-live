@@ -7,6 +7,7 @@ database safe to hit from both the GUI thread and the asyncio worker thread.
 """
 
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -19,6 +20,11 @@ logger = logging.getLogger(__name__)
 
 # How long a writer waits for a locked database before raising (milliseconds).
 _SQLITE_BUSY_TIMEOUT_MS = 5000
+
+
+def utcnow() -> datetime:
+    """Timezone-aware UTC now (SQLite stores it as a naive UTC string)."""
+    return datetime.now(timezone.utc)
 
 
 class Base(DeclarativeBase):

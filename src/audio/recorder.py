@@ -20,12 +20,14 @@ class AudioRecorder:
         sample_rate: int = 16000,
         channels: int = 1,
         chunk_size: int = 512,
-        on_level_change: Optional[Callable[[float], None]] = None
+        on_level_change: Optional[Callable[[float], None]] = None,
+        on_audio_chunk: Optional[Callable[[bytes], None]] = None
     ):
         self.sample_rate = sample_rate
         self.channels = channels
         self.chunk_size = chunk_size
         self.on_level_change = on_level_change
+        self.on_audio_chunk = on_audio_chunk
         
         self.is_recording = False
         self.is_muted = False
@@ -90,6 +92,14 @@ class AudioRecorder:
             
         # Push to asyncio queue thread-safely
         self._loop.call_soon_threadsafe(self.audio_queue.put_nowait, data)
+
+        # Fan out to secondary consumers (e.g. local STT for conversation history).
+        # This runs on the sounddevice audio thread; sinks must be thread-safe.
+        if self.on_audio_chunk and not self.is_muted:
+            try:
+                self.on_audio_chunk(data)
+            except Exception:
+                pass
         
         # Calculate RMS level for UI meter
         if self.on_level_change and not self.is_muted:

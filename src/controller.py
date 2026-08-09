@@ -5,15 +5,34 @@ Application Controller orchestrating asyncio worker threads, audio pipeline, Gem
 import asyncio
 import logging
 import threading
+import uuid
 from typing import Optional
 
 from src.config import config
 from src.audio.recorder import AudioRecorder
 from src.audio.player import AudioPlayer
 from src.client.live_client import GeminiLiveClient
+from src.db import (
+    MessageRole,
+    create_conversation,
+    create_message,
+    end_conversation,
+    update_conversation,
+)
 from src.gui.app import GeminiLiveApp
+from src.stt import LocalTranscriptService
 
 logger = logging.getLogger(__name__)
+
+# Role names used by GeminiLiveClient transcripts -> persisted MessageRole.
+_ROLE_MAP = {
+    "Model": MessageRole.MODEL,
+    "User": MessageRole.USER,
+    "User Event": MessageRole.EVENT,
+}
+
+# Keep titles short enough for the dev-console conversation list.
+_TITLE_MAX_CHARS = 60
 
 class ApplicationController:
     """Coordinates asyncio worker thread, live client session with AI tool calls, and CustomTkinter GUI."""
@@ -28,7 +47,19 @@ class ApplicationController:
         self.client: Optional[GeminiLiveClient] = None
         self.gui: Optional[GeminiLiveApp] = None
 
+        # On-device STT that transcribes both sides of the conversation into
+        # the transcript/history without touching the live audio path.
+        self.transcript_service = LocalTranscriptService(
+            model_size=config.stt_model_size,
+            language=config.stt_language,
+            on_result=self._on_transcript_received,
+        )
+
         self._session_task: Optional[asyncio.Task] = None
+
+        # Active DB-backed conversation for the current live session.
+        self._active_conversation_id: Optional[int] = None
+        self._conversation_titled: bool = False
 
     def start(self) -> None:
         """Start background asyncio loop thread and launch GUI mainloop."""
@@ -53,7 +84,8 @@ class ApplicationController:
             sample_rate=self.config.input_sample_rate,
             channels=self.config.channels,
             chunk_size=self.config.chunk_size,
-            on_level_change=self._on_mic_level_changed
+            on_level_change=self._on_mic_level_changed,
+            on_audio_chunk=self.transcript_service.feed_user_audio
         )
 
         # 3. Create Gemini Live Client with Tool Reaction Callback
@@ -64,7 +96,9 @@ class ApplicationController:
             on_status_change=self._on_status_changed,
             on_transcript=self._on_transcript_received,
             on_log=self._on_log_received,
-            on_tool_reaction=self._on_tool_reaction_triggered
+            on_tool_reaction=self._on_tool_reaction_triggered,
+            on_session_ended=self._on_session_ended,
+            transcript_service=self.transcript_service
         )
 
         # 4. Create CustomTkinter GUI app
@@ -94,6 +128,8 @@ class ApplicationController:
                 return
 
         if self.client and self.async_loop and self.async_loop.is_running():
+            self._begin_conversation()
+            self.transcript_service.start()
             logger.info("Scheduling Live session start...")
             self._session_task = asyncio.run_coroutine_threadsafe(
                 self.client.start_session(),
@@ -137,7 +173,12 @@ class ApplicationController:
             self.gui.after(0, self.gui.set_status, status)
 
     def _on_transcript_received(self, role: str, text: str) -> None:
-        """Callback when transcript text is received from Gemini or User event."""
+        """Callback when transcript text is received from Gemini or User event.
+
+        Runs on the asyncio worker thread. Persists the line against the active
+        conversation (if any), then forwards it to the GUI.
+        """
+        self._persist_message(role, text)
         if self.gui and self.gui.winfo_exists():
             self.gui.after(0, self.gui.append_transcript, role, text)
 
@@ -145,3 +186,57 @@ class ApplicationController:
         """Callback for log messages."""
         if self.gui and self.gui.winfo_exists():
             self.gui.after(0, self.gui.append_log, message)
+
+    # ------------------------------------------------------------------
+    # Database-backed conversation lifecycle
+    # ------------------------------------------------------------------
+
+    def _begin_conversation(self) -> None:
+        """Create a new ACTIVE conversation row for the upcoming live session."""
+        try:
+            conversation = create_conversation(session_id=uuid.uuid4().hex)
+            self._active_conversation_id = conversation.id
+            self._conversation_titled = False
+            logger.info("Started conversation #%s", conversation.id)
+        except Exception as e:
+            logger.error("Failed to create conversation record: %s", e)
+            self._active_conversation_id = None
+            self._conversation_titled = False
+
+    def _on_session_ended(self) -> None:
+        """Callback from the client when the live session fully terminates.
+
+        Runs on the asyncio worker thread. Marks the active conversation
+        COMPLETED with an ended_at timestamp.
+        """
+        conversation_id = self._active_conversation_id
+        self._active_conversation_id = None
+        self._conversation_titled = False
+        self.transcript_service.stop()
+        if conversation_id is None:
+            return
+        try:
+            ended = end_conversation(conversation_id)
+            logger.info("Ended conversation #%s (%s)", conversation_id, ended.status if ended else "missing")
+        except Exception as e:
+            logger.error("Failed to end conversation #%s: %s", conversation_id, e)
+
+    def _persist_message(self, role: str, text: str) -> None:
+        """Persist a transcript line against the active conversation."""
+        conversation_id = self._active_conversation_id
+        if conversation_id is None or not text.strip():
+            return
+        message_role = _ROLE_MAP.get(role, MessageRole.SYSTEM)
+        try:
+            create_message(conversation_id, role=message_role, content=text)
+            # Auto-title the conversation from its first user/external input.
+            if (
+                not self._conversation_titled
+                and message_role in (MessageRole.USER, MessageRole.EVENT)
+            ):
+                title = text.strip()[:_TITLE_MAX_CHARS]
+                if title:
+                    update_conversation(conversation_id, title=title)
+                    self._conversation_titled = True
+        except Exception as e:
+            logger.warning("Failed to persist message: %s", e)

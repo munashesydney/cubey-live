@@ -11,14 +11,17 @@ explicit session is passed in, so they are safe to call from any thread.
 """
 
 from src.db.base import Base, SessionLocal, engine
-from src.db.models import Conversation, ConversationStatus
+from src.db.models import Conversation, ConversationStatus, Message, MessageRole
 from src.db.repositories import (
     count_conversations,
+    count_messages,
     create_conversation,
+    create_message,
     delete_conversation,
     end_conversation,
     get_conversation,
     list_conversations,
+    list_messages,
     update_conversation,
 )
 from src.db.session import get_session
@@ -27,14 +30,19 @@ __all__ = [
     "Base",
     "Conversation",
     "ConversationStatus",
+    "Message",
+    "MessageRole",
     "SessionLocal",
     "count_conversations",
+    "count_messages",
     "create_conversation",
+    "create_message",
     "delete_conversation",
     "end_conversation",
     "engine",
     "get_conversation",
     "get_session",
     "list_conversations",
+    "list_messages",
     "update_conversation",
 ]

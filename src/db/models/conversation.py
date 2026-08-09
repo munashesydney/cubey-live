@@ -3,19 +3,14 @@ Conversation ORM model — one row per interactive session between user and Cube
 """
 
 import enum
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Optional
 
 from sqlalchemy import JSON, CheckConstraint, DateTime, Integer, String
 from sqlalchemy import Enum as SqlEnum
 from sqlalchemy.orm import Mapped, mapped_column
 
-from src.db.base import Base
-
-
-def _utcnow() -> datetime:
-    """Timezone-aware UTC now (SQLite stores it as a naive UTC string)."""
-    return datetime.now(timezone.utc)
+from src.db.base import Base, utcnow
 
 
 class ConversationStatus(str, enum.Enum):
@@ -66,16 +61,16 @@ class Conversation(Base):
         "metadata", JSON, nullable=True
     )
     started_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=_utcnow
+        DateTime(timezone=True), nullable=False, default=utcnow
     )
     ended_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=_utcnow
+        DateTime(timezone=True), nullable=False, default=utcnow
     )
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+        DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow
     )
 
     def __repr__(self) -> str:
