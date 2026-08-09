@@ -1,13 +1,21 @@
 """
-Configuration settings for the Gemini Live Voice & Interruption Simulator.
+Configuration settings for Cubey - the Gemini Live Voice & Interruption Simulator.
 """
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 from dotenv import load_dotenv
 
 # Load environment variables from .env if present
 load_dotenv()
+
+# Project root (two levels up from src/config.py -> project root)
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# Default location for the SQLite database file
+DEFAULT_DATA_DIR = PROJECT_ROOT / "data"
+DEFAULT_DB_PATH = DEFAULT_DATA_DIR / "cubey.db"
 
 @dataclass
 class AppConfig:
@@ -21,6 +29,10 @@ class AppConfig:
     output_sample_rate: int = int(os.getenv("OUTPUT_SAMPLE_RATE", "24000"))
     channels: int = int(os.getenv("CHANNELS", "1"))
     chunk_size: int = 512  # low-latency frame buffer size
+
+    # Database Parameters
+    database_url: str = os.getenv("DATABASE_URL", f"sqlite:///{DEFAULT_DB_PATH.as_posix()}")
+    database_path: Path = field(default_factory=lambda: DEFAULT_DB_PATH)
 
     def validate(self) -> None:
         """Validate critical configuration fields."""
