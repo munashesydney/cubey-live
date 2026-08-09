@@ -24,15 +24,22 @@ from src.stt import LocalTranscriptService
 
 logger = logging.getLogger(__name__)
 
-# Role names used by GeminiLiveClient transcripts -> persisted MessageRole.
-_ROLE_MAP = {
-    "Model": MessageRole.MODEL,
-    "User": MessageRole.USER,
-    "User Event": MessageRole.EVENT,
-}
-
 # Keep titles short enough for the dev-console conversation list.
 _TITLE_MAX_CHARS = 60
+
+
+def _map_message_role(role: str) -> MessageRole:
+    """Normalize transcript role names (from the live client or local STT) to a
+    persisted MessageRole. Local STT emits lowercase 'user'/'model'; the live
+    client emits 'User Event'/'Model'."""
+    normalized = role.strip().lower()
+    if normalized in ("user",):
+        return MessageRole.USER
+    if normalized in ("model", "ai", "assistant"):
+        return MessageRole.MODEL
+    if normalized in ("user event", "event"):
+        return MessageRole.EVENT
+    return MessageRole.SYSTEM
 
 class ApplicationController:
     """Coordinates asyncio worker thread, live client session with AI tool calls, and CustomTkinter GUI."""
@@ -226,7 +233,7 @@ class ApplicationController:
         conversation_id = self._active_conversation_id
         if conversation_id is None or not text.strip():
             return
-        message_role = _ROLE_MAP.get(role, MessageRole.SYSTEM)
+        message_role = _map_message_role(role)
         try:
             create_message(conversation_id, role=message_role, content=text)
             # Auto-title the conversation from its first user/external input.
