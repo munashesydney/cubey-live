@@ -12,34 +12,15 @@ from typing import Callable, Optional
 from google import genai
 from google.genai import types
 
+from src.ai.prompts.gemini_live import SYSTEM_PROMPT as ROBOT_SYSTEM_INSTRUCTION
 from src.config import AppConfig
 from src.audio.recorder import AudioRecorder
 from src.audio.player import AudioPlayer
-from src.client.tools import (
-    MEMORIES_TOOL_DECLARATION,
-    MESSAGES_TOOL_DECLARATION,
-    REACT_TOOL_DECLARATION,
-    execute_memories_tool,
-    execute_messages_tool,
-    execute_react_tool,
-)
+from src.client.tools import ToolContext, build_gemini_tools, dispatch_tool_call
 from src.services.embeddings import EmbeddingService
 from src.services.stt import LocalTranscriptService
 
 logger = logging.getLogger(__name__)
-
-# System instruction instructing Gemini to call the 'react' tool autonomously
-ROBOT_SYSTEM_INSTRUCTION = (
-    "You are an AI embodied in a physical robot agent. You communicate naturally using speech. "
-    "Respond concisely, warmly, and expressively in real time. "
-    "CRITICAL TOOL INSTRUCTION: You have access to the 'react' tool. Whenever you experience physical "
-    "interactions or physical event text in brackets like [HUMAN KICKED YOU], [OBSTACLE IN PATH], "
-    "[WATER SPILLED ON SENSORS], or [CRITICAL BATTERY 5%], you MUST autonomously call the 'react' tool "
-    "with the corresponding reaction_type ('hurt', 'alert', 'happy', 'surprised', 'skeptical', 'low_battery') AND speak your reaction out loud. "
-    "MEMORY: Use the 'memories' tool to remember durable facts about the user (names, preferences, "
-    "important life details) and to recall them whenever they become relevant. "
-    "Use the 'messages' tool to search past conversation history for things said before."
-)
 
 def compute_pcm_rms(audio_data: bytes) -> float:
     """Calculate RMS volume level of 16-bit PCM mono audio chunk (0.0 to 1.0)."""
@@ -123,11 +104,7 @@ class GeminiLiveClient:
         try:
             live_config = types.LiveConnectConfig(
                 response_modalities=[types.Modality.AUDIO],
-                tools=[
-                    REACT_TOOL_DECLARATION,
-                    MESSAGES_TOOL_DECLARATION,
-                    MEMORIES_TOOL_DECLARATION,
-                ],  # Register react tool
+                tools=build_gemini_tools("live_model"),  # Register react tool
                 speech_config=types.SpeechConfig(
                     voice_config=types.VoiceConfig(
                         prebuilt_voice_config=types.PrebuiltVoiceConfig(
@@ -273,97 +250,34 @@ class GeminiLiveClient:
                     tool_call = response.tool_call
                     if tool_call is not None:
                         for fn_call in tool_call.function_calls:
-                            if fn_call.name == "react":
-                                args = fn_call.args or {}
-                                reaction_type = args.get("reaction_type", "hurt")
-                                
-                                self.log(f"🔧 [AI Tool Call]: react(reaction_type='{reaction_type}')")
-                                
-                                # Execute react tool logic
-                                result_dict = execute_react_tool(
-                                    reaction_type=reaction_type,
-                                    on_trigger_reaction=self._dispatch_tool_reaction
+                            # Single dispatch through the tool registry — the
+                            # live model is allowed everything the policy grants.
+                            result_dict = dispatch_tool_call(
+                                fn_call.name or "",
+                                fn_call.args or {},
+                                ToolContext(
+                                    embedding_service=self.embedding_service,
+                                    on_react=self._dispatch_tool_reaction,
+                                ),
+                            )
+                            self.log(
+                                f"🔧 [AI Tool Call]: {fn_call.name} -> {result_dict.get('status')}"
+                            )
+
+                            # Return tool response frame back over WebSocket
+                            try:
+                                await self._session.send_tool_response(
+                                    function_responses=[
+                                        types.FunctionResponse(
+                                            name=fn_call.name,
+                                            id=fn_call.id,
+                                            response=result_dict
+                                        )
+                                    ]
                                 )
-
-                                # Return tool response frame back over WebSocket
-                                try:
-                                    await self._session.send_tool_response(
-                                        function_responses=[
-                                            types.FunctionResponse(
-                                                name=fn_call.name,
-                                                id=fn_call.id,
-                                                response=result_dict
-                                            )
-                                        ]
-                                    )
-                                    self.log(f"✓ Returned tool_response for '{fn_call.name}'")
-                                except Exception as tool_err:
-                                    self.log(f"❌ Error sending tool response: {tool_err}")
-
-                            elif fn_call.name == "messages":
-                                args = fn_call.args or {}
-                                query = args.get("query", "")
-                                limit = args.get("limit")
-
-                                self.log(f"🔍 [AI Tool Call]: messages(query='{query}')")
-
-                                # Search stored conversation history via embeddings
-                                result_dict = execute_messages_tool(
-                                    query=query,
-                                    limit=limit,
-                                    embedding_service=self.embedding_service
-                                )
-
-                                # Return tool response frame back over WebSocket
-                                try:
-                                    await self._session.send_tool_response(
-                                        function_responses=[
-                                            types.FunctionResponse(
-                                                name=fn_call.name,
-                                                id=fn_call.id,
-                                                response=result_dict
-                                            )
-                                        ]
-                                    )
-                                    self.log(f"✓ Returned tool_response for '{fn_call.name}'")
-                                except Exception as tool_err:
-                                    self.log(f"❌ Error sending tool response: {tool_err}")
-
-                            elif fn_call.name == "memories":
-                                args = fn_call.args or {}
-
-                                self.log(
-                                    "🧠 [AI Tool Call]: memories(action='{}', memory_id={})".format(
-                                        args.get("action"), args.get("memory_id")
-                                    )
-                                )
-
-                                # Add / update / search durable memories
-                                result_dict = execute_memories_tool(
-                                    action=args.get("action"),
-                                    content=args.get("content"),
-                                    category=args.get("category"),
-                                    importance=args.get("importance"),
-                                    memory_id=args.get("memory_id"),
-                                    query=args.get("query"),
-                                    limit=args.get("limit"),
-                                    embedding_service=self.embedding_service
-                                )
-
-                                # Return tool response frame back over WebSocket
-                                try:
-                                    await self._session.send_tool_response(
-                                        function_responses=[
-                                            types.FunctionResponse(
-                                                name=fn_call.name,
-                                                id=fn_call.id,
-                                                response=result_dict
-                                            )
-                                        ]
-                                    )
-                                    self.log(f"✓ Returned tool_response for '{fn_call.name}'")
-                                except Exception as tool_err:
-                                    self.log(f"❌ Error sending tool response: {tool_err}")
+                                self.log(f"✓ Returned tool_response for '{fn_call.name}'")
+                            except Exception as tool_err:
+                                self.log(f"❌ Error sending tool response: {tool_err}")
 
                     server_content = response.server_content
                     if server_content is None:

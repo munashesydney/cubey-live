@@ -5,12 +5,14 @@ Persists chat history in SQLite using existing conversations and messages tables
 """
 
 import datetime
+import json
 import logging
 import uuid
 import customtkinter as ctk
 from typing import Dict, List, Optional
 
 from src.config import AppConfig, config
+from src.client.tools import ToolContext, build_llama_tools
 from src.db import (
     MessageRole,
     create_conversation,
@@ -18,6 +20,7 @@ from src.db import (
     list_conversations,
     list_messages,
 )
+from src.services.embeddings import EmbeddingService
 from src.services.local_llm import LocalLLMService
 
 logger = logging.getLogger(__name__)
@@ -37,6 +40,9 @@ class LocalChatWindow(ctk.CTkToplevel):
             n_ctx=app_config.local_model_n_ctx,
             default_system_prompt=app_config.local_model_system_prompt,
         )
+
+        # Shared embedding service for the memory/history tools.
+        self.embedding_service = EmbeddingService()
 
         # Active conversation state
         self.active_conversation_id: Optional[int] = None
@@ -348,19 +354,39 @@ class LocalChatWindow(ctk.CTkToplevel):
 
         sys_prompt = self.sys_prompt_entry.get().strip() or self.current_system_prompt
 
-        # 6. Call streaming LLM service
+        # 6. Call streaming LLM service (with shared tools from the registry)
         self.llm_service.stream_chat_completion(
             messages=chat_history,
             system_prompt=sys_prompt,
             on_token=self._on_token_received_threadsafe,
             on_complete=self._on_complete_threadsafe,
             on_error=self._on_error_threadsafe,
+            on_tool_call=self._on_tool_call_received,
+            tools=build_llama_tools("local_model"),
+            tool_context=ToolContext(embedding_service=self.embedding_service),
         )
 
     def stop_generation(self) -> None:
         """Halt streaming generation."""
         if self._is_generating:
             self.llm_service.stop_generation()
+
+    def _on_tool_call_received(self, name: str, args: dict, result: dict) -> None:
+        """Callback from the LLM worker thread when a tool is executed."""
+        try:
+            if self.winfo_exists():
+                self.after(0, self._show_tool_call, name, args, result)
+        except Exception:
+            pass
+
+    def _show_tool_call(self, name: str, args: dict, result: dict) -> None:
+        """Render a tool-call line in the transcript on the main thread."""
+        arg_summary = json.dumps(args)[:80]
+        status = result.get("status", "?") if isinstance(result, dict) else "?"
+        self.transcript_box.insert(
+            "end", f"🔧 [tool] {name}({arg_summary}) → {status}\n"
+        )
+        self.transcript_box.see("end")
 
     def _on_token_received_threadsafe(self, token: str) -> None:
         """Callback from background thread for received token."""

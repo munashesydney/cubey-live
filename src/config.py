@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from dotenv import load_dotenv
 
+from src.ai.prompts.local_llm import SYSTEM_PROMPT as _LOCAL_LLM_SYSTEM_PROMPT
+
 # Load environment variables from .env if present
 load_dotenv()
 
@@ -48,8 +50,7 @@ class AppConfig:
     local_model_filename: str = os.getenv("LOCAL_MODEL_FILENAME", "Qwen_Qwen3.5-2B-Q4_K_M.gguf")
     local_model_n_ctx: int = int(os.getenv("LOCAL_MODEL_N_CTX", "4096"))
     local_model_system_prompt: str = os.getenv(
-        "LOCAL_MODEL_SYSTEM_PROMPT",
-        "You are Qwen3.5, a helpful, intelligent local AI assistant embedded inside Cubey."
+        "LOCAL_MODEL_SYSTEM_PROMPT", _LOCAL_LLM_SYSTEM_PROMPT
     )
 
     def validate(self) -> None:
