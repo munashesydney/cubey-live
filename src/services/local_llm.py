@@ -66,6 +66,8 @@ class LocalLLMService:
 
         # Guards the one-time model download/load against concurrent callers.
         self._load_lock = threading.Lock()
+        # Serializes llama.cpp inference (not safe for concurrent calls).
+        self._llm_lock = threading.Lock()
 
         self._active_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
@@ -126,6 +128,46 @@ class LocalLLMService:
                 raise
             finally:
                 self._is_loading = False
+
+    def generate(
+        self,
+        messages: List[Dict[str, str]],
+        system_prompt: Optional[str] = None,
+        temperature: float = 0.7,
+        tools: Optional[List[dict]] = None,
+        tool_context: Optional[ToolContext] = None,
+        max_tool_rounds: int = 4,
+    ) -> str:
+        """
+        Synchronous generation for headless task runs (blocks the caller).
+
+        Runs the same agentic loop as streaming, collecting the final text.
+        Raises RuntimeError if generation fails.
+        """
+        self._stop_event.clear()
+        result: dict = {}
+
+        def on_complete(text: str) -> None:
+            result["text"] = text
+
+        def on_error(err: str) -> None:
+            result["error"] = err
+
+        sys_prompt = system_prompt if system_prompt is not None else self.default_system_prompt
+        payload: List[Dict[str, Any]] = []
+        if sys_prompt:
+            payload.append({"role": "system", "content": sys_prompt})
+        payload.extend(messages)
+
+        # _worker_stream is synchronous and invokes on_complete/on_error
+        # before returning, so no event is needed.
+        self._worker_stream(
+            payload, temperature, None, on_complete, on_error, None,
+            tools, tool_context, max_tool_rounds,
+        )
+        if "error" in result:
+            raise RuntimeError(result["error"])
+        return result.get("text", "")
 
     def stream_chat_completion(
         self,
@@ -302,42 +344,42 @@ class LocalLLMService:
         Text tokens are streamed to on_token live, except Qwen text-format
         <tool_call> blocks, which are hidden from the UI.
         """
-        streamer = self._llm.create_chat_completion(
-            messages=messages,
-            stream=True,
-            temperature=temperature,
-            tools=tools,
-        )
-
         token_parts: List[str] = []
         accumulated_calls: List[dict] = []
         finish_reason: Optional[str] = None
 
-        for chunk in streamer:
-            if self._stop_event.is_set():
-                logger.info("Local LLM generation stopped by user request.")
-                break
+        with self._llm_lock:
+            streamer = self._llm.create_chat_completion(
+                messages=messages,
+                stream=True,
+                temperature=temperature,
+                tools=tools,
+            )
+            for chunk in streamer:
+                if self._stop_event.is_set():
+                    logger.info("Local LLM generation stopped by user request.")
+                    break
 
-            choice = chunk["choices"][0]
-            delta = choice.get("delta", {})
+                choice = chunk["choices"][0]
+                delta = choice.get("delta", {})
 
-            content = delta.get("content")
-            if content:
-                token_parts.append(content)
-                round_text = "".join(token_parts)
-                # Hide anything inside an unclosed Qwen <tool_call> block.
-                inside_block = round_text.rfind("<tool_call>") > round_text.rfind(
-                    "</tool_call>"
-                )
-                if not inside_block and on_token:
-                    on_token(content)
+                content = delta.get("content")
+                if content:
+                    token_parts.append(content)
+                    round_text = "".join(token_parts)
+                    # Hide anything inside an unclosed Qwen <tool_call> block.
+                    inside_block = round_text.rfind("<tool_call>") > round_text.rfind(
+                        "</tool_call>"
+                    )
+                    if not inside_block and on_token:
+                        on_token(content)
 
-            new_calls = delta.get("tool_calls")
-            if new_calls:
-                self._merge_tool_calls(accumulated_calls, new_calls)
+                new_calls = delta.get("tool_calls")
+                if new_calls:
+                    self._merge_tool_calls(accumulated_calls, new_calls)
 
-            if choice.get("finish_reason"):
-                finish_reason = choice.get("finish_reason")
+                if choice.get("finish_reason"):
+                    finish_reason = choice.get("finish_reason")
 
         assembled_text = "".join(token_parts)
         if finish_reason == "tool_calls" and accumulated_calls:

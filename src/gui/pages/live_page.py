@@ -1,12 +1,14 @@
 """
-Developer Control Window module.
-Dedicated pop-up window (CTkToplevel) containing live session controls, mic meters, physical event interruption grid, transcripts, and logs.
+Gemini Live page — embedded in the DeveloperWindow shell.
+
+Holds the live session controls (mic meter, mute, start/stop), the physical
+event interruption panel, and the transcript / logs / conversations tabs.
 """
 
 import datetime
 import logging
 import customtkinter as ctk
-from typing import Callable, Optional
+from typing import Callable
 
 from src.config import AppConfig
 from src.db import (
@@ -15,13 +17,12 @@ from src.db import (
     list_conversations,
     list_messages,
 )
-from src.gui.local_chat_window import LocalChatWindow
-from src.gui.memory_window import MemoryWindow
 
 logger = logging.getLogger(__name__)
 
-class DeveloperWindow(ctk.CTkToplevel):
-    """Developer Control Dashboard Window."""
+
+class LivePage(ctk.CTkFrame):
+    """Gemini Live session control page."""
 
     def __init__(
         self,
@@ -34,29 +35,18 @@ class DeveloperWindow(ctk.CTkToplevel):
         is_session_active: bool = False,
         **kwargs
     ):
-        super().__init__(master, **kwargs)
-        self.config = config
+        super().__init__(master, fg_color="transparent", **kwargs)
+        self.app_config = config
         self.on_start_session = on_start_session
         self.on_stop_session = on_stop_session
         self.on_send_interruption = on_send_interruption
         self.on_toggle_mute = on_toggle_mute
         self.is_session_active = is_session_active
 
-        self.local_chat_win: Optional[LocalChatWindow] = None
-        self.memory_win: Optional[MemoryWindow] = None
-
-        # Window properties
-        self.title("🛠️ Cubeo Developer Console")
-        self.geometry("960x640")
-        self.minsize(850, 520)
-
-        # Focus window on launch
-        self.after(100, self.lift)
-
         self._create_layout()
 
     def _create_layout(self) -> None:
-        """Create header controls and main developer grid."""
+        """Header controls and main live-console grid."""
         # Top Header Bar
         self.header_frame = ctk.CTkFrame(self, corner_radius=10, fg_color="#1E1E2E")
         self.header_frame.pack(fill="x", padx=15, pady=(12, 5))
@@ -66,14 +56,14 @@ class DeveloperWindow(ctk.CTkToplevel):
 
         ctk.CTkLabel(
             title_box,
-            text="🛠️ Developer Control Console",
+            text="✨ Gemini Live",
             font=ctk.CTkFont(size=18, weight="bold"),
             text_color="#F5E0DC"
         ).pack(anchor="w")
 
         ctk.CTkLabel(
             title_box,
-            text=f"Model: {self.config.model} | Voice: {self.config.voice_name}",
+            text=f"Model: {self.app_config.model} | Voice: {self.app_config.voice_name}",
             font=ctk.CTkFont(size=11),
             text_color="#BAC2DE"
         ).pack(anchor="w")
@@ -114,34 +104,6 @@ class DeveloperWindow(ctk.CTkToplevel):
         )
         self.session_button.pack(side="left", padx=5)
         self._update_session_button_state()
-
-        # Local Chat Window Button
-        self.local_chat_btn = ctk.CTkButton(
-            controls_box,
-            text="🦙 Local Qwen Chat",
-            font=ctk.CTkFont(size=12, weight="bold"),
-            fg_color="#CBA6F7",
-            hover_color="#B4BEFE",
-            text_color="#11111B",
-            width=150,
-            height=34,
-            command=self._open_local_chat
-        )
-        self.local_chat_btn.pack(side="left", padx=5)
-
-        # Memory Bank Window Button
-        self.memory_btn = ctk.CTkButton(
-            controls_box,
-            text="🧠 Memories",
-            font=ctk.CTkFont(size=12, weight="bold"),
-            fg_color="#74C7EC",
-            hover_color="#89DCEB",
-            text_color="#11111B",
-            width=120,
-            height=34,
-            command=self._open_memory_window
-        )
-        self.memory_btn.pack(side="left", padx=5)
 
         # Main Split Grid
         self.main_grid = ctk.CTkFrame(self, fg_color="transparent")
@@ -277,32 +239,23 @@ class DeveloperWindow(ctk.CTkToplevel):
         )
         self.status_label.pack(side="left", padx=15, pady=2)
 
-    def _open_local_chat(self) -> None:
-        """Open or focus the dedicated Local Qwen3.5 Chat Window."""
-        if self.local_chat_win is None or not self.local_chat_win.winfo_exists():
-            self.local_chat_win = LocalChatWindow(master=self, app_config=self.config)
-        else:
-            self.local_chat_win.lift()
-            self.local_chat_win.focus()
-
-    def _open_memory_window(self) -> None:
-        """Open or focus the dedicated Memory Bank Window."""
-        if self.memory_win is None or not self.memory_win.winfo_exists():
-            self.memory_win = MemoryWindow(master=self)
-        else:
-            self.memory_win.refresh_memories()
-            self.memory_win.lift()
-            self.memory_win.focus()
+    # ------------------------------------------------------------------
+    # live updates (called from the controller / async side)
+    # ------------------------------------------------------------------
 
     def set_status(self, status: str) -> None:
         """Thread-safe update to connection status."""
         try:
             if self.winfo_exists():
                 self.status_label.configure(text=f"Status: {status}")
-                if "Connected" in status or "Live" in status:
+                if status.startswith("Connected") or status.startswith("Live"):
                     self.is_session_active = True
                     self.after(200, self.refresh_conversations)
-                elif "Disconnected" in status or "Idle" in status:
+                elif (
+                    status.startswith("Disconnected")
+                    or status.startswith("Idle")
+                    or status.startswith("Error")
+                ):
                     self.is_session_active = False
                     self.after(200, self.refresh_conversations)
                 self._update_session_button_state()
@@ -392,8 +345,8 @@ class DeveloperWindow(ctk.CTkToplevel):
     def refresh_conversations(self) -> None:
         """Reload the conversation list from the database."""
         try:
-            # Gemini Live conversations only — local LLM chats are shown in
-            # the local chat window (legacy rows without a type count as live).
+            # Gemini Live conversations only — local LLM chats have
+            # metadata_json.type == 'local_llm' and live elsewhere.
             conversations = [
                 conv
                 for conv in list_conversations(limit=100)
@@ -463,6 +416,10 @@ class DeveloperWindow(ctk.CTkToplevel):
                 "end", f"[{msg.role.value}] {msg.content}\n\n"
             )
         self.convo_detail_box.see("1.0")
+
+    # ------------------------------------------------------------------
+    # session controls
+    # ------------------------------------------------------------------
 
     def _update_session_button_state(self) -> None:
         """Update button appearance based on session state."""

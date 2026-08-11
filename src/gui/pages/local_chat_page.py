@@ -1,18 +1,18 @@
 """
-Local LLM Chat Console Window module.
-Dedicated pop-up window (CTkToplevel) for interactive streaming chat with local Qwen3.5 2B Q4 model via llama.cpp / Ollama API.
-Persists chat history in SQLite using existing conversations and messages tables.
+Local LLM Chat Console page — embedded in the DeveloperWindow shell.
+
+Dedicated page for interactive streaming chat with local Qwen3.5 2B Q4 model
+via llama.cpp. Persists chat history in SQLite using existing conversations
+and messages tables.
 """
 
 import datetime
-import json
 import logging
 import uuid
 import customtkinter as ctk
 from typing import Dict, List, Optional
 
 from src.config import AppConfig, config
-from src.client.tools import ToolContext, build_llama_tools
 from src.db import (
     MessageRole,
     create_conversation,
@@ -20,17 +20,16 @@ from src.db import (
     list_conversations,
     list_messages,
 )
-from src.services.embeddings import EmbeddingService
 from src.services.local_llm import LocalLLMService
 
 logger = logging.getLogger(__name__)
 
 
-class LocalChatWindow(ctk.CTkToplevel):
-    """Dedicated Local Qwen3.5 2B Chat Window."""
+class LocalChatPage(ctk.CTkFrame):
+    """Dedicated Local Qwen3.5 2B Chat Page."""
 
     def __init__(self, master, app_config: AppConfig = config, **kwargs):
-        super().__init__(master, **kwargs)
+        super().__init__(master, fg_color="transparent", **kwargs)
         self.app_config = app_config
 
         # Instantiate local LLM service
@@ -41,9 +40,6 @@ class LocalChatWindow(ctk.CTkToplevel):
             default_system_prompt=app_config.local_model_system_prompt,
         )
 
-        # Shared embedding service for the memory/history tools.
-        self.embedding_service = EmbeddingService()
-
         # Active conversation state
         self.active_conversation_id: Optional[int] = None
         self.conversations_map: Dict[str, int] = {}
@@ -53,13 +49,7 @@ class LocalChatWindow(ctk.CTkToplevel):
         self._current_assistant_text: str = ""
         self._is_generating: bool = False
 
-        # Window properties
-        self.title("🦙 Qwen3.5 2B Local Chat Console")
-        self.geometry("920x660")
-        self.minsize(800, 500)
-
         self._create_layout()
-        self.after(100, self.lift)
 
         # Check local engine health and load conversations
         self.after(200, self._check_engine_status)
@@ -244,12 +234,10 @@ class LocalChatWindow(ctk.CTkToplevel):
 
         for conv in convos:
             meta = conv.metadata_json or {}
-            # This window shows local LLM chats only.
-            if meta.get("type") != "local_llm":
-                continue
+            label_prefix = "🦙 " if meta.get("type") == "local_llm" else "💬 "
             title = conv.title or f"Conversation #{conv.id}"
             time_str = conv.started_at.strftime("%b %d %H:%M") if conv.started_at else ""
-            label = f"🦙 {title[:30]} ({time_str})"
+            label = f"{label_prefix}{title[:30]} ({time_str})"
 
             self.conversations_map[label] = conv.id
             options.append(label)
@@ -354,39 +342,19 @@ class LocalChatWindow(ctk.CTkToplevel):
 
         sys_prompt = self.sys_prompt_entry.get().strip() or self.current_system_prompt
 
-        # 6. Call streaming LLM service (with shared tools from the registry)
+        # 6. Call streaming LLM service
         self.llm_service.stream_chat_completion(
             messages=chat_history,
             system_prompt=sys_prompt,
             on_token=self._on_token_received_threadsafe,
             on_complete=self._on_complete_threadsafe,
             on_error=self._on_error_threadsafe,
-            on_tool_call=self._on_tool_call_received,
-            tools=build_llama_tools("local_model"),
-            tool_context=ToolContext(embedding_service=self.embedding_service),
         )
 
     def stop_generation(self) -> None:
         """Halt streaming generation."""
         if self._is_generating:
             self.llm_service.stop_generation()
-
-    def _on_tool_call_received(self, name: str, args: dict, result: dict) -> None:
-        """Callback from the LLM worker thread when a tool is executed."""
-        try:
-            if self.winfo_exists():
-                self.after(0, self._show_tool_call, name, args, result)
-        except Exception:
-            pass
-
-    def _show_tool_call(self, name: str, args: dict, result: dict) -> None:
-        """Render a tool-call line in the transcript on the main thread."""
-        arg_summary = json.dumps(args)[:80]
-        status = result.get("status", "?") if isinstance(result, dict) else "?"
-        self.transcript_box.insert(
-            "end", f"🔧 [tool] {name}({arg_summary}) → {status}\n"
-        )
-        self.transcript_box.see("end")
 
     def _on_token_received_threadsafe(self, token: str) -> None:
         """Callback from background thread for received token."""

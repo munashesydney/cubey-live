@@ -13,3 +13,6 @@ fastembed>=0.3
 # Local LLM (llama.cpp) chat console
 llama-cpp-python>=0.3.0
 huggingface-hub>=0.28
+
+# Task scheduling (cron expressions)
+croniter>=2.0

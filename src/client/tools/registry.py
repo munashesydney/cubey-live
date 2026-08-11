@@ -135,6 +135,81 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "required": ["action"],
         },
     },
+    "tasks": {
+        "name": "tasks",
+        "description": (
+            "Schedule tasks that spawn an AI to do something later. "
+            "A task runs one AI ('local' Qwen or 'gemini') with a prompt when "
+            "its schedule is due. Use 'add' to schedule something, 'list' to see "
+            "scheduled tasks, 'update' to change one, 'delete' to cancel one. "
+            "Examples: remind the user at a time, run a daily summary, or do a "
+            "quick check every few minutes."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["add", "list", "update", "delete"],
+                    "description": "What to do with tasks.",
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Short name for the task, e.g. 'Evening reminder'.",
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": (
+                        "The instruction the AI runs when the task is due, e.g. "
+                        "'Remind the user to take their medicine'."
+                    ),
+                },
+                "model": {
+                    "type": "string",
+                    "enum": ["local", "gemini"],
+                    "description": "Which AI runs the task: 'local' (Qwen) or 'gemini'.",
+                },
+                "schedule_type": {
+                    "type": "string",
+                    "enum": ["one_shot", "interval", "cron"],
+                    "description": (
+                        "'one_shot' runs once at run_at; 'interval' runs every "
+                        "interval_seconds; 'cron' runs per cron_expr."
+                    ),
+                },
+                "run_at": {
+                    "type": "string",
+                    "description": (
+                        "ISO-8601 timestamp for 'one_shot' schedules, interpreted "
+                        "in the machine's local timezone, e.g. '2026-08-09T19:00:00'. "
+                        "For 'in 5 seconds', use the current time plus 5 seconds."
+                    ),
+                },
+                "interval_seconds": {
+                    "type": "integer",
+                    "description": "Seconds between runs for 'interval' schedules (e.g. 300 = every 5 minutes).",
+                },
+                "cron_expr": {
+                    "type": "string",
+                    "description": (
+                        "5-field cron expression for 'cron' schedules, in local time, "
+                        "e.g. '0 19 * * *' for every day at 7pm or '*/5 * * * *' "
+                        "for every 5 minutes."
+                    ),
+                },
+                "task_id": {
+                    "type": "integer",
+                    "description": "Id of the task to update or delete.",
+                },
+                "status": {
+                    "type": "string",
+                    "enum": ["active", "paused", "done"],
+                    "description": "Optional new status for 'update' (e.g. 'paused').",
+                },
+            },
+            "required": ["action"],
+        },
+    },
 }
 
 # ---------------------------------------------------------------------------
@@ -142,11 +217,12 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
 # ---------------------------------------------------------------------------
 
 MODEL_TOOL_POLICY: dict[str, list[str]] = {
-    # Gemini Live: full agent — physical reactions + memory + history.
-    "live_model": ["react", "messages", "memories"],
+    # Gemini Live: full agent — physical reactions + memory + history + tasks.
+    "live_model": ["react", "messages", "memories", "tasks"],
     # Local Qwen: the user never interacts with it directly, so it has no
-    # physical reactions — but it shares the same memory bank and history.
-    "local_model": ["messages", "memories"],
+    # physical reactions — but it shares the memory bank, history, and can
+    # schedule tasks.
+    "local_model": ["messages", "memories", "tasks"],
 }
 
 
@@ -271,6 +347,22 @@ def dispatch_tool_call(name: str, args: dict[str, Any], context: ToolContext) ->
                 query=args.get("query"),
                 limit=args.get("limit"),
                 embedding_service=context.embedding_service,
+            )
+
+        if name == "tasks":
+            from src.client.tools.tasks import execute_tasks_tool
+
+            return execute_tasks_tool(
+                action=args.get("action"),
+                title=args.get("title"),
+                prompt=args.get("prompt"),
+                model=args.get("model"),
+                schedule_type=args.get("schedule_type"),
+                run_at=args.get("run_at"),
+                interval_seconds=args.get("interval_seconds"),
+                cron_expr=args.get("cron_expr"),
+                task_id=args.get("task_id"),
+                status=args.get("status"),
             )
     except Exception as e:
         logger.exception("Tool dispatch failed for '%s': %s", name, e)

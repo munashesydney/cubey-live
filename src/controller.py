@@ -21,8 +21,9 @@ from src.db import (
     update_conversation,
 )
 from src.services.embeddings import EmbeddingService
-from src.gui.app import GeminiLiveApp
+from src.gui.windows.app_window import GeminiLiveApp
 from src.services.stt import LocalTranscriptService
+from src.services.task_scheduler import TaskScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,9 @@ class ApplicationController:
         # On-device embeddings (fastembed) for semantic memory over messages.
         self.embedding_service = EmbeddingService(model_name=config.embedding_model)
 
+        # Background scheduler for AI tasks (the 'tasks' tool).
+        self.task_scheduler = TaskScheduler()
+
         self._session_task: Optional[asyncio.Task] = None
 
         # Active DB-backed conversation for the current live session.
@@ -76,6 +80,9 @@ class ApplicationController:
     def start(self) -> None:
         """Start background asyncio loop thread and launch GUI mainloop."""
         logger.info("Initializing Application Controller...")
+
+        # 0. Start the background task scheduler
+        self.task_scheduler.start()
 
         # 1. Start dedicated background thread for asyncio event loop
         self.async_loop = asyncio.new_event_loop()

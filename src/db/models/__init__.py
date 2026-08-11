@@ -5,6 +5,7 @@ from src.db.models.memory import Memory, MemoryStatus
 from src.db.models.memory_embedding import MemoryEmbedding
 from src.db.models.message import Message, MessageRole
 from src.db.models.message_embedding import MessageEmbedding
+from src.db.models.task import Task, TaskModel, TaskScheduleType, TaskStatus
 
 __all__ = [
     "Conversation",
@@ -15,4 +16,8 @@ __all__ = [
     "Message",
     "MessageEmbedding",
     "MessageRole",
+    "Task",
+    "TaskModel",
+    "TaskScheduleType",
+    "TaskStatus",
 ]

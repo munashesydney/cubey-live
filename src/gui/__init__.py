@@ -2,6 +2,6 @@
 CustomTkinter GUI application module.
 """
 
-from .app import GeminiLiveApp
+from .windows.app_window import GeminiLiveApp
 
 __all__ = ["GeminiLiveApp"]

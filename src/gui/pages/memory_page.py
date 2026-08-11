@@ -1,7 +1,7 @@
 """
-Memory Bank Window module.
-Dedicated pop-up window (CTkToplevel) for visualizing Cubey's durable
-long-term memories stored via the 'memories' tool.
+Memory Bank page — embedded in the DeveloperWindow shell.
+
+Visualizes Cubey's durable long-term memories stored via the 'memories' tool.
 """
 
 import logging
@@ -29,18 +29,12 @@ _CATEGORY_COLORS = {
 }
 
 
-class MemoryWindow(ctk.CTkToplevel):
-    """Dedicated Memory Bank Visualization Window."""
+class MemoryPage(ctk.CTkFrame):
+    """Dedicated Memory Bank Visualization Page."""
 
     def __init__(self, master, **kwargs):
-        super().__init__(master, **kwargs)
-        self.title("🧠 Cubey Memory Bank")
-        self.geometry("780x640")
-        self.minsize(600, 420)
-
+        super().__init__(master, fg_color="transparent", **kwargs)
         self._create_layout()
-
-        self.after(100, self.lift)
         self.refresh_memories()
 
     def _create_layout(self) -> None:

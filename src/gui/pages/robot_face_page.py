@@ -1,5 +1,5 @@
 """
-Cubeo Robot Face Screen module.
+Cubeo Robot Face page.
 High-performance 2x Super-Sampled PIL Anti-Aliased Graphics Engine rendering silky smooth,
 expressive EMO-style robot eyes with Bezier crescent arcs, slanted trapezoid morphs,
 and 3D perspective transformations.
@@ -8,13 +8,13 @@ and 3D perspective transformations.
 import math
 import tkinter as tk
 import customtkinter as ctk
-from PIL import Image, ImageDraw, ImageTk, ImageOps
-from typing import Callable, Optional, Tuple, List
+from PIL import Image, ImageDraw, ImageTk
+from typing import Callable, Optional
 
-from src.gui.screens.animations import EyeAnimationEngine
+from src.gui.pages.animations import EyeAnimationEngine
 
-class RobotFaceScreen(ctk.CTkFrame):
-    """Screen displaying Cubeo's animated OLED robot face with 2x SSAA anti-aliased Pillow rendering."""
+class RobotFacePage(ctk.CTkFrame):
+    """Page displaying Cubeo's animated OLED robot face with 2x SSAA anti-aliased Pillow rendering."""
 
     def __init__(self, master, on_open_developer_console: Optional[Callable[[], None]] = None, **kwargs):
         super().__init__(master, fg_color="#0A0A0F", corner_radius=0, **kwargs)

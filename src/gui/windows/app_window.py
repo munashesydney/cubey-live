@@ -10,8 +10,8 @@ import customtkinter as ctk
 from typing import Callable, Optional
 
 from src.config import AppConfig
-from src.gui.screens.robot_face_screen import RobotFaceScreen
-from src.gui.developer_window import DeveloperWindow
+from src.gui.pages.robot_face_page import RobotFacePage
+from src.gui.windows.developer_window import DeveloperWindow
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +54,7 @@ class GeminiLiveApp(ctk.CTk):
         self.dev_window: Optional[DeveloperWindow] = None
 
         # Build 100% full-bleed Robot Face display
-        self.robot_face = RobotFaceScreen(
+        self.robot_face = RobotFacePage(
             self,
             on_open_developer_console=self.toggle_developer_console
         )
@@ -83,9 +83,9 @@ class GeminiLiveApp(ctk.CTk):
 
     def set_status(self, status: str) -> None:
         """Thread-safe update to status."""
-        if "Connected" in status or "Live" in status:
+        if status.startswith("Connected") or status.startswith("Live"):
             self.is_session_active = True
-        elif "Disconnected" in status or "Idle" in status:
+        elif status.startswith("Disconnected") or status.startswith("Idle"):
             self.is_session_active = False
 
         if self.dev_window and self.dev_window.winfo_exists():
