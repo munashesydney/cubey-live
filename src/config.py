@@ -26,11 +26,64 @@ class AppConfig:
     model: str = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-live-preview")
     voice_name: str = os.getenv("GEMINI_VOICE", "Puck")
     
-    # Audio Parameters (Optimized for low latency across Windows and Linux)
+    # Audio parameters. 20 ms input packets are short enough for responsive VAD
+    # without creating excessive WebSocket overhead. Queue limits are expressed
+    # in milliseconds so a stalled device/network can never drift seconds behind
+    # the live conversation.
     input_sample_rate: int = int(os.getenv("INPUT_SAMPLE_RATE", "16000"))
     output_sample_rate: int = int(os.getenv("OUTPUT_SAMPLE_RATE", "24000"))
     channels: int = int(os.getenv("CHANNELS", "1"))
-    chunk_size: int = 512  # low-latency frame buffer size
+    chunk_size: int = int(os.getenv("AUDIO_CHUNK_SIZE", "320"))
+    input_queue_ms: int = int(os.getenv("AUDIO_INPUT_QUEUE_MS", "240"))
+    output_block_size: int = int(os.getenv("AUDIO_OUTPUT_BLOCK_SIZE", "240"))
+    # Diagnostic threshold only: generated speech is never frame-dropped when
+    # Gemini delivers it faster than physical speakers can play it.
+    output_buffer_ms: int = int(os.getenv("AUDIO_OUTPUT_BUFFER_MS", "2000"))
+    input_device: str = os.getenv("AUDIO_INPUT_DEVICE", "")
+    output_device: str = os.getenv("AUDIO_OUTPUT_DEVICE", "")
+    prefer_low_latency_devices: bool = os.getenv(
+        "AUDIO_PREFER_LOW_LATENCY_DEVICE", "true"
+    ).strip().lower() not in {"0", "false", "no", "off"}
+
+    # Gemini server VAD. Short end-of-speech detection is the largest perceived
+    # latency win after audio buffering; all values remain environment-tunable.
+    vad_prefix_padding_ms: int = int(os.getenv("GEMINI_VAD_PREFIX_MS", "20"))
+    vad_silence_duration_ms: int = int(os.getenv("GEMINI_VAD_SILENCE_MS", "150"))
+
+    # Deterministic client-side voice activity signaling. Short utterances such
+    # as "hi" are explicitly closed instead of relying on an opaque server VAD
+    # state that can occasionally merge several greetings into one long turn.
+    client_vad_enabled: bool = os.getenv(
+        "AUDIO_CLIENT_VAD", "true"
+    ).strip().lower() not in {"0", "false", "no", "off"}
+    client_vad_rms_threshold: float = float(
+        os.getenv("AUDIO_CLIENT_VAD_RMS", "0.025")
+    )
+    client_vad_min_speech_ms: int = int(
+        os.getenv("AUDIO_CLIENT_VAD_MIN_SPEECH_MS", "40")
+    )
+    client_vad_silence_ms: int = int(
+        os.getenv("AUDIO_CLIENT_VAD_SILENCE_MS", "300")
+    )
+
+    # Retry transient Live WebSocket failures inside the same app conversation.
+    live_reconnect_attempts: int = int(os.getenv("GEMINI_RECONNECT_ATTEMPTS", "5"))
+    live_reconnect_base_delay: float = float(
+        os.getenv("GEMINI_RECONNECT_BASE_DELAY", "0.5")
+    )
+    live_reconnect_max_delay: float = float(
+        os.getenv("GEMINI_RECONNECT_MAX_DELAY", "5.0")
+    )
+
+    # Local acoustic echo gate used only while Cubey is speaking. The lower
+    # threshold makes normal-volume barge-in practical; a short pre-roll keeps
+    # the beginning of the user's word intact when the gate opens.
+    interruption_rms_threshold: float = float(
+        os.getenv("AUDIO_INTERRUPTION_RMS", "0.045")
+    )
+    interruption_preroll_ms: int = int(
+        os.getenv("AUDIO_INTERRUPTION_PREROLL_MS", "120")
+    )
 
     # Database Parameters
     database_url: str = os.getenv("DATABASE_URL", f"sqlite:///{DEFAULT_DB_PATH.as_posix()}")

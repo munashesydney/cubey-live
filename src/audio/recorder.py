@@ -6,9 +6,12 @@ Optimized for low-latency capture across Windows and Linux (Raspberry Pi).
 import asyncio
 import logging
 import math
+import time
 import numpy as np
 import sounddevice as sd
 from typing import Callable, Optional
+
+from src.audio.resample import resample_pcm16
 
 logger = logging.getLogger(__name__)
 
@@ -19,21 +22,39 @@ class AudioRecorder:
         self,
         sample_rate: int = 16000,
         channels: int = 1,
-        chunk_size: int = 512,
+        chunk_size: int = 320,
+        max_queue_ms: int = 240,
+        device=None,
+        device_sample_rate: Optional[int] = None,
         on_level_change: Optional[Callable[[float], None]] = None,
         on_audio_chunk: Optional[Callable[[bytes], None]] = None
     ):
         self.sample_rate = sample_rate
         self.channels = channels
         self.chunk_size = chunk_size
+        self.max_queue_ms = max_queue_ms
+        self.device = device
+        self.device_sample_rate = device_sample_rate or sample_rate
+        # Run the hardware callback at 10 ms for low device latency, then
+        # aggregate into the configured 20 ms Gemini packet size below.
+        self.device_chunk_size = max(
+            1, round(self.device_sample_rate / 100)
+        )
         self.on_level_change = on_level_change
         self.on_audio_chunk = on_audio_chunk
         
         self.is_recording = False
         self.is_muted = False
         self.stream: Optional[sd.RawInputStream] = None
-        self.audio_queue: asyncio.Queue[bytes] = asyncio.Queue()
+        chunk_ms = max(1.0, self.chunk_size / self.sample_rate * 1000.0)
+        self.max_queue_chunks = max(2, math.ceil(self.max_queue_ms / chunk_ms))
+        self.audio_queue: asyncio.Queue[bytes] = asyncio.Queue(
+            maxsize=self.max_queue_chunks
+        )
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._last_level_update = 0.0
+        self._dropped_chunks = 0
+        self._packet_buffer = bytearray()
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
         """Start capturing audio from the default microphone with low-latency settings."""
@@ -41,20 +62,57 @@ class AudioRecorder:
             return
             
         self._loop = loop
+        self.clear_queue()
+        self._packet_buffer.clear()
         self.is_recording = True
         
         try:
             self.stream = sd.RawInputStream(
-                samplerate=self.sample_rate,
+                device=self.device,
+                samplerate=self.device_sample_rate,
                 channels=self.channels,
                 dtype='int16',
-                blocksize=self.chunk_size,
+                blocksize=self.device_chunk_size,
                 latency='low',
                 callback=self._audio_callback
             )
             self.stream.start()
-            logger.info("Microphone audio recorder started (%d Hz, Low Latency)", self.sample_rate)
+            logger.info(
+                "Microphone recorder started (%d Hz device -> %d Hz Gemini)",
+                self.device_sample_rate,
+                self.sample_rate,
+            )
         except Exception as e:
+            # A preferred endpoint can disappear between enumeration and open
+            # (USB/Bluetooth changes). Retry the system default safely.
+            if self.device is not None:
+                if self.stream is not None:
+                    try:
+                        self.stream.close()
+                    except Exception:
+                        pass
+                    self.stream = None
+                logger.warning(
+                    "Preferred input device failed (%s); retrying system default",
+                    e,
+                )
+                self.device = None
+                self.device_sample_rate = self.sample_rate
+                self.device_chunk_size = self.chunk_size
+                try:
+                    self.stream = sd.RawInputStream(
+                        samplerate=self.sample_rate,
+                        channels=self.channels,
+                        dtype='int16',
+                        blocksize=self.chunk_size,
+                        latency='low',
+                        callback=self._audio_callback,
+                    )
+                    self.stream.start()
+                    logger.info("Microphone recorder using system-default fallback")
+                    return
+                except Exception:
+                    logger.exception("System-default input fallback also failed")
             self.is_recording = False
             logger.error("Failed to start audio input stream: %s", e)
             raise
@@ -71,6 +129,15 @@ class AudioRecorder:
             self.stream = None
         logger.info("Microphone audio recorder stopped.")
 
+    def clear_queue(self) -> None:
+        """Discard stale captured audio between sessions."""
+        while True:
+            try:
+                self.audio_queue.get_nowait()
+                self.audio_queue.task_done()
+            except asyncio.QueueEmpty:
+                break
+
     def set_muted(self, muted: bool) -> None:
         """Mute or unmute microphone audio feeding the stream."""
         self.is_muted = muted
@@ -84,14 +151,32 @@ class AudioRecorder:
         if not self.is_recording or self._loop is None:
             return
             
+        resampled = resample_pcm16(
+            bytes(indata),
+            self.device_sample_rate,
+            self.sample_rate,
+            self.channels,
+        )
+
         if self.is_muted:
             # Send silent PCM frame if muted
-            data = b'\x00' * len(indata)
-        else:
-            data = bytes(indata)
-            
-        # Push to asyncio queue thread-safely
-        self._loop.call_soon_threadsafe(self.audio_queue.put_nowait, data)
+            resampled = b'\x00' * len(resampled)
+
+        self._packet_buffer.extend(resampled)
+        packet_bytes = self.chunk_size * self.channels * 2
+        while len(self._packet_buffer) >= packet_bytes:
+            data = bytes(self._packet_buffer[:packet_bytes])
+            del self._packet_buffer[:packet_bytes]
+            self._dispatch_packet(data)
+
+    def _dispatch_packet(self, data: bytes) -> None:
+        """Fan out one correctly-sized Gemini microphone packet."""
+        if self._loop is None:
+            return
+
+        # Keep the PortAudio callback non-blocking. The actual bounded enqueue
+        # happens on the asyncio thread, where asyncio.Queue is safe to mutate.
+        self._loop.call_soon_threadsafe(self._enqueue_latest, data)
 
         # Fan out to secondary consumers (e.g. local STT for conversation history).
         # This runs on the sounddevice audio thread; sinks must be thread-safe.
@@ -102,7 +187,13 @@ class AudioRecorder:
                 pass
         
         # Calculate RMS level for UI meter
-        if self.on_level_change and not self.is_muted:
+        now = time.monotonic()
+        if (
+            self.on_level_change
+            and not self.is_muted
+            and now - self._last_level_update >= 1 / 15
+        ):
+            self._last_level_update = now
             try:
                 audio_array = np.frombuffer(data, dtype=np.int16)
                 if len(audio_array) > 0:
@@ -113,3 +204,21 @@ class AudioRecorder:
                     self._loop.call_soon_threadsafe(self.on_level_change, norm_level)
             except Exception:
                 pass
+
+    def _enqueue_latest(self, data: bytes) -> None:
+        """Enqueue a frame without ever allowing captured audio to go stale."""
+        if not self.is_recording:
+            return
+        if self.audio_queue.full():
+            try:
+                self.audio_queue.get_nowait()
+                self.audio_queue.task_done()
+                self._dropped_chunks += 1
+                if self._dropped_chunks == 1 or self._dropped_chunks % 50 == 0:
+                    logger.warning(
+                        "Microphone transport fell behind; dropped %d stale chunk(s)",
+                        self._dropped_chunks,
+                    )
+            except asyncio.QueueEmpty:
+                pass
+        self.audio_queue.put_nowait(data)

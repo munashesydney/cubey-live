@@ -35,9 +35,10 @@ except ImportError:  # pragma: no cover - av is a faster-whisper dependency
 USER_SAMPLE_RATE = 16000
 MODEL_SAMPLE_RATE = 24000
 
-# VAD parameters (chunk = 512 frames @ 16 kHz = 32 ms).
+# VAD parameters. Silence is tracked by byte duration rather than chunk count,
+# so changing the live capture packet size does not change transcription turns.
 _VAD_SPEECH_THRESHOLD = 0.03   # normalized RMS; marks "is this chunk speech or not"
-_VAD_SILENCE_CHUNKS = 62       # ~2 s of quiet ends a user turn
+_VAD_SILENCE_SECONDS = 2.0     # quiet duration that ends a user turn
 _MIN_UTTERANCE_SECONDS = 0.5   # ignore blips shorter than this
 
 # Suppress whisper hallucinating text on silence/non-speech audio.
@@ -133,7 +134,7 @@ class LocalTranscriptService:
 
         # VAD state
         self._user_buffer = bytearray()
-        self._silence_chunks = 0
+        self._silence_bytes = 0
         self._model_buffer = bytearray()
 
     # ------------------------------------------------------------------
@@ -247,11 +248,12 @@ class LocalTranscriptService:
         rms = float(np.sqrt(np.mean(np.square(samples.astype(np.float32))))) / 32768.0
         if rms >= _VAD_SPEECH_THRESHOLD:
             self._user_buffer += chunk
-            self._silence_chunks = 0
+            self._silence_bytes = 0
         elif self._user_buffer:
             self._user_buffer += chunk  # trailing silence for whisper context
-            self._silence_chunks += 1
-            if self._silence_chunks >= _VAD_SILENCE_CHUNKS:
+            self._silence_bytes += len(chunk)
+            silence_limit = int(_VAD_SILENCE_SECONDS * USER_SAMPLE_RATE * 2)
+            if self._silence_bytes >= silence_limit:
                 self._flush_user_turn()
         # Leading silence before any speech is dropped.
 
@@ -261,7 +263,7 @@ class LocalTranscriptService:
                 return
             audio = bytes(self._user_buffer)
             self._user_buffer.clear()
-            self._silence_chunks = 0
+            self._silence_bytes = 0
             min_bytes = int(_MIN_UTTERANCE_SECONDS * USER_SAMPLE_RATE * 2)
             if len(audio) < min_bytes:
                 return

@@ -11,6 +11,7 @@ from typing import Optional
 from src.config import config
 from src.audio.recorder import AudioRecorder
 from src.audio.player import AudioPlayer
+from src.audio.devices import select_audio_device
 from src.client.live_client import GeminiLiveClient
 from src.db import (
     MessageRole,
@@ -94,15 +95,34 @@ class ApplicationController:
         self.loop_thread.start()
 
         # 2. Create audio pipeline components
+        input_device = select_audio_device(
+            "input",
+            self.config.input_sample_rate,
+            self.config.input_device,
+            self.config.prefer_low_latency_devices,
+        )
+        output_device = select_audio_device(
+            "output",
+            self.config.output_sample_rate,
+            self.config.output_device,
+            self.config.prefer_low_latency_devices,
+        )
         self.player = AudioPlayer(
             sample_rate=self.config.output_sample_rate,
-            channels=self.config.channels
+            channels=self.config.channels,
+            block_size=self.config.output_block_size,
+            max_buffer_ms=self.config.output_buffer_ms,
+            device=output_device.device,
+            device_sample_rate=output_device.sample_rate,
         )
         
         self.recorder = AudioRecorder(
             sample_rate=self.config.input_sample_rate,
             channels=self.config.channels,
             chunk_size=self.config.chunk_size,
+            max_queue_ms=self.config.input_queue_ms,
+            device=input_device.device,
+            device_sample_rate=input_device.sample_rate,
             on_level_change=self._on_mic_level_changed,
             on_audio_chunk=self.transcript_service.feed_user_audio
         )

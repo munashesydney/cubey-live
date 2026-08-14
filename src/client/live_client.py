@@ -5,6 +5,7 @@ text interruptions, and Volume-Thresholded Acoustic Echo Gating for barge-in.
 """
 
 import asyncio
+from collections import deque
 import logging
 import time
 import numpy as np
@@ -65,11 +66,25 @@ class GeminiLiveClient:
         self._tasks: list[asyncio.Task] = []
         self._stop_event = asyncio.Event()
         self._model_text_buffer: list[str] = []
+        self._model_turn_active = False
 
         self._pause_mic_until: float = 0.0
 
-        # Minimum RMS volume threshold required to interrupt AI while AI is speaking
-        self.voice_interruption_threshold = 0.12
+        # Keep a short mic pre-roll while speaker output is active. When real
+        # speech opens the echo gate this preserves the first phoneme.
+        chunk_ms = max(1.0, recorder.chunk_size / recorder.sample_rate * 1000.0)
+        preroll_chunks = max(
+            1, int(round(self.config.interruption_preroll_ms / chunk_ms))
+        )
+        self._barge_in_preroll: deque[bytes] = deque(maxlen=preroll_chunks)
+        self._speech_preroll: deque[bytes] = deque(maxlen=preroll_chunks)
+        self.voice_interruption_threshold = self.config.interruption_rms_threshold
+        self._user_activity_active = False
+        self._speech_chunks = 0
+        self._silence_chunks = 0
+        self._session_resumption_handle: Optional[str] = None
+        self._connection_started_at = 0.0
+        self._has_connected_once = False
 
         # Initialize official GenAI client
         self.genai_client = genai.Client(
@@ -96,62 +111,74 @@ class GeminiLiveClient:
                 self.on_status_change(status)
 
     async def start_session(self) -> None:
-        """Establish Live session and launch send/receive tasks."""
+        """Run one logical Live session across retryable WebSocket connections."""
         self._loop = asyncio.get_running_loop()
         self._stop_event.clear()
+        self._model_turn_active = False
+        self._model_text_buffer.clear()
+        self._barge_in_preroll.clear()
+        self._reset_client_vad()
+        self._session_resumption_handle = None
+        self._has_connected_once = False
         self.set_status("Connecting to Gemini Live API...")
 
+        fatal_error: Optional[Exception] = None
+        retry_count = 0
         try:
-            live_config = types.LiveConnectConfig(
-                response_modalities=[types.Modality.AUDIO],
-                tools=build_gemini_tools("live_model"),  # Register react tool
-                speech_config=types.SpeechConfig(
-                    voice_config=types.VoiceConfig(
-                        prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                            voice_name=self.config.voice_name
-                        )
+            while not self._stop_event.is_set():
+                try:
+                    await self._run_live_connection()
+                    if not self._stop_event.is_set():
+                        raise ConnectionError("Gemini Live transport ended unexpectedly")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    if self._stop_event.is_set():
+                        break
+
+                    connected_for = (
+                        time.monotonic() - self._connection_started_at
+                        if self._connection_started_at
+                        else 0.0
                     )
-                ),
-                system_instruction=types.Content(
-                    parts=[types.Part(text=ROBOT_SYSTEM_INSTRUCTION)]
-                )
-            )
-        except Exception as config_err:
-            msg = f"Config Error: {config_err}"
-            self.log(f"❌ {msg}")
-            self.set_status(msg)
-            return
+                    if connected_for >= 30:
+                        retry_count = 0
 
-        try:
-            self.log(f"Initiating WebSocket connection with Tool Use (Model: {self.config.model})...")
-            async with self.genai_client.aio.live.connect(
-                model=self.config.model,
-                config=live_config
-            ) as session:
-                self._session = session
-                self.is_connected = True
-                self.set_status("Connected & Live 🟢")
-                self.log(f"Connected to model '{self.config.model}' with registered 'react' tool.")
+                    if (
+                        not self._is_retryable_transport_error(exc)
+                        or retry_count >= self.config.live_reconnect_attempts
+                    ):
+                        raise
 
-                # Start audio recorder and player
-                self.player.start()
-                self.recorder.start(self._loop)
-
-                # Create concurrent async tasks
-                send_task = asyncio.create_task(self._send_audio_loop())
-                receive_task = asyncio.create_task(self._receive_responses_loop())
-                self._tasks = [send_task, receive_task]
-
-                await self._stop_event.wait()
-                self.log("Stopping Live session tasks...")
-                
-                for task in self._tasks:
-                    task.cancel()
-                await asyncio.gather(*self._tasks, return_exceptions=True)
-
+                    retry_count += 1
+                    delay = min(
+                        self.config.live_reconnect_base_delay
+                        * (2 ** (retry_count - 1)),
+                        self.config.live_reconnect_max_delay,
+                    )
+                    self.is_connected = False
+                    self._session = None
+                    self.player.clear()
+                    self.recorder.clear_queue()
+                    self._reset_client_vad()
+                    self._barge_in_preroll.clear()
+                    self.set_status(
+                        f"Reconnecting to Gemini ({retry_count}/{self.config.live_reconnect_attempts})…"
+                    )
+                    self.log(
+                        f"Transient Live transport error: {exc}. "
+                        f"Retrying in {delay:.1f}s."
+                    )
+                    try:
+                        await asyncio.wait_for(
+                            self._stop_event.wait(), timeout=delay
+                        )
+                    except asyncio.TimeoutError:
+                        pass
         except asyncio.CancelledError:
             self.log("Live session cancelled.")
         except Exception as e:
+            fatal_error = e
             err_msg = str(e)
             if "APIError" in type(e).__name__ or "disabled" in err_msg.lower():
                 err_msg = f"API Error: {e}"
@@ -163,7 +190,7 @@ class GeminiLiveClient:
             self._session = None
             self.recorder.stop()
             self.player.stop()
-            if not self._stop_event.is_set():
+            if fatal_error is not None:
                 self.set_status("Disconnected (Error) 🔴")
             else:
                 self.set_status("Disconnected 🔴")
@@ -173,9 +200,141 @@ class GeminiLiveClient:
                 except Exception as e:
                     logger.exception("on_session_ended callback failed: %s", e)
 
+    def _build_live_config(self) -> types.LiveConnectConfig:
+        """Create connection config with the latest resumable session handle."""
+        return types.LiveConnectConfig(
+            response_modalities=[types.Modality.AUDIO],
+            tools=build_gemini_tools("live_model"),
+            speech_config=types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                        voice_name=self.config.voice_name
+                    )
+                )
+            ),
+            realtime_input_config=types.RealtimeInputConfig(
+                automatic_activity_detection=(
+                    types.AutomaticActivityDetection(disabled=True)
+                    if self.config.client_vad_enabled
+                    else types.AutomaticActivityDetection(
+                        disabled=False,
+                        start_of_speech_sensitivity=(
+                            types.StartSensitivity.START_SENSITIVITY_HIGH
+                        ),
+                        end_of_speech_sensitivity=(
+                            types.EndSensitivity.END_SENSITIVITY_HIGH
+                        ),
+                        prefix_padding_ms=self.config.vad_prefix_padding_ms,
+                        silence_duration_ms=self.config.vad_silence_duration_ms,
+                    )
+                ),
+                activity_handling=types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
+                turn_coverage=types.TurnCoverage.TURN_INCLUDES_ONLY_ACTIVITY,
+            ),
+            session_resumption=types.SessionResumptionConfig(
+                handle=self._session_resumption_handle
+            ),
+            system_instruction=types.Content(
+                parts=[types.Part(text=ROBOT_SYSTEM_INSTRUCTION)]
+            ),
+        )
+
+    async def _run_live_connection(self) -> None:
+        """Run one WebSocket connection; raise if either transport task fails."""
+        resuming = self._session_resumption_handle is not None
+        action = "Resuming" if resuming else "Initiating"
+        self.log(
+            f"{action} WebSocket connection with Tool Use "
+            f"(Model: {self.config.model})..."
+        )
+
+        async with self.genai_client.aio.live.connect(
+            model=self.config.model,
+            config=self._build_live_config(),
+        ) as session:
+            self._session = session
+            self.is_connected = True
+            self._connection_started_at = time.monotonic()
+            self.set_status(
+                "Reconnected & Live 🟢"
+                if self._has_connected_once
+                else "Connected & Live 🟢"
+            )
+            self._has_connected_once = True
+            self.log(
+                f"Connected to model '{self.config.model}' with registered tools."
+            )
+
+            if not self.player.is_playing:
+                self.player.start()
+            if not self.recorder.is_recording:
+                self.recorder.start(self._loop)
+            else:
+                self.recorder.clear_queue()
+
+            send_task = asyncio.create_task(self._send_audio_loop())
+            receive_task = asyncio.create_task(self._receive_responses_loop())
+            stop_task = asyncio.create_task(self._stop_event.wait())
+            self._tasks = [send_task, receive_task]
+
+            try:
+                done, _ = await asyncio.wait(
+                    [send_task, receive_task, stop_task],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if stop_task in done:
+                    return
+
+                for task in (send_task, receive_task):
+                    if task not in done:
+                        continue
+                    error = task.exception()
+                    if error is not None:
+                        raise error
+                raise ConnectionError("Gemini Live audio task stopped unexpectedly")
+            finally:
+                for task in (send_task, receive_task, stop_task):
+                    task.cancel()
+                await asyncio.gather(
+                    send_task, receive_task, stop_task, return_exceptions=True
+                )
+                self.is_connected = False
+                self._session = None
+
+    @staticmethod
+    def _is_retryable_transport_error(error: Exception) -> bool:
+        """Return whether reconnecting is safe for this transport failure."""
+        code = getattr(error, "code", None)
+        try:
+            numeric_code = int(code) if code is not None else None
+        except (TypeError, ValueError):
+            numeric_code = None
+        if numeric_code in {1001, 1006, 1011, 1012, 1013}:
+            return True
+
+        text = f"{type(error).__name__}: {error}".lower()
+        return any(
+            marker in text
+            for marker in (
+                "1011",
+                "internal error",
+                "connectionclosed",
+                "connection closed",
+                "transport ended",
+                "timed out",
+                "timeout",
+                "temporarily unavailable",
+                "service unavailable",
+                "websocket",
+            )
+        )
+
     def stop_session(self) -> None:
         """Signal live session to shut down."""
-        self._stop_event.set()
+        if self._loop and self._loop.is_running():
+            self._loop.call_soon_threadsafe(self._stop_event.set)
+        else:
+            self._stop_event.set()
 
     async def interrupt_with_text(self, text_payload: str) -> None:
         """
@@ -187,7 +346,7 @@ class GeminiLiveClient:
             return
 
         self.player.clear()
-        self._pause_mic_until = time.time() + 0.5
+        self._pause_mic_until = time.monotonic() + 0.5
         
         self.log(f"⚡ [EVENT CONTEXT SENT TO AI]: '{text_payload}'")
 
@@ -195,6 +354,11 @@ class GeminiLiveClient:
             self.on_transcript("User Event", f"⚡ {text_payload}")
 
         try:
+            if self.config.client_vad_enabled and self._user_activity_active:
+                await self._session.send_realtime_input(
+                    activity_end=types.ActivityEnd()
+                )
+                self._reset_client_vad()
             await self._session.send_client_content(
                 turns=types.Content(
                     role="user",
@@ -214,38 +378,121 @@ class GeminiLiveClient:
         try:
             while self.is_connected and self._session is not None:
                 audio_data = await self.recorder.audio_queue.get()
-                
-                # Check mic pause window (after text interruption dispatch)
-                if time.time() < self._pause_mic_until:
-                    self.recorder.audio_queue.task_done()
-                    continue
-
-                # Threshold mic gate while AI speaker is actively playing audio
-                if self.player.is_speaking:
-                    rms = compute_pcm_rms(audio_data)
-                    # If RMS is below threshold (0.12), drop chunk to suppress speaker echo feedback.
-                    # If RMS >= 0.12, genuine human voice is speaking loud enough to interrupt!
-                    if rms < self.voice_interruption_threshold:
-                        self.recorder.audio_queue.task_done()
+                try:
+                    # Check mic pause window (after text interruption dispatch).
+                    if time.monotonic() < self._pause_mic_until:
+                        self._barge_in_preroll.clear()
                         continue
-                    else:
-                        self.log(f"🎙️ [Human Voice Interruption] Mic RMS {rms:.3f} >= {self.voice_interruption_threshold}")
 
-                if audio_data and self._session:
-                    await self._session.send_realtime_input(
-                        audio=types.Blob(data=audio_data, mime_type="audio/pcm")
-                    )
-                self.recorder.audio_queue.task_done()
+                    chunks_to_send = [audio_data]
+                    if self.player.is_speaking:
+                        self._barge_in_preroll.append(audio_data)
+                        rms = compute_pcm_rms(audio_data)
+                        if rms < self.voice_interruption_threshold:
+                            continue
+
+                        # Cut local playback now. Waiting for Gemini's
+                        # interruption frame makes barge-in feel delayed.
+                        chunks_to_send = list(self._barge_in_preroll)
+                        self._barge_in_preroll.clear()
+                        self.player.clear()
+                        self.log(
+                            "Human voice interruption detected "
+                            f"(RMS {rms:.3f}); stopped local playback"
+                        )
+                    else:
+                        self._barge_in_preroll.clear()
+
+                    for chunk in chunks_to_send:
+                        if self.config.client_vad_enabled:
+                            await self._process_client_vad_chunk(chunk)
+                        else:
+                            await self._send_audio_chunk(chunk)
+                finally:
+                    self.recorder.audio_queue.task_done()
         except asyncio.CancelledError:
-            pass
+            raise
         except Exception as e:
             self.log(f"Error in send audio loop: {e}")
+            raise
+
+    async def _process_client_vad_chunk(self, audio_data: bytes) -> None:
+        """Send explicit activity boundaries around microphone speech."""
+        if not audio_data or self._session is None:
+            return
+
+        chunk_ms = self.recorder.chunk_size / self.recorder.sample_rate * 1000
+        start_chunks = max(
+            1, int(round(self.config.client_vad_min_speech_ms / chunk_ms))
+        )
+        end_chunks = max(
+            1, int(round(self.config.client_vad_silence_ms / chunk_ms))
+        )
+        rms = compute_pcm_rms(audio_data)
+        is_speech = rms >= self.config.client_vad_rms_threshold
+
+        if not self._user_activity_active:
+            self._speech_preroll.append(audio_data)
+            self._speech_chunks = self._speech_chunks + 1 if is_speech else 0
+            if self._speech_chunks < start_chunks:
+                return
+
+            await self._session.send_realtime_input(
+                activity_start=types.ActivityStart()
+            )
+            self._user_activity_active = True
+            self._silence_chunks = 0
+            logger.info("Client VAD: speech started (RMS %.3f)", rms)
+            for chunk in self._speech_preroll:
+                await self._send_audio_chunk(chunk)
+            self._speech_preroll.clear()
+            return
+
+        await self._send_audio_chunk(audio_data)
+        if is_speech:
+            self._silence_chunks = 0
+            return
+
+        self._silence_chunks += 1
+        if self._silence_chunks >= end_chunks:
+            await self._session.send_realtime_input(activity_end=types.ActivityEnd())
+            logger.info("Client VAD: speech ended after %d ms silence", int(self.config.client_vad_silence_ms))
+            self._reset_client_vad()
+
+    async def _send_audio_chunk(self, audio_data: bytes) -> None:
+        if audio_data and self._session:
+            await self._session.send_realtime_input(
+                audio=types.Blob(
+                    data=audio_data,
+                    mime_type=f"audio/pcm;rate={self.config.input_sample_rate}",
+                )
+            )
+
+    def _reset_client_vad(self) -> None:
+        self._user_activity_active = False
+        self._speech_chunks = 0
+        self._silence_chunks = 0
+        self._speech_preroll.clear()
 
     async def _receive_responses_loop(self) -> None:
         """Task receiving real-time audio responses and processing incoming AI tool calls."""
         try:
             while self.is_connected and self._session is not None:
                 async for response in self._session.receive():
+                    resumption = response.session_resumption_update
+                    if (
+                        resumption is not None
+                        and resumption.resumable
+                        and resumption.new_handle
+                    ):
+                        self._session_resumption_handle = resumption.new_handle
+
+                    if response.go_away is not None:
+                        self.log(
+                            "Gemini Live connection will rotate soon "
+                            f"(time left: {response.go_away.time_left or 'unknown'})"
+                        )
+
                     # Handle AI Tool Calls (Function Calling)
                     tool_call = response.tool_call
                     if tool_call is not None:
@@ -290,32 +537,39 @@ class GeminiLiveClient:
                             if part.inline_data and part.inline_data.data:
                                 self.player.play_chunk(part.inline_data.data)
                                 if self.transcript_service:
-                                    # The model replying ends the user's turn.
-                                    self.transcript_service.flush_user_turn()
+                                    # Flush once at turn start. Repeating this
+                                    # for every audio chunk churns worker events
+                                    # and can steal CPU from playback.
+                                    if not self._model_turn_active:
+                                        self.transcript_service.flush_user_turn()
                                     self.transcript_service.feed_model_audio(
                                         part.inline_data.data
                                     )
+                                self._model_turn_active = True
                             if part.text:
                                 self._model_text_buffer.append(part.text)
 
                     # Flush accumulated model text at the end of its turn
                     if server_content.turn_complete:
                         self._flush_model_text()
+                        self._model_turn_active = False
                         if self.transcript_service:
                             self.transcript_service.flush_model_turn()
 
                     # Handle server-side barge-in / interruption signal
                     if server_content.interrupted:
                         self._flush_model_text()
+                        self._model_turn_active = False
                         if self.transcript_service:
                             self.transcript_service.flush_model_turn()
                         self.player.clear()
                         self.log("⚡ [Server Barge-in Detected] Gemini cut off generation.")
 
         except asyncio.CancelledError:
-            pass
+            raise
         except Exception as e:
             self.log(f"Error in receive responses loop: {e}")
+            raise
 
     def _flush_model_text(self) -> None:
         """Emit accumulated model text as one transcript line and reset the buffer."""
