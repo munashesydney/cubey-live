@@ -12,6 +12,7 @@ import threading
 from typing import Any, Callable, Dict, List, Optional
 
 from src.ai.prompts.local_llm import SYSTEM_PROMPT as _DEFAULT_SYSTEM_PROMPT
+from src.ai.prompts.local_llm.shared_tools import build_current_time_context
 from src.client.tools.registry import ToolContext, dispatch_tool_call
 from src.config import PROJECT_ROOT
 
@@ -112,6 +113,12 @@ class LocalLLMService:
         """Signal active generation stream to halt."""
         self._stop_event.set()
 
+    @staticmethod
+    def _with_runtime_context(system_prompt: str) -> str:
+        """Attach a fresh clock snapshot without changing Gemini's prompt path."""
+
+        return f"{system_prompt}\n\n{build_current_time_context()}"
+
     def _ensure_model_loaded(self) -> None:
         """Blocking call to download and load the model into memory. Runs on worker thread."""
         if self._llm is not None:
@@ -182,7 +189,9 @@ class LocalLLMService:
         def on_error(err: str) -> None:
             result["error"] = err
 
-        sys_prompt = system_prompt if system_prompt is not None else self.default_system_prompt
+        sys_prompt = self._with_runtime_context(
+            system_prompt if system_prompt is not None else self.default_system_prompt
+        )
         payload: List[Dict[str, Any]] = []
         if sys_prompt:
             payload.append({"role": "system", "content": sys_prompt})
@@ -225,7 +234,9 @@ class LocalLLMService:
 
         self._stop_event.clear()
 
-        sys_prompt = system_prompt if system_prompt is not None else self.default_system_prompt
+        sys_prompt = self._with_runtime_context(
+            system_prompt if system_prompt is not None else self.default_system_prompt
+        )
         # Gently point the model at the tools it has, so it reaches for them.
         if tools:
             tool_names = ", ".join(t["function"]["name"] for t in tools)

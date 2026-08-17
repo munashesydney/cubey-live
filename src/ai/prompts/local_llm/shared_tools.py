@@ -1,6 +1,7 @@
 """Tool guidance shared by the interactive and scheduled local-LLM prompts."""
 
 from collections.abc import Sequence
+from datetime import datetime, timezone
 
 
 SHARED_TOOL_DESCRIPTIONS = (
@@ -35,9 +36,29 @@ SHARED_TOOL_DESCRIPTIONS = (
     "correct or refresh an existing memory.\n"
     "\n"
     "current_time - get Cubey's current local date, time, timezone, and UTC time.\n"
-    "  Call it whenever the current time, date, day, timezone, or a relative-time "
-    "calculation matters. Do not guess the current time. It takes no parameters."
+    "  A fresh, trusted current local time is included in the runtime system "
+    "context at the start of every request. Use that time for relative-time "
+    "calculations; never use dates from past messages or examples. Call this tool "
+    "only when you need to re-check the clock during a long-running request. It "
+    "takes no parameters."
 )
+
+
+def build_current_time_context(now: datetime | None = None) -> str:
+    """Return the trusted current-time block added to every local model request."""
+
+    local_now = (now or datetime.now(timezone.utc)).astimezone()
+    utc_now = local_now.astimezone(timezone.utc)
+    timezone_name = local_now.tzname() or "local timezone"
+    return (
+        "## Runtime clock\n"
+        f"Current local time: {local_now.isoformat(timespec='seconds')} "
+        f"({timezone_name}).\n"
+        f"Current UTC time: {utc_now.isoformat(timespec='seconds')}.\n"
+        "This is the authoritative current time for this request. For relative "
+        "times such as 'in two minutes', calculate from Current local time above; "
+        "never search past messages for the date or time."
+    )
 
 
 def build_tool_calling_instructions(tool_names: Sequence[str]) -> str:
@@ -72,4 +93,8 @@ def build_tool_calling_instructions(tool_names: Sequence[str]) -> str:
     )
 
 
-__all__ = ["SHARED_TOOL_DESCRIPTIONS", "build_tool_calling_instructions"]
+__all__ = [
+    "SHARED_TOOL_DESCRIPTIONS",
+    "build_current_time_context",
+    "build_tool_calling_instructions",
+]

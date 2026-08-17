@@ -70,6 +70,8 @@ class LocalChatPage(ctk.CTkFrame):
 
         # Active conversation state
         self.active_conversation_id: Optional[int] = None
+        # Distinguishes the initial empty state from an intentional New Chat.
+        self._new_chat_pending: bool = False
         self.conversations_map: Dict[str, int] = {}
         self.current_system_prompt: str = app_config.local_model_system_prompt
 
@@ -274,7 +276,12 @@ class LocalChatPage(ctk.CTkFrame):
             options = ["(No Saved Conversations)"]
 
         self.convo_dropdown.configure(values=options)
-        if options and options[0] != "(No Saved Conversations)" and self.active_conversation_id is None:
+        if (
+            options
+            and options[0] != "(No Saved Conversations)"
+            and self.active_conversation_id is None
+            and not self._new_chat_pending
+        ):
             self.convo_dropdown.set(options[0])
             self._show_conversation(self.conversations_map[options[0]])
 
@@ -297,6 +304,7 @@ class LocalChatPage(ctk.CTkFrame):
     def _show_conversation(self, conversation_id: int) -> None:
         """Render selected conversation messages into transcript box."""
         self.active_conversation_id = conversation_id
+        self._new_chat_pending = False
         try:
             messages = list_messages(conversation_id=conversation_id, limit=500)
         except Exception as e:
@@ -319,6 +327,7 @@ class LocalChatPage(ctk.CTkFrame):
     def start_new_chat(self) -> None:
         """Reset active conversation and clear transcript box."""
         self.active_conversation_id = None
+        self._new_chat_pending = True
         self.transcript_box.delete("1.0", "end")
         self.transcript_box.insert("end", "✨ Started new Qwen3.5 local chat session. Type your query below!\n\n")
         self.convo_dropdown.set("(New Conversation)")
@@ -345,6 +354,7 @@ class LocalChatPage(ctk.CTkFrame):
                     source=ConversationSource.LOCAL,
                 )
                 self.active_conversation_id = conv.id
+                self._new_chat_pending = False
             except Exception as e:
                 logger.error("Failed to create conversation: %s", e)
 

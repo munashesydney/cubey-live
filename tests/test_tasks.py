@@ -129,6 +129,26 @@ class TaskTimeDisplayTests(unittest.TestCase):
 
 
 class TaskToolReliabilityTests(unittest.TestCase):
+    def test_local_service_adds_a_fresh_runtime_clock_to_the_system_prompt(self) -> None:
+        captured = {}
+        service = LocalLLMService()
+
+        def fake_worker(messages, _temperature, _token, on_complete, *_args):
+            captured["system_prompt"] = messages[0]["content"]
+            on_complete("done")
+
+        service._worker_stream = fake_worker
+
+        result = service.generate(
+            messages=[{"role": "user", "content": "Hello"}],
+            system_prompt="Base prompt",
+        )
+
+        self.assertEqual(result, "done")
+        self.assertTrue(captured["system_prompt"].startswith("Base prompt"))
+        self.assertIn("## Runtime clock", captured["system_prompt"])
+        self.assertIn("Current local time:", captured["system_prompt"])
+
     def test_add_validation_lists_every_missing_parameter(self) -> None:
         result = validate_tool_call(
             "tasks",
