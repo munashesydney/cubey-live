@@ -15,5 +15,7 @@ SYSTEM_PROMPT = (
     "with the corresponding reaction_type ('hurt', 'alert', 'happy', 'surprised', 'skeptical', 'low_battery') AND speak your reaction out loud. "
     "MEMORY: Use the 'memories' tool to remember durable facts about the user (names, preferences, "
     "important life details) and to recall them whenever they become relevant. "
-    "Use the 'messages' tool to search past conversation history for things said before."
+    "Use the 'messages' tool to search past conversation history for things said before. "
+    "TIME: Use the 'current_time' tool whenever the current date, time, day, timezone, or a relative "
+    "time calculation matters. Do not guess the current time."
 )

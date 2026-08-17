@@ -22,6 +22,34 @@ logger = logging.getLogger(__name__)
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL)
 _TOOL_CALL_FUNC_RE = re.compile(r"<function=([^>]+)>")
 _TOOL_CALL_PARAM_RE = re.compile(r"<parameter=([^>]+)>(.*?)</parameter>", re.DOTALL)
+_TASK_REQUEST_RE = re.compile(
+    r"\b(?:remind\s+me|schedule|set\s+(?:up\s+)?(?:a\s+)?reminder|create\s+(?:a\s+)?task)\b",
+    re.IGNORECASE,
+)
+_TASK_SUCCESS_CLAIM_RE = re.compile(
+    r"\b(?:task|reminder)\b.{0,60}\b(?:scheduled|created|set)\b|"
+    r"\b(?:scheduled|created|set)\b.{0,60}\b(?:task|reminder)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _latest_user_text(messages: List[Dict[str, Any]]) -> str:
+    for message in reversed(messages):
+        content = str(message.get("content") or "")
+        if message.get("role") == "user" and not content.startswith("<tool_response>"):
+            return content
+    return ""
+
+
+def _task_created_confirmation(result: dict[str, Any]) -> Optional[str]:
+    """Build a factual confirmation directly from a successful tool result."""
+
+    if result.get("status") != "created":
+        return None
+    return (
+        f"Task #{result.get('task_id')} was scheduled successfully for "
+        f"{result.get('next_run_at')}."
+    )
 
 
 def _parse_qwen_tool_calls(text: str) -> List[dict]:
@@ -136,7 +164,8 @@ class LocalLLMService:
         temperature: float = 0.7,
         tools: Optional[List[dict]] = None,
         tool_context: Optional[ToolContext] = None,
-        max_tool_rounds: int = 4,
+        on_tool_call: Optional[Callable[[str, dict, dict], None]] = None,
+        max_tool_rounds: int = 8,
     ) -> str:
         """
         Synchronous generation for headless task runs (blocks the caller).
@@ -162,7 +191,7 @@ class LocalLLMService:
         # _worker_stream is synchronous and invokes on_complete/on_error
         # before returning, so no event is needed.
         self._worker_stream(
-            payload, temperature, None, on_complete, on_error, None,
+            payload, temperature, None, on_complete, on_error, on_tool_call,
             tools, tool_context, max_tool_rounds,
         )
         if "error" in result:
@@ -180,7 +209,7 @@ class LocalLLMService:
         temperature: float = 0.7,
         tools: Optional[List[dict]] = None,
         tool_context: Optional[ToolContext] = None,
-        max_tool_rounds: int = 4,
+        max_tool_rounds: int = 8,
     ) -> None:
         """
         Launch streaming chat completion on a background worker thread.
@@ -248,10 +277,21 @@ class LocalLLMService:
             return
 
         working_messages: List[Dict[str, Any]] = list(messages)
+        task_tool_available = any(
+            tool.get("function", {}).get("name") == "tasks" for tool in (tools or [])
+        )
+        task_request = task_tool_available and bool(
+            _TASK_REQUEST_RE.search(_latest_user_text(working_messages))
+        )
+        grounding_retries = 0
+        tool_rounds = 0
         try:
-            for _round in range(max_tool_rounds + 1):
+            for _attempt in range(max_tool_rounds + 2):
                 structured_calls, round_text = self._generate_round(
-                    working_messages, temperature, tools, on_token
+                    working_messages,
+                    temperature,
+                    tools,
+                    None if task_request else on_token,
                 )
 
                 # Qwen emits tool calls either via the structured channel or as
@@ -261,9 +301,42 @@ class LocalLLMService:
 
                 if not tool_calls:
                     # Final answer: strip any tool blocks for display/persistence.
+                    final_text = _strip_tool_blocks(round_text)
+                    if task_request and _TASK_SUCCESS_CLAIM_RE.search(final_text):
+                        if grounding_retries == 0:
+                            grounding_retries += 1
+                            working_messages.extend(
+                                [
+                                    {"role": "assistant", "content": final_text},
+                                    {
+                                        "role": "user",
+                                        "content": (
+                                            "<tool_response>{\"status\":\"not_executed\","
+                                            "\"message\":\"No task was created. Call tasks.add "
+                                            "successfully before claiming it was scheduled.\"}"
+                                            "</tool_response>"
+                                        ),
+                                    },
+                                ]
+                            )
+                            continue
+                        final_text = (
+                            "I couldn't create the task because I did not receive "
+                            "a successful response from the tasks tool."
+                        )
+                    if task_request and on_token:
+                        on_token(final_text)
                     if on_complete:
-                        on_complete(_strip_tool_blocks(round_text))
+                        on_complete(final_text)
                     return
+
+                if tool_rounds >= max_tool_rounds:
+                    if on_error:
+                        on_error(
+                            f"Tool calling reached the maximum of {max_tool_rounds} rounds."
+                        )
+                    return
+                tool_rounds += 1
 
                 logger.info(
                     "Local LLM called %d tool(s): %s",
@@ -297,8 +370,18 @@ class LocalLLMService:
                         {"role": "assistant", "content": round_text}
                     )
 
+                created_confirmation: Optional[str] = None
                 for tc in tool_calls:
                     result = dispatch_tool_call(tc["name"], tc["args"], tool_context)
+                    if tc["name"] == "tasks":
+                        logger.info(
+                            "Local tasks tool args=%s result=%s",
+                            tc["args"],
+                            result,
+                        )
+                        created_confirmation = (
+                            _task_created_confirmation(result) or created_confirmation
+                        )
                     if on_tool_call:
                         try:
                             on_tool_call(tc["name"], tc["args"], result)
@@ -319,11 +402,14 @@ class LocalLLMService:
                                 "content": f"<tool_response>{json.dumps(result)}</tool_response>",
                             }
                         )
-            else:
-                if on_error:
-                    on_error(
-                        f"Tool calling exceeded the maximum of {max_tool_rounds} rounds."
-                    )
+                if created_confirmation is not None:
+                    if on_token:
+                        on_token(created_confirmation)
+                    if on_complete:
+                        on_complete(created_confirmation)
+                    return
+            if on_error:
+                on_error("The model could not complete the tool workflow reliably.")
         except Exception as e:
             err_msg = f"Error during local llama.cpp generation: {e}"
             logger.error(err_msg)

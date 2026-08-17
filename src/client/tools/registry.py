@@ -5,8 +5,9 @@ Owns:
   - TOOL_SCHEMAS:      the neutral, OpenAI-style definitions (name, description,
                        JSON-schema parameters) for every tool.
   - MODEL_TOOL_POLICY: which tools each model may call:
-                         live_model -> react, messages, memories
-                         local_model -> messages, memories (no face reactions)
+                         live_model -> react, messages, memories, current_time, tasks
+                         local_model -> messages, memories, current_time, tasks
+                         local_task_runner -> messages, memories, current_time
   - builders:          render the neutral schemas into Gemini Live
                        declarations or llama.cpp tool lists.
   - dispatch:          route a tool call by name to its executor.
@@ -135,15 +136,31 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "required": ["action"],
         },
     },
+    "current_time": {
+        "name": "current_time",
+        "description": (
+            "Get the current date and time from Cubey's machine. Call this whenever "
+            "the current time, date, day, timezone, or a relative time expression "
+            "such as 'in two hours' matters. Do not guess the time."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+        },
+    },
     "tasks": {
         "name": "tasks",
         "description": (
-            "Schedule tasks that spawn an AI to do something later. "
+            "Schedule work for an AI pipeline to perform later. "
             "A task runs one AI ('local' Qwen or 'gemini') with a prompt when "
             "its schedule is due. Use 'add' to schedule something, 'list' to see "
             "scheduled tasks, 'update' to change one, 'delete' to cancel one. "
             "Examples: remind the user at a time, run a daily summary, or do a "
-            "quick check every few minutes."
+            "quick check every few minutes. For action='add', always provide "
+            "title, prompt, model, schedule_type, and the schedule-specific field. "
+            "Write prompt as an instruction to your future self that preserves "
+            "the user's perspective; for example, 'Remind the user to call their "
+            "dad', not 'Call your dad'."
         ),
         "parameters": {
             "type": "object",
@@ -155,44 +172,57 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 },
                 "title": {
                     "type": "string",
-                    "description": "Short name for the task, e.g. 'Evening reminder'.",
+                    "description": (
+                        "Required for 'add'. Short name for the task, e.g. "
+                        "'Evening reminder'."
+                    ),
                 },
                 "prompt": {
                     "type": "string",
                     "description": (
-                        "The instruction the AI runs when the task is due, e.g. "
-                        "'Remind the user to take their medicine'."
+                        "Required for 'add'. An instruction written to the AI that "
+                        "will run it later. Preserve who the user is: write "
+                        "'Remind the user to call their dad', not 'Call your dad'."
                     ),
                 },
                 "model": {
                     "type": "string",
                     "enum": ["local", "gemini"],
-                    "description": "Which AI runs the task: 'local' (Qwen) or 'gemini'.",
+                    "description": (
+                        "Required for 'add'. Which AI runs the task: 'local' "
+                        "(Qwen) or 'gemini'."
+                    ),
                 },
                 "schedule_type": {
                     "type": "string",
                     "enum": ["one_shot", "interval", "cron"],
                     "description": (
-                        "'one_shot' runs once at run_at; 'interval' runs every "
+                        "Required for 'add'. 'one_shot' runs once at run_at; "
+                        "'interval' runs every "
                         "interval_seconds; 'cron' runs per cron_expr."
                     ),
                 },
                 "run_at": {
                     "type": "string",
                     "description": (
-                        "ISO-8601 timestamp for 'one_shot' schedules, interpreted "
+                        "Required when schedule_type is 'one_shot'. ISO-8601 "
+                        "timestamp interpreted "
                         "in the machine's local timezone, e.g. '2026-08-09T19:00:00'. "
                         "For 'in 5 seconds', use the current time plus 5 seconds."
                     ),
                 },
                 "interval_seconds": {
                     "type": "integer",
-                    "description": "Seconds between runs for 'interval' schedules (e.g. 300 = every 5 minutes).",
+                    "description": (
+                        "Required when schedule_type is 'interval'. Seconds between "
+                        "runs (e.g. 300 = every 5 minutes)."
+                    ),
                 },
                 "cron_expr": {
                     "type": "string",
                     "description": (
-                        "5-field cron expression for 'cron' schedules, in local time, "
+                        "Required when schedule_type is 'cron'. A 5-field cron "
+                        "expression in local time, "
                         "e.g. '0 19 * * *' for every day at 7pm or '*/5 * * * *' "
                         "for every 5 minutes."
                     ),
@@ -218,11 +248,12 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
 
 MODEL_TOOL_POLICY: dict[str, list[str]] = {
     # Gemini Live: full agent — physical reactions + memory + history + tasks.
-    "live_model": ["react", "messages", "memories", "tasks"],
-    # Local Qwen: the user never interacts with it directly, so it has no
-    # physical reactions — but it shares the memory bank, history, and can
-    # schedule tasks.
-    "local_model": ["messages", "memories", "tasks"],
+    "live_model": ["react", "messages", "memories", "current_time", "tasks"],
+    # Interactive local Qwen shares memory/history and can schedule tasks.
+    "local_model": ["messages", "memories", "current_time", "tasks"],
+    # Scheduled runs execute an existing task. They deliberately cannot create,
+    # update, or delete tasks, preventing recursive task creation.
+    "local_task_runner": ["messages", "memories", "current_time"],
 }
 
 
@@ -314,8 +345,106 @@ class ToolContext:
     on_react: Optional[Callable[[str], None]] = None
 
 
+def validate_tool_call(name: str, args: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Return actionable feedback for missing action-specific parameters."""
+
+    schema = TOOL_SCHEMAS.get(name)
+    if schema is None:
+        return {
+            "status": "unknown_tool",
+            "tool": name,
+            "message": f"Unknown tool '{name}'.",
+        }
+
+    required = list(schema["parameters"].get("required", []))
+    action = str(args.get("action") or "").strip().lower()
+
+    if name == "memories":
+        required.extend(
+            {
+                "add": ["content"],
+                "update": ["memory_id"],
+                "search": ["query"],
+            }.get(action, [])
+        )
+    elif name == "tasks":
+        if action == "add":
+            required.extend(["title", "prompt", "model", "schedule_type"])
+            schedule_type = str(args.get("schedule_type") or "").strip().lower()
+            schedule_field = {
+                "one_shot": "run_at",
+                "interval": "interval_seconds",
+                "cron": "cron_expr",
+            }.get(schedule_type)
+            if schedule_field:
+                required.append(schedule_field)
+        elif action in {"update", "delete"}:
+            required.append("task_id")
+
+    missing = list(
+        dict.fromkeys(
+            field
+            for field in required
+            if field not in args
+            or args[field] is None
+            or (isinstance(args[field], str) and not args[field].strip())
+        )
+    )
+    if missing:
+        operation = f"{name}.{action}" if action else name
+        return {
+            "status": "validation_error",
+            "tool": name,
+            "action": action or None,
+            "missing_parameters": missing,
+            "required_parameters": list(dict.fromkeys(required)),
+            "message": (
+                f"{operation} was not executed because required parameter(s) are "
+                f"missing: {', '.join(missing)}. Call the tool again with every "
+                "required parameter. Do not tell the user it succeeded yet."
+            ),
+        }
+
+    if name == "tasks" and action == "add":
+        prompt = str(args.get("prompt") or "").strip()
+        lowered_prompt = prompt.lower()
+        personal_action = lowered_prompt.startswith(
+            ("call ", "text ", "email ", "visit ", "take ", "meet ", "contact ")
+        )
+        wrong_perspective = "remind me" in lowered_prompt or (
+            personal_action
+            and any(token in f" {lowered_prompt} " for token in (" my ", " your ", " me "))
+            and " user" not in lowered_prompt
+        )
+        if wrong_perspective:
+            return {
+                "status": "validation_error",
+                "tool": name,
+                "action": action,
+                "invalid_parameters": ["prompt"],
+                "message": (
+                    "tasks.add was not executed because prompt uses the wrong "
+                    "perspective. Write it as an instruction to your future self "
+                    "and refer to the person as 'the user'. Example: 'Remind the "
+                    "user to call their dad', not 'Call your dad'. Call tasks.add "
+                    "again with a corrected prompt."
+                ),
+            }
+
+    return None
+
+
 def dispatch_tool_call(name: str, args: dict[str, Any], context: ToolContext) -> dict[str, Any]:
     """Route a tool call to its executor. Never raises — returns a result dict."""
+    validation_error = validate_tool_call(name, args)
+    if validation_error is not None:
+        logger.warning(
+            "Rejected invalid tool call %s: %s",
+            name,
+            validation_error["message"],
+        )
+        return validation_error
+
     # Lazy imports keep the registry free of heavy deps at import time.
     try:
         if name == "react":
@@ -348,6 +477,11 @@ def dispatch_tool_call(name: str, args: dict[str, Any], context: ToolContext) ->
                 limit=args.get("limit"),
                 embedding_service=context.embedding_service,
             )
+
+        if name == "current_time":
+            from src.client.tools.current_time import execute_current_time_tool
+
+            return execute_current_time_tool()
 
         if name == "tasks":
             from src.client.tools.tasks import execute_tasks_tool

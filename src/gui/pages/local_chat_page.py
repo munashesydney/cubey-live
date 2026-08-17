@@ -24,8 +24,23 @@ from src.db import (
 from src.client.tools import ToolContext, build_llama_tools
 from src.services.embeddings import EmbeddingService
 from src.services.local_llm import LocalLLMService
+from src.services.local_tool_history import (
+    deserialize_tool_trace,
+    serialize_tool_trace,
+    tool_trace_messages,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _local_datetime(value: Optional[datetime.datetime]) -> Optional[datetime.datetime]:
+    """Interpret naive database timestamps as UTC and display them locally."""
+
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=datetime.timezone.utc)
+    return value.astimezone()
 
 
 class LocalChatPage(ctk.CTkFrame):
@@ -67,6 +82,7 @@ class LocalChatPage(ctk.CTkFrame):
         # Check local engine health and load conversations
         self.after(200, self._check_engine_status)
         self.after(300, self.refresh_conversations_list)
+        self.after(5000, self._schedule_conversation_refresh)
 
     def _create_layout(self) -> None:
         """Create header controls, settings drawer, chat transcript, and message input."""
@@ -247,8 +263,9 @@ class LocalChatPage(ctk.CTkFrame):
 
         for conv in convos:
             title = conv.title or f"Conversation #{conv.id}"
-            time_str = conv.started_at.strftime("%b %d %H:%M") if conv.started_at else ""
-            label = f"🦙 {title[:30]} ({time_str})"
+            local_started_at = _local_datetime(conv.started_at)
+            time_str = local_started_at.strftime("%b %d %H:%M") if local_started_at else ""
+            label = f"🦙 {title[:24]} · #{conv.id} ({time_str})"
 
             self.conversations_map[label] = conv.id
             options.append(label)
@@ -260,6 +277,16 @@ class LocalChatPage(ctk.CTkFrame):
         if options and options[0] != "(No Saved Conversations)" and self.active_conversation_id is None:
             self.convo_dropdown.set(options[0])
             self._show_conversation(self.conversations_map[options[0]])
+
+    def _schedule_conversation_refresh(self) -> None:
+        """Keep background task-run conversations visible in the selector."""
+        try:
+            if not self.winfo_exists():
+                return
+            self.refresh_conversations_list()
+            self.after(5000, self._schedule_conversation_refresh)
+        except Exception:
+            pass
 
     def _on_conversation_selected(self, selected_label: str) -> None:
         """Handler for conversation dropdown selection."""
@@ -280,8 +307,11 @@ class LocalChatPage(ctk.CTkFrame):
         self.transcript_box.insert("end", f"=== Conversation #{conversation_id} ===\n\n")
 
         for msg in messages:
+            if msg.role == MessageRole.EVENT and deserialize_tool_trace(msg.content):
+                continue
             role_display = "👤 User" if msg.role == MessageRole.USER else "🦙 Qwen3.5"
-            timestamp = msg.created_at.strftime("%H:%M:%S") if msg.created_at else ""
+            local_created_at = _local_datetime(msg.created_at)
+            timestamp = local_created_at.strftime("%H:%M:%S") if local_created_at else ""
             self.transcript_box.insert("end", f"[{timestamp}] {role_display}:\n{msg.content}\n\n")
 
         self.transcript_box.see("end")
@@ -334,12 +364,14 @@ class LocalChatPage(ctk.CTkFrame):
         chat_history: List[Dict[str, str]] = []
         if self.active_conversation_id is not None:
             try:
-                past_msgs = list_messages(conversation_id=self.active_conversation_id, limit=20)
-                for pm in past_msgs:
+                past_msgs = list_messages(conversation_id=self.active_conversation_id, limit=500)
+                for pm in past_msgs[-60:]:
                     if pm.role == MessageRole.USER:
                         chat_history.append({"role": "user", "content": pm.content})
                     elif pm.role == MessageRole.MODEL:
                         chat_history.append({"role": "assistant", "content": pm.content})
+                    elif pm.role == MessageRole.EVENT:
+                        chat_history.extend(tool_trace_messages(pm.content))
             except Exception as e:
                 logger.warning("Failed to build chat history: %s", e)
                 chat_history = [{"role": "user", "content": text}]
@@ -355,15 +387,45 @@ class LocalChatPage(ctk.CTkFrame):
         sys_prompt = self.sys_prompt_entry.get().strip() or self.current_system_prompt
 
         # 6. Call streaming LLM service
+        conversation_id = self.active_conversation_id
         self.llm_service.stream_chat_completion(
             messages=chat_history,
             system_prompt=sys_prompt,
             on_token=self._on_token_received_threadsafe,
             on_complete=self._on_complete_threadsafe,
             on_error=self._on_error_threadsafe,
+            on_tool_call=(
+                lambda name, args, result: self._persist_tool_trace(
+                    conversation_id, name, args, result
+                )
+            ),
             tools=build_llama_tools("local_model"),
             tool_context=self.tool_context,
         )
+
+    @staticmethod
+    def _persist_tool_trace(
+        conversation_id: Optional[int],
+        name: str,
+        args: dict,
+        result: dict,
+    ) -> None:
+        """Keep tool diagnostics available to Qwen on later chat turns."""
+
+        if conversation_id is None:
+            return
+        try:
+            create_message(
+                conversation_id,
+                role=MessageRole.EVENT,
+                content=serialize_tool_trace(name, args, result),
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to persist tool trace for conversation #%s: %s",
+                conversation_id,
+                e,
+            )
 
     def stop_generation(self) -> None:
         """Halt streaming generation."""

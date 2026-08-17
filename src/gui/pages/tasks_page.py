@@ -5,6 +5,7 @@ View and manage scheduled AI tasks created via the 'tasks' tool.
 """
 
 import logging
+from datetime import datetime
 from typing import Any, Optional
 
 import customtkinter as ctk
@@ -38,7 +39,14 @@ _STATUS_COLORS = {
 def _format_when(value) -> str:
     if value is None:
         return "—"
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value)
+        except ValueError:
+            return value
     try:
+        if value.tzinfo is not None:
+            value = value.astimezone()
         return value.strftime("%Y-%m-%d %H:%M")
     except AttributeError:
         return str(value)

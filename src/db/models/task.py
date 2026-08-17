@@ -1,5 +1,5 @@
 """
-Task ORM model — scheduled jobs that spawn an AI when due.
+Task ORM model — scheduled jobs that run an AI pipeline when due.
 
 Schedules are one of:
   - one_shot: run once at `run_at`
@@ -63,7 +63,7 @@ class TaskModel(str, enum.Enum):
 
 
 class Task(Base):
-    """A scheduled job that spawns an AI agent when due."""
+    """A scheduled job that runs an AI pipeline when due."""
 
     __tablename__ = "tasks"
 

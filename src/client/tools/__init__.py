@@ -9,6 +9,10 @@ from src.client.tools.memories import MEMORIES_TOOL_DECLARATION, execute_memorie
 from src.client.tools.messages import MESSAGES_TOOL_DECLARATION, execute_messages_tool
 from src.client.tools.react import REACT_TOOL_DECLARATION, execute_react_tool
 from src.client.tools.tasks import TASKS_TOOL_DECLARATION, execute_tasks_tool
+from src.client.tools.current_time import (
+    CURRENT_TIME_TOOL_DECLARATION,
+    execute_current_time_tool,
+)
 from src.client.tools.registry import (
     MODEL_TOOL_POLICY,
     TOOL_SCHEMAS,
@@ -24,6 +28,7 @@ from src.client.tools.registry import (
 __all__ = [
     "MEMORIES_TOOL_DECLARATION",
     "MESSAGES_TOOL_DECLARATION",
+    "CURRENT_TIME_TOOL_DECLARATION",
     "MODEL_TOOL_POLICY",
     "REACT_TOOL_DECLARATION",
     "TASKS_TOOL_DECLARATION",
@@ -35,6 +40,7 @@ __all__ = [
     "dispatch_tool_call",
     "execute_memories_tool",
     "execute_messages_tool",
+    "execute_current_time_tool",
     "execute_react_tool",
     "execute_tasks_tool",
     "tool_names_for",

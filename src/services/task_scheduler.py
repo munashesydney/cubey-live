@@ -6,30 +6,41 @@ thread pool, and recomputes the next occurrence after every run. One-shot
 tasks transition to DONE; interval/cron tasks keep their schedule.
 
 Task execution dispatch:
-  - local  -> LocalLLMService.generate() (headless agentic run with tools)
+  - local  -> LocalLLMService.generate() (headless Qwen pipeline with tools)
   - gemini -> stub; real implementation is planned for the future
 """
 
 import logging
 import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from croniter import croniter
 
+from src.ai.prompts.local_llm.local_llm_task_runner import (
+    SYSTEM_PROMPT as TASK_RUNNER_SYSTEM_PROMPT,
+)
 from src.client.tools import ToolContext, build_llama_tools
+from src.config import config
 from src.db import (
+    ConversationSource,
+    MessageRole,
     Task,
     TaskModel,
     TaskScheduleType,
     TaskStatus,
+    create_conversation,
+    create_message,
     due_tasks,
+    end_conversation,
     get_task,
     update_task,
 )
 from src.services.embeddings import EmbeddingService
 from src.services.local_llm import LocalLLMService
+from src.services.local_tool_history import serialize_tool_trace
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +163,9 @@ class TaskScheduler:
     # ------------------------------------------------------------------
 
     def _run_task(self, task_id: int) -> None:
+        conversation_id: Optional[int] = None
+        result_text: Optional[str] = None
+        result_status = "error"
         try:
             task = get_task(task_id)
             if task is None:
@@ -160,7 +174,10 @@ class TaskScheduler:
             if task.status != TaskStatus.ACTIVE:
                 return
 
-            status, result_text = self._run_agent(task)
+            if task.model == TaskModel.LOCAL:
+                conversation_id = self._start_local_task_conversation(task)
+
+            result_status, result_text = self._run_agent(task, conversation_id)
             now = utcnow()
 
             if task.schedule_type == TaskScheduleType.ONE_SHOT:
@@ -169,10 +186,10 @@ class TaskScheduler:
                     status=TaskStatus.DONE,
                     next_run_at=None,
                     last_run_at=now,
-                    last_status=status,
+                    last_status=result_status,
                     last_result=result_text,
                 )
-                logger.info("Task #%s done: %s", task_id, status)
+                logger.info("Task #%s done: %s", task_id, result_status)
             else:
                 next_run = compute_next_run_at(
                     task.schedule_type,
@@ -185,37 +202,55 @@ class TaskScheduler:
                     task_id,
                     next_run_at=next_run,
                     last_run_at=now,
-                    last_status=status,
+                    last_status=result_status,
                     last_result=result_text,
                 )
                 logger.info(
                     "Task #%s ran (%s); next run at %s",
-                    task_id, status, next_run,
+                    task_id, result_status, next_run,
                 )
         except Exception as e:
             logger.exception("Task #%s run failed: %s", task_id, e)
+            if result_text is None:
+                result_text = f"Scheduler error: {e}"
             try:
                 update_task(
                     task_id,
                     last_run_at=utcnow(),
                     last_status="error",
-                    last_result=f"Scheduler error: {e}",
+                    last_result=result_text,
                 )
             except Exception:
                 logger.exception("Failed to record task #%s error state", task_id)
         finally:
+            if conversation_id is not None and result_text is not None:
+                self._finish_local_task_conversation(
+                    conversation_id,
+                    result_status,
+                    result_text,
+                )
             with self._running_lock:
                 self._running.discard(task_id)
 
-    def _run_agent(self, task: Task) -> tuple[str, str]:
+    def _run_agent(
+        self,
+        task: Task,
+        conversation_id: Optional[int] = None,
+    ) -> tuple[str, str]:
         """Spawn the AI for a task. Returns (status, result_text)."""
         if task.model == TaskModel.LOCAL:
             try:
                 llm = self._get_llm()
                 text = llm.generate(
                     messages=[{"role": "user", "content": task.prompt}],
-                    tools=build_llama_tools("local_model"),
+                    system_prompt=TASK_RUNNER_SYSTEM_PROMPT,
+                    tools=build_llama_tools("local_task_runner"),
                     tool_context=ToolContext(embedding_service=self._get_embeddings()),
+                    on_tool_call=(
+                        lambda name, args, result: self._persist_tool_trace(
+                            conversation_id, name, args, result
+                        )
+                    ),
                 )
                 return "completed", text
             except Exception as e:
@@ -229,16 +264,82 @@ class TaskScheduler:
             "schedule and will run once support lands."
         )
 
+    @staticmethod
+    def _persist_tool_trace(
+        conversation_id: Optional[int],
+        name: str,
+        args: dict,
+        result: dict,
+    ) -> None:
+        if conversation_id is None:
+            return
+        create_message(
+            conversation_id,
+            role=MessageRole.EVENT,
+            content=serialize_tool_trace(name, args, result),
+        )
+
+    def _start_local_task_conversation(self, task: Task) -> Optional[int]:
+        """Create the normal Local Chat conversation that will hold this run."""
+        try:
+            conversation = create_conversation(
+                session_id=uuid.uuid4().hex,
+                title=task.title,
+                metadata={
+                    "type": "local_llm",
+                    "model": config.local_model_filename,
+                    "pipeline": "task_runner",
+                    "task_id": task.id,
+                },
+                source=ConversationSource.LOCAL,
+            )
+            create_message(
+                conversation.id,
+                role=MessageRole.USER,
+                content=task.prompt,
+            )
+            return conversation.id
+        except Exception as e:
+            logger.warning("Failed to create Local Chat for task #%s: %s", task.id, e)
+            return None
+
+    @staticmethod
+    def _finish_local_task_conversation(
+        conversation_id: int,
+        status: str,
+        result_text: str,
+    ) -> None:
+        """Persist the task response and close its Local Chat conversation."""
+        try:
+            content = result_text if status == "completed" else f"Task failed: {result_text}"
+            create_message(
+                conversation_id,
+                role=MessageRole.MODEL,
+                content=content,
+            )
+            end_conversation(conversation_id)
+        except Exception as e:
+            logger.warning(
+                "Failed to finish Local Chat conversation #%s: %s",
+                conversation_id,
+                e,
+            )
+
     # ------------------------------------------------------------------
     # lazy services
     # ------------------------------------------------------------------
 
     def _get_llm(self) -> LocalLLMService:
         if self._llm is None:
-            self._llm = LocalLLMService()
+            self._llm = LocalLLMService(
+                repo_id=config.local_model_repo_id,
+                filename=config.local_model_filename,
+                n_ctx=config.local_model_n_ctx,
+                default_system_prompt=config.local_model_system_prompt,
+            )
         return self._llm
 
     def _get_embeddings(self) -> EmbeddingService:
         if self._embeddings is None:
-            self._embeddings = EmbeddingService()
+            self._embeddings = EmbeddingService(model_name=config.embedding_model)
         return self._embeddings

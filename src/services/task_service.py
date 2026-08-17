@@ -6,7 +6,7 @@ next run from its schedule. Returns plain dicts suitable for tool responses.
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from src.db import (
@@ -27,17 +27,39 @@ logger = logging.getLogger(__name__)
 
 def _parse_run_at(value) -> Optional[datetime]:
     """Accept a datetime or an ISO-8601 string (naive -> machine-local)."""
-    if value is None or isinstance(value, datetime):
-        return value
-    if isinstance(value, str):
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
         text = value.strip()
         if not text:
             return None
         parsed = datetime.fromisoformat(text)
-        if parsed.tzinfo is None:
-            parsed = parsed.astimezone()  # naive -> local tz
-        return parsed
-    raise ValueError(f"run_at must be an ISO-8601 string or datetime, got {type(value).__name__}")
+    else:
+        raise ValueError(
+            f"run_at must be an ISO-8601 string or datetime, got {type(value).__name__}"
+        )
+    if parsed.tzinfo is None:
+        return parsed.astimezone()  # naive -> local tz
+    return parsed.astimezone()  # explicit offset -> machine-local time
+
+
+def _local_iso(value: Optional[datetime], *, stored_as_utc: bool) -> Optional[str]:
+    """Serialize a SQLite datetime with an explicit machine-local UTC offset.
+
+    SQLite drops timezone objects. `next_run_at` is stored as a naive UTC clock
+    value, while `run_at` is stored as a naive machine-local clock value.
+    """
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = (
+            value.replace(tzinfo=timezone.utc)
+            if stored_as_utc
+            else value.astimezone()
+        )
+    return value.astimezone().isoformat(timespec="seconds")
 
 
 def _coerce_model(model) -> TaskModel:
@@ -76,10 +98,10 @@ def _task_dict(task) -> dict:
         "prompt": task.prompt,
         "model": task.model.value,
         "schedule_type": task.schedule_type.value,
-        "run_at": task.run_at.isoformat(timespec="seconds") if task.run_at else None,
+        "run_at": _local_iso(task.run_at, stored_as_utc=False),
         "interval_seconds": task.interval_seconds,
         "cron_expr": task.cron_expr,
-        "next_run_at": task.next_run_at.isoformat(timespec="seconds") if task.next_run_at else None,
+        "next_run_at": _local_iso(task.next_run_at, stored_as_utc=True),
         "status": task.status.value,
         "last_status": task.last_status,
         "last_result": task.last_result,
@@ -138,7 +160,7 @@ def create_task(
     return {
         "status": "created",
         "task_id": task.id,
-        "next_run_at": next_run.isoformat(timespec="seconds") if next_run else None,
+        "next_run_at": _local_iso(next_run, stored_as_utc=True),
         "message": "Task scheduled.",
     }
 
@@ -237,7 +259,7 @@ def update_task(
         "status": "updated",
         "task_id": task_id,
         "next_run_at": (
-            refreshed.next_run_at.isoformat(timespec="seconds")
+            _local_iso(refreshed.next_run_at, stored_as_utc=True)
             if refreshed and refreshed.next_run_at
             else None
         ),
