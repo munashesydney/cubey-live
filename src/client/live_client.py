@@ -1,14 +1,12 @@
 """
 Gemini Multimodal Live API Client using google-genai SDK.
 Handles real-time audio streaming, AI tool calls (react tool), response handling,
-text interruptions, and Volume-Thresholded Acoustic Echo Gating for barge-in.
+text interruptions, and native server-side voice barge-in.
 """
 
 import asyncio
-from collections import deque
 import logging
 import time
-import numpy as np
 from typing import Callable, Optional
 from google import genai
 from google.genai import types
@@ -22,16 +20,6 @@ from src.services.embeddings import EmbeddingService
 from src.services.stt import LocalTranscriptService
 
 logger = logging.getLogger(__name__)
-
-def compute_pcm_rms(audio_data: bytes) -> float:
-    """Calculate RMS volume level of 16-bit PCM mono audio chunk (0.0 to 1.0)."""
-    if not audio_data:
-        return 0.0
-    arr = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32)
-    if len(arr) == 0:
-        return 0.0
-    rms = np.sqrt(np.mean(arr ** 2)) / 32768.0
-    return float(rms)
 
 class GeminiLiveClient:
     """Manages WebSocket connection to Gemini Multimodal Live API with Tool Calling."""
@@ -69,19 +57,6 @@ class GeminiLiveClient:
         self._model_turn_active = False
 
         self._pause_mic_until: float = 0.0
-
-        # Keep a short mic pre-roll while speaker output is active. When real
-        # speech opens the echo gate this preserves the first phoneme.
-        chunk_ms = max(1.0, recorder.chunk_size / recorder.sample_rate * 1000.0)
-        preroll_chunks = max(
-            1, int(round(self.config.interruption_preroll_ms / chunk_ms))
-        )
-        self._barge_in_preroll: deque[bytes] = deque(maxlen=preroll_chunks)
-        self._speech_preroll: deque[bytes] = deque(maxlen=preroll_chunks)
-        self.voice_interruption_threshold = self.config.interruption_rms_threshold
-        self._user_activity_active = False
-        self._speech_chunks = 0
-        self._silence_chunks = 0
         self._session_resumption_handle: Optional[str] = None
         self._connection_started_at = 0.0
         self._has_connected_once = False
@@ -116,8 +91,6 @@ class GeminiLiveClient:
         self._stop_event.clear()
         self._model_turn_active = False
         self._model_text_buffer.clear()
-        self._barge_in_preroll.clear()
-        self._reset_client_vad()
         self._session_resumption_handle = None
         self._has_connected_once = False
         self.set_status("Connecting to Gemini Live API...")
@@ -160,8 +133,6 @@ class GeminiLiveClient:
                     self._session = None
                     self.player.clear()
                     self.recorder.clear_queue()
-                    self._reset_client_vad()
-                    self._barge_in_preroll.clear()
                     self.set_status(
                         f"Reconnecting to Gemini ({retry_count}/{self.config.live_reconnect_attempts})…"
                     )
@@ -201,7 +172,7 @@ class GeminiLiveClient:
                     logger.exception("on_session_ended callback failed: %s", e)
 
     def _build_live_config(self) -> types.LiveConnectConfig:
-        """Create connection config with the latest resumable session handle."""
+        """Create connection config with native server VAD and session resumption handle."""
         return types.LiveConnectConfig(
             response_modalities=[types.Modality.AUDIO],
             tools=build_gemini_tools("live_model"),
@@ -213,20 +184,16 @@ class GeminiLiveClient:
                 )
             ),
             realtime_input_config=types.RealtimeInputConfig(
-                automatic_activity_detection=(
-                    types.AutomaticActivityDetection(disabled=True)
-                    if self.config.client_vad_enabled
-                    else types.AutomaticActivityDetection(
-                        disabled=False,
-                        start_of_speech_sensitivity=(
-                            types.StartSensitivity.START_SENSITIVITY_HIGH
-                        ),
-                        end_of_speech_sensitivity=(
-                            types.EndSensitivity.END_SENSITIVITY_HIGH
-                        ),
-                        prefix_padding_ms=self.config.vad_prefix_padding_ms,
-                        silence_duration_ms=self.config.vad_silence_duration_ms,
-                    )
+                automatic_activity_detection=types.AutomaticActivityDetection(
+                    disabled=False,
+                    start_of_speech_sensitivity=(
+                        types.StartSensitivity.START_SENSITIVITY_HIGH
+                    ),
+                    end_of_speech_sensitivity=(
+                        types.EndSensitivity.END_SENSITIVITY_HIGH
+                    ),
+                    prefix_padding_ms=self.config.vad_prefix_padding_ms,
+                    silence_duration_ms=self.config.vad_silence_duration_ms,
                 ),
                 activity_handling=types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
                 turn_coverage=types.TurnCoverage.TURN_INCLUDES_ONLY_ACTIVITY,
@@ -354,11 +321,6 @@ class GeminiLiveClient:
             self.on_transcript("User Event", f"⚡ {text_payload}")
 
         try:
-            if self.config.client_vad_enabled and self._user_activity_active:
-                await self._session.send_realtime_input(
-                    activity_end=types.ActivityEnd()
-                )
-                self._reset_client_vad()
             await self._session.send_client_content(
                 turns=types.Content(
                     role="user",
@@ -371,43 +333,16 @@ class GeminiLiveClient:
             self.log(f"❌ Failed to send text payload: {e}")
 
     async def _send_audio_loop(self) -> None:
-        """
-        Task continuously reading mic PCM chunks and streaming to WebSocket.
-        Applies Volume-Thresholded Mic Gating while AI speaker is actively playing.
-        """
+        """Task continuously reading mic PCM chunks and streaming directly to WebSocket."""
         try:
             while self.is_connected and self._session is not None:
                 audio_data = await self.recorder.audio_queue.get()
                 try:
                     # Check mic pause window (after text interruption dispatch).
                     if time.monotonic() < self._pause_mic_until:
-                        self._barge_in_preroll.clear()
                         continue
 
-                    chunks_to_send = [audio_data]
-                    if self.player.is_speaking:
-                        self._barge_in_preroll.append(audio_data)
-                        rms = compute_pcm_rms(audio_data)
-                        if rms < self.voice_interruption_threshold:
-                            continue
-
-                        # Cut local playback now. Waiting for Gemini's
-                        # interruption frame makes barge-in feel delayed.
-                        chunks_to_send = list(self._barge_in_preroll)
-                        self._barge_in_preroll.clear()
-                        self.player.clear()
-                        self.log(
-                            "Human voice interruption detected "
-                            f"(RMS {rms:.3f}); stopped local playback"
-                        )
-                    else:
-                        self._barge_in_preroll.clear()
-
-                    for chunk in chunks_to_send:
-                        if self.config.client_vad_enabled:
-                            await self._process_client_vad_chunk(chunk)
-                        else:
-                            await self._send_audio_chunk(chunk)
+                    await self._send_audio_chunk(audio_data)
                 finally:
                     self.recorder.audio_queue.task_done()
         except asyncio.CancelledError:
@@ -415,49 +350,6 @@ class GeminiLiveClient:
         except Exception as e:
             self.log(f"Error in send audio loop: {e}")
             raise
-
-    async def _process_client_vad_chunk(self, audio_data: bytes) -> None:
-        """Send explicit activity boundaries around microphone speech."""
-        if not audio_data or self._session is None:
-            return
-
-        chunk_ms = self.recorder.chunk_size / self.recorder.sample_rate * 1000
-        start_chunks = max(
-            1, int(round(self.config.client_vad_min_speech_ms / chunk_ms))
-        )
-        end_chunks = max(
-            1, int(round(self.config.client_vad_silence_ms / chunk_ms))
-        )
-        rms = compute_pcm_rms(audio_data)
-        is_speech = rms >= self.config.client_vad_rms_threshold
-
-        if not self._user_activity_active:
-            self._speech_preroll.append(audio_data)
-            self._speech_chunks = self._speech_chunks + 1 if is_speech else 0
-            if self._speech_chunks < start_chunks:
-                return
-
-            await self._session.send_realtime_input(
-                activity_start=types.ActivityStart()
-            )
-            self._user_activity_active = True
-            self._silence_chunks = 0
-            logger.info("Client VAD: speech started (RMS %.3f)", rms)
-            for chunk in self._speech_preroll:
-                await self._send_audio_chunk(chunk)
-            self._speech_preroll.clear()
-            return
-
-        await self._send_audio_chunk(audio_data)
-        if is_speech:
-            self._silence_chunks = 0
-            return
-
-        self._silence_chunks += 1
-        if self._silence_chunks >= end_chunks:
-            await self._session.send_realtime_input(activity_end=types.ActivityEnd())
-            logger.info("Client VAD: speech ended after %d ms silence", int(self.config.client_vad_silence_ms))
-            self._reset_client_vad()
 
     async def _send_audio_chunk(self, audio_data: bytes) -> None:
         if audio_data and self._session:
@@ -467,12 +359,6 @@ class GeminiLiveClient:
                     mime_type=f"audio/pcm;rate={self.config.input_sample_rate}",
                 )
             )
-
-    def _reset_client_vad(self) -> None:
-        self._user_activity_active = False
-        self._speech_chunks = 0
-        self._silence_chunks = 0
-        self._speech_preroll.clear()
 
     async def _receive_responses_loop(self) -> None:
         """Task receiving real-time audio responses and processing incoming AI tool calls."""

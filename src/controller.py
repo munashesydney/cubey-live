@@ -94,6 +94,13 @@ class ApplicationController:
         )
         self.loop_thread.start()
 
+        # Start background prewarm of embedding model
+        threading.Thread(
+            target=self.embedding_service.prewarm,
+            name="embedding_prewarm",
+            daemon=True,
+        ).start()
+
         # 2. Create audio pipeline components
         input_device = select_audio_device(
             "input",

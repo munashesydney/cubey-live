@@ -135,83 +135,67 @@ class _FakeSession:
 
 
 class LiveSendTests(unittest.IsolatedAsyncioTestCase):
-    async def test_barge_in_sends_preroll_with_explicit_sample_rate(self) -> None:
+    async def test_audio_loop_streams_chunks_directly_with_sample_rate(self) -> None:
         recorder = AudioRecorder(chunk_size=320, max_queue_ms=240)
         player = _FakePlayer()
-        config = AppConfig(
-            api_key="test",
-            client_vad_enabled=False,
-            interruption_rms_threshold=0.04,
-            interruption_preroll_ms=120,
-        )
+        config = AppConfig(api_key="test")
         with patch("src.client.live_client.genai.Client"):
             client = GeminiLiveClient(config, recorder, player)
 
-        quiet = np.full(320, 200, dtype=np.int16).tobytes()
-        loud = np.full(320, 5000, dtype=np.int16).tobytes()
-        for chunk in (quiet, quiet, loud):
+        chunk1 = np.full(320, 200, dtype=np.int16).tobytes()
+        chunk2 = np.full(320, 5000, dtype=np.int16).tobytes()
+        for chunk in (chunk1, chunk2):
             recorder.audio_queue.put_nowait(chunk)
 
-        session = _FakeSession(client, expected=3)
+        session = _FakeSession(client, expected=2)
         client._session = session
         client.is_connected = True
         await asyncio.wait_for(client._send_audio_loop(), timeout=1)
 
-        self.assertEqual([blob.data for blob in session.audio], [quiet, quiet, loud])
+        self.assertEqual([blob.data for blob in session.audio], [chunk1, chunk2])
         self.assertTrue(
             all(blob.mime_type == "audio/pcm;rate=16000" for blob in session.audio)
         )
-        self.assertEqual(player.clear_count, 1)
         self.assertEqual(recorder.audio_queue._unfinished_tasks, 0)
 
-    async def test_client_vad_closes_short_utterance_after_silence(self) -> None:
-        class VadSession:
-            def __init__(self, client):
-                self.client = client
-                self.events = []
-
-            async def send_realtime_input(
-                self, *, audio=None, activity_start=None, activity_end=None
-            ) -> None:
-                if activity_start is not None:
-                    self.events.append(("start", None))
-                elif activity_end is not None:
-                    self.events.append(("end", None))
-                    self.client.is_connected = False
-                elif audio is not None:
-                    self.events.append(("audio", audio))
-
-        recorder = AudioRecorder(chunk_size=320, max_queue_ms=240)
-        player = _FakePlayer()
-        player.speaking = False
+    def test_live_config_enables_server_vad(self) -> None:
+        recorder = AudioRecorder()
+        player = AudioPlayer()
         config = AppConfig(
             api_key="test",
-            client_vad_enabled=True,
-            client_vad_rms_threshold=0.025,
-            client_vad_min_speech_ms=40,
-            client_vad_silence_ms=60,
-            interruption_preroll_ms=40,
+            vad_prefix_padding_ms=25,
+            vad_silence_duration_ms=180,
         )
         with patch("src.client.live_client.genai.Client"):
             client = GeminiLiveClient(config, recorder, player)
 
-        quiet = np.full(320, 100, dtype=np.int16).tobytes()
-        speech = np.full(320, 5000, dtype=np.int16).tobytes()
-        for chunk in (quiet, speech, speech, quiet, quiet, quiet):
-            recorder.audio_queue.put_nowait(chunk)
+        live_config = client._build_live_config()
+        vad_config = live_config.realtime_input_config.automatic_activity_detection
+        self.assertFalse(vad_config.disabled)
+        self.assertEqual(vad_config.prefix_padding_ms, 25)
+        self.assertEqual(vad_config.silence_duration_ms, 180)
 
-        session = VadSession(client)
-        client._session = session
+    async def test_server_interruption_clears_player(self) -> None:
+        recorder = AudioRecorder()
+        player = _FakePlayer()
+        config = AppConfig(api_key="test")
+        with patch("src.client.live_client.genai.Client"):
+            client = GeminiLiveClient(config, recorder, player)
+
+        class InterruptedSession:
+            async def receive(self):
+                yield genai_types.LiveServerMessage(
+                    server_content=genai_types.LiveServerContent(
+                        interrupted=True
+                    )
+                )
+                client.is_connected = False
+
+        client._session = InterruptedSession()
         client.is_connected = True
-        await asyncio.wait_for(client._send_audio_loop(), timeout=1)
+        await client._receive_responses_loop()
 
-        self.assertEqual(
-            [kind for kind, _ in session.events],
-            ["start", "audio", "audio", "audio", "audio", "audio", "end"],
-        )
-        sent_audio = [blob.data for kind, blob in session.events if kind == "audio"]
-        self.assertEqual(sent_audio, [speech, speech, quiet, quiet, quiet])
-        self.assertEqual(recorder.audio_queue._unfinished_tasks, 0)
+        self.assertEqual(player.clear_count, 1)
 
 
 class LiveReconnectTests(unittest.IsolatedAsyncioTestCase):

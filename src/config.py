@@ -50,22 +50,6 @@ class AppConfig:
     vad_prefix_padding_ms: int = int(os.getenv("GEMINI_VAD_PREFIX_MS", "20"))
     vad_silence_duration_ms: int = int(os.getenv("GEMINI_VAD_SILENCE_MS", "150"))
 
-    # Deterministic client-side voice activity signaling. Short utterances such
-    # as "hi" are explicitly closed instead of relying on an opaque server VAD
-    # state that can occasionally merge several greetings into one long turn.
-    client_vad_enabled: bool = os.getenv(
-        "AUDIO_CLIENT_VAD", "true"
-    ).strip().lower() not in {"0", "false", "no", "off"}
-    client_vad_rms_threshold: float = float(
-        os.getenv("AUDIO_CLIENT_VAD_RMS", "0.025")
-    )
-    client_vad_min_speech_ms: int = int(
-        os.getenv("AUDIO_CLIENT_VAD_MIN_SPEECH_MS", "40")
-    )
-    client_vad_silence_ms: int = int(
-        os.getenv("AUDIO_CLIENT_VAD_SILENCE_MS", "300")
-    )
-
     # Retry transient Live WebSocket failures inside the same app conversation.
     live_reconnect_attempts: int = int(os.getenv("GEMINI_RECONNECT_ATTEMPTS", "5"))
     live_reconnect_base_delay: float = float(
@@ -73,16 +57,6 @@ class AppConfig:
     )
     live_reconnect_max_delay: float = float(
         os.getenv("GEMINI_RECONNECT_MAX_DELAY", "5.0")
-    )
-
-    # Local acoustic echo gate used only while Cubey is speaking. The lower
-    # threshold makes normal-volume barge-in practical; a short pre-roll keeps
-    # the beginning of the user's word intact when the gate opens.
-    interruption_rms_threshold: float = float(
-        os.getenv("AUDIO_INTERRUPTION_RMS", "0.045")
-    )
-    interruption_preroll_ms: int = int(
-        os.getenv("AUDIO_INTERRUPTION_PREROLL_MS", "120")
     )
 
     # Database Parameters
