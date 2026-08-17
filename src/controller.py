@@ -58,13 +58,8 @@ class ApplicationController:
         self.client: Optional[GeminiLiveClient] = None
         self.gui: Optional[GeminiLiveApp] = None
 
-        # On-device STT that transcribes both sides of the conversation into
-        # the transcript/history without touching the live audio path.
-        self.transcript_service = LocalTranscriptService(
-            model_size=config.stt_model_size,
-            language=config.stt_language,
-            on_result=self._on_transcript_received,
-        )
+        # Local transcript service is bypassed in favor of native Gemini Live cloud transcripts.
+        self.transcript_service: Optional[LocalTranscriptService] = None
 
         # On-device embeddings (fastembed) for semantic memory over messages.
         self.embedding_service = EmbeddingService(model_name=config.embedding_model)
@@ -131,7 +126,6 @@ class ApplicationController:
             device=input_device.device,
             device_sample_rate=input_device.sample_rate,
             on_level_change=self._on_mic_level_changed,
-            on_audio_chunk=self.transcript_service.feed_user_audio
         )
 
         # 3. Create Gemini Live Client with Tool Reaction Callback
@@ -144,7 +138,6 @@ class ApplicationController:
             on_log=self._on_log_received,
             on_tool_reaction=self._on_tool_reaction_triggered,
             on_session_ended=self._on_session_ended,
-            transcript_service=self.transcript_service,
             embedding_service=self.embedding_service
         )
 
@@ -176,7 +169,8 @@ class ApplicationController:
 
         if self.client and self.async_loop and self.async_loop.is_running():
             self._begin_conversation()
-            self.transcript_service.start()
+            if self.transcript_service:
+                self.transcript_service.start()
             logger.info("Scheduling Live session start...")
             self._session_task = asyncio.run_coroutine_threadsafe(
                 self.client.start_session(),
@@ -261,8 +255,8 @@ class ApplicationController:
         """
         conversation_id = self._active_conversation_id
         self._active_conversation_id = None
-        self._conversation_titled = False
-        self.transcript_service.stop()
+        if self.transcript_service:
+            self.transcript_service.stop()
         if conversation_id is None:
             return
         try:

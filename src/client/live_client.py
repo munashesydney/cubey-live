@@ -53,6 +53,7 @@ class GeminiLiveClient:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._tasks: list[asyncio.Task] = []
         self._stop_event = asyncio.Event()
+        self._user_text_buffer: list[str] = []
         self._model_text_buffer: list[str] = []
         self._model_turn_active = False
 
@@ -90,6 +91,7 @@ class GeminiLiveClient:
         self._loop = asyncio.get_running_loop()
         self._stop_event.clear()
         self._model_turn_active = False
+        self._user_text_buffer.clear()
         self._model_text_buffer.clear()
         self._session_resumption_handle = None
         self._has_connected_once = False
@@ -172,7 +174,7 @@ class GeminiLiveClient:
                     logger.exception("on_session_ended callback failed: %s", e)
 
     def _build_live_config(self) -> types.LiveConnectConfig:
-        """Create connection config with native server VAD and session resumption handle."""
+        """Create connection config with native server VAD, cloud transcription, and session resumption handle."""
         return types.LiveConnectConfig(
             response_modalities=[types.Modality.AUDIO],
             tools=build_gemini_tools("live_model"),
@@ -183,6 +185,8 @@ class GeminiLiveClient:
                     )
                 )
             ),
+            input_audio_transcription=types.AudioTranscriptionConfig(),
+            output_audio_transcription=types.AudioTranscriptionConfig(),
             realtime_input_config=types.RealtimeInputConfig(
                 automatic_activity_detection=types.AutomaticActivityDetection(
                     disabled=False,
@@ -416,38 +420,53 @@ class GeminiLiveClient:
                     if server_content is None:
                         continue
 
-                    # Handle model speech turn
+                    # 1. Handle native user speech transcription from Gemini Live
+                    input_transcription = server_content.input_transcription
+                    if input_transcription is not None:
+                        if input_transcription.text:
+                            self._user_text_buffer.append(input_transcription.text)
+                            self.log(
+                                f"🎤 [Gemini Live User STT Chunk]: '{input_transcription.text}' "
+                                f"(finished={input_transcription.finished})"
+                            )
+                        if input_transcription.finished:
+                            self._flush_user_text()
+
+                    # 2. Handle native model output speech transcription from Gemini Live
+                    output_transcription = server_content.output_transcription
+                    if output_transcription is not None:
+                        if output_transcription.text:
+                            self._model_text_buffer.append(output_transcription.text)
+                            self.log(
+                                f"🤖 [Gemini Live Model STT Chunk]: '{output_transcription.text}' "
+                                f"(finished={output_transcription.finished})"
+                            )
+                        if output_transcription.finished:
+                            self._flush_model_text()
+
+                    # 3. Handle model speech turn audio and text
                     model_turn = server_content.model_turn
                     if model_turn is not None:
+                        # Flush any pending user text when model begins response
+                        self._flush_user_text()
                         for part in model_turn.parts:
                             if part.inline_data and part.inline_data.data:
                                 self.player.play_chunk(part.inline_data.data)
-                                if self.transcript_service:
-                                    # Flush once at turn start. Repeating this
-                                    # for every audio chunk churns worker events
-                                    # and can steal CPU from playback.
-                                    if not self._model_turn_active:
-                                        self.transcript_service.flush_user_turn()
-                                    self.transcript_service.feed_model_audio(
-                                        part.inline_data.data
-                                    )
                                 self._model_turn_active = True
-                            if part.text:
+                            if part.text and part.text not in "".join(self._model_text_buffer):
                                 self._model_text_buffer.append(part.text)
 
-                    # Flush accumulated model text at the end of its turn
+                    # Flush accumulated text at the end of turn
                     if server_content.turn_complete:
+                        self._flush_user_text()
                         self._flush_model_text()
                         self._model_turn_active = False
-                        if self.transcript_service:
-                            self.transcript_service.flush_model_turn()
 
                     # Handle server-side barge-in / interruption signal
                     if server_content.interrupted:
+                        self._flush_user_text()
                         self._flush_model_text()
                         self._model_turn_active = False
-                        if self.transcript_service:
-                            self.transcript_service.flush_model_turn()
                         self.player.clear()
                         self.log("⚡ [Server Barge-in Detected] Gemini cut off generation.")
 
@@ -457,14 +476,26 @@ class GeminiLiveClient:
             self.log(f"Error in receive responses loop: {e}")
             raise
 
+    def _flush_user_text(self) -> None:
+        """Emit accumulated user speech transcript line and reset the buffer."""
+        text = "".join(self._user_text_buffer).strip()
+        self._user_text_buffer.clear()
+        if text:
+            self.log(f"🎤 [Gemini Live User STT]: '{text}'")
+            if self.on_transcript:
+                self.on_transcript("User", text)
+
     def _flush_model_text(self) -> None:
         """Emit accumulated model text as one transcript line and reset the buffer."""
-        text = " ".join(part.strip() for part in self._model_text_buffer if part.strip())
-        self._model_text_buffer = []
-        if text and self.on_transcript:
-            self.on_transcript("Model", text)
+        text = "".join(self._model_text_buffer).strip()
+        self._model_text_buffer.clear()
+        if text:
+            self.log(f"🤖 [Gemini Live Model STT]: '{text}'")
+            if self.on_transcript:
+                self.on_transcript("Model", text)
 
     def _dispatch_tool_reaction(self, reaction_type: str) -> None:
         """Thread-safely dispatch tool reaction to GUI on main thread."""
         if self.on_tool_reaction and self._loop:
             self._loop.call_soon_threadsafe(self.on_tool_reaction, reaction_type)
+

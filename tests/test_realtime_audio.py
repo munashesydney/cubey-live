@@ -158,7 +158,7 @@ class LiveSendTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(recorder.audio_queue._unfinished_tasks, 0)
 
-    def test_live_config_enables_server_vad(self) -> None:
+    def test_live_config_enables_server_vad_and_transcription(self) -> None:
         recorder = AudioRecorder()
         player = AudioPlayer()
         config = AppConfig(
@@ -174,6 +174,45 @@ class LiveSendTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(vad_config.disabled)
         self.assertEqual(vad_config.prefix_padding_ms, 25)
         self.assertEqual(vad_config.silence_duration_ms, 180)
+        self.assertIsNotNone(live_config.input_audio_transcription)
+        self.assertIsNotNone(live_config.output_audio_transcription)
+
+    async def test_server_input_and_output_transcription_emitted(self) -> None:
+        recorder = AudioRecorder()
+        player = _FakePlayer()
+        config = AppConfig(api_key="test")
+        transcripts: list[tuple[str, str]] = []
+        with patch("src.client.live_client.genai.Client"):
+            client = GeminiLiveClient(
+                config, recorder, player, on_transcript=lambda role, text: transcripts.append((role, text))
+            )
+
+        class TranscriptionSession:
+            async def receive(self):
+                # User speech chunk (finished=True)
+                yield genai_types.LiveServerMessage(
+                    server_content=genai_types.LiveServerContent(
+                        input_transcription=genai_types.Transcription(
+                            text="Hello Gemini", finished=True
+                        )
+                    )
+                )
+                # Model speech chunk (turn_complete=True)
+                yield genai_types.LiveServerMessage(
+                    server_content=genai_types.LiveServerContent(
+                        output_transcription=genai_types.Transcription(
+                            text="Hello User", finished=True
+                        ),
+                        turn_complete=True,
+                    )
+                )
+                client.is_connected = False
+
+        client._session = TranscriptionSession()
+        client.is_connected = True
+        await client._receive_responses_loop()
+
+        self.assertEqual(transcripts, [("User", "Hello Gemini"), ("Model", "Hello User")])
 
     async def test_server_interruption_clears_player(self) -> None:
         recorder = AudioRecorder()
