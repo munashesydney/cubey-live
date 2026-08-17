@@ -14,6 +14,7 @@ from src.audio.player import AudioPlayer
 from src.audio.devices import select_audio_device
 from src.client.live_client import GeminiLiveClient
 from src.db import (
+    ConversationSource,
     MessageRole,
     create_conversation,
     create_message,
@@ -230,6 +231,7 @@ class ApplicationController:
             conversation = create_conversation(
                 session_id=uuid.uuid4().hex,
                 metadata={"type": "live", "model": self.config.model},
+                source=ConversationSource.GEMINI,
             )
             self._active_conversation_id = conversation.id
             self._conversation_titled = False

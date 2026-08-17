@@ -13,6 +13,7 @@ explicit session is passed in, so they are safe to call from any thread.
 from src.db.base import Base, SessionLocal, engine
 from src.db.models import (
     Conversation,
+    ConversationSource,
     ConversationStatus,
     Memory,
     MemoryEmbedding,
@@ -68,6 +69,7 @@ from src.db.session import get_session
 __all__ = [
     "Base",
     "Conversation",
+    "ConversationSource",
     "ConversationStatus",
     "Memory",
     "MemoryEmbedding",

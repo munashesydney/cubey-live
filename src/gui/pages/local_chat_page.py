@@ -14,6 +14,7 @@ from typing import Dict, List, Optional
 
 from src.config import AppConfig, config
 from src.db import (
+    ConversationSource,
     MessageRole,
     create_conversation,
     create_message,
@@ -224,7 +225,7 @@ class LocalChatPage(ctk.CTkFrame):
     def refresh_conversations_list(self) -> None:
         """Fetch saved conversations from DB and populate dropdown selector."""
         try:
-            convos = list_conversations(limit=50)
+            convos = list_conversations(source=ConversationSource.LOCAL, limit=50)
         except Exception as e:
             logger.warning("Failed to load conversations: %s", e)
             return
@@ -233,11 +234,9 @@ class LocalChatPage(ctk.CTkFrame):
         options: List[str] = []
 
         for conv in convos:
-            meta = conv.metadata_json or {}
-            label_prefix = "🦙 " if meta.get("type") == "local_llm" else "💬 "
             title = conv.title or f"Conversation #{conv.id}"
             time_str = conv.started_at.strftime("%b %d %H:%M") if conv.started_at else ""
-            label = f"{label_prefix}{title[:30]} ({time_str})"
+            label = f"🦙 {title[:30]} ({time_str})"
 
             self.conversations_map[label] = conv.id
             options.append(label)
@@ -300,7 +299,8 @@ class LocalChatPage(ctk.CTkFrame):
                 conv = create_conversation(
                     session_id=uuid.uuid4().hex,
                     title=text[:50],
-                    metadata={"type": "local_llm", "model": self.app_config.local_model_filename}
+                    metadata={"type": "local_llm", "model": self.app_config.local_model_filename},
+                    source=ConversationSource.LOCAL,
                 )
                 self.active_conversation_id = conv.id
             except Exception as e:

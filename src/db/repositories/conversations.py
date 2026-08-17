@@ -14,7 +14,7 @@ from typing import Any, Optional
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from src.db.models import Conversation, ConversationStatus
+from src.db.models import Conversation, ConversationSource, ConversationStatus
 from src.db.session import get_session
 
 logger = logging.getLogger(__name__)
@@ -28,6 +28,7 @@ def create_conversation(
     session_id: str,
     title: Optional[str] = None,
     metadata: Optional[dict[str, Any]] = None,
+    source: ConversationSource = ConversationSource.GEMINI,
     session: Optional[Session] = None,
 ) -> Conversation:
     """Create a new conversation in ACTIVE status.
@@ -38,7 +39,10 @@ def create_conversation(
 
     def _create(s: Session) -> Conversation:
         conversation = Conversation(
-            session_id=session_id, title=title, metadata_json=metadata
+            session_id=session_id,
+            title=title,
+            metadata_json=metadata,
+            source=source,
         )
         s.add(conversation)
         s.flush()
@@ -73,11 +77,12 @@ def get_conversation(
 
 def list_conversations(
     status: Optional[ConversationStatus] = None,
+    source: Optional[ConversationSource] = None,
     limit: int = 50,
     offset: int = 0,
     session: Optional[Session] = None,
 ) -> list[Conversation]:
-    """List conversations, newest first, optionally filtered by status."""
+    """List conversations, newest first, optionally filtered by status and source."""
     if limit < 1 or offset < 0:
         raise ValueError("limit must be >= 1 and offset >= 0")
 
@@ -90,6 +95,8 @@ def list_conversations(
         )
         if status is not None:
             stmt = stmt.where(Conversation.status == status)
+        if source is not None:
+            stmt = stmt.where(Conversation.source == source)
         return list(s.scalars(stmt).all())
 
     if session is not None:

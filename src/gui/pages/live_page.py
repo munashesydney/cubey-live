@@ -12,6 +12,7 @@ from typing import Callable
 
 from src.config import AppConfig
 from src.db import (
+    ConversationSource,
     ConversationStatus,
     get_conversation,
     list_conversations,
@@ -345,13 +346,10 @@ class LivePage(ctk.CTkFrame):
     def refresh_conversations(self) -> None:
         """Reload the conversation list from the database."""
         try:
-            # Gemini Live conversations only — local LLM chats have
-            # metadata_json.type == 'local_llm' and live elsewhere.
-            conversations = [
-                conv
-                for conv in list_conversations(limit=100)
-                if (conv.metadata_json or {}).get("type") != "local_llm"
-            ]
+            conversations = list_conversations(
+                source=ConversationSource.GEMINI,
+                limit=100,
+            )
         except Exception as e:
             logger.warning("Failed to load conversations: %s", e)
             return
