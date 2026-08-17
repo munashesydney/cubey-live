@@ -21,6 +21,8 @@ from src.db import (
     list_conversations,
     list_messages,
 )
+from src.client.tools import ToolContext, build_llama_tools
+from src.services.embeddings import EmbeddingService
 from src.services.local_llm import LocalLLMService
 
 logger = logging.getLogger(__name__)
@@ -29,9 +31,19 @@ logger = logging.getLogger(__name__)
 class LocalChatPage(ctk.CTkFrame):
     """Dedicated Local Qwen3.5 2B Chat Page."""
 
-    def __init__(self, master, app_config: AppConfig = config, **kwargs):
+    def __init__(
+        self,
+        master,
+        app_config: AppConfig = config,
+        embedding_service: Optional[EmbeddingService] = None,
+        **kwargs,
+    ):
         super().__init__(master, fg_color="transparent", **kwargs)
         self.app_config = app_config
+        self.tool_context = ToolContext(
+            embedding_service=embedding_service
+            or EmbeddingService(model_name=app_config.embedding_model)
+        )
 
         # Instantiate local LLM service
         self.llm_service = LocalLLMService(
@@ -349,6 +361,8 @@ class LocalChatPage(ctk.CTkFrame):
             on_token=self._on_token_received_threadsafe,
             on_complete=self._on_complete_threadsafe,
             on_error=self._on_error_threadsafe,
+            tools=build_llama_tools("local_model"),
+            tool_context=self.tool_context,
         )
 
     def stop_generation(self) -> None:

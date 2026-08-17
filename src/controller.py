@@ -142,7 +142,8 @@ class ApplicationController:
             async_loop=self.async_loop,
             on_start_session=self.start_live_session,
             on_stop_session=self.stop_live_session,
-            on_send_interruption=self.send_interruption
+            on_send_interruption=self.send_interruption,
+            embedding_service=self.embedding_service,
         )
         self.gui.client = self.client
 

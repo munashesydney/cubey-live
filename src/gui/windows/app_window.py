@@ -12,6 +12,7 @@ from typing import Callable, Optional
 from src.config import AppConfig
 from src.gui.pages.robot_face_page import RobotFacePage
 from src.gui.windows.developer_window import DeveloperWindow
+from src.services.embeddings import EmbeddingService
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,7 @@ class GeminiLiveApp(ctk.CTk):
         on_start_session: Callable[[], None],
         on_stop_session: Callable[[], None],
         on_send_interruption: Callable[[str], None],
+        embedding_service: EmbeddingService,
     ):
         super().__init__()
         self.config = config
@@ -36,6 +38,7 @@ class GeminiLiveApp(ctk.CTk):
         self.on_start_session = on_start_session
         self.on_stop_session = on_stop_session
         self.on_send_interruption = on_send_interruption
+        self.embedding_service = embedding_service
 
         # Window title & initial resolution (110.4 : 63.1 ratio)
         self.title("🤖 Cubeo Robot Face")
@@ -75,7 +78,8 @@ class GeminiLiveApp(ctk.CTk):
                 on_stop_session=self.on_stop_session,
                 on_send_interruption=self.on_send_interruption,
                 on_toggle_mute=self._toggle_mute,
-                is_session_active=self.is_session_active
+                is_session_active=self.is_session_active,
+                embedding_service=self.embedding_service,
             )
         else:
             self.dev_window.lift()

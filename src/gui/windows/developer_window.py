@@ -19,6 +19,7 @@ from src.gui.pages import (
     MemoryPage,
     TasksPage,
 )
+from src.services.embeddings import EmbeddingService
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,7 @@ class DeveloperWindow(ctk.CTkToplevel):
         on_stop_session: Callable[[], None],
         on_send_interruption: Callable[[str], None],
         on_toggle_mute: Callable[[bool], None],
+        embedding_service: EmbeddingService,
         is_session_active: bool = False,
         **kwargs
     ):
@@ -52,6 +54,7 @@ class DeveloperWindow(ctk.CTkToplevel):
         self.on_stop_session = on_stop_session
         self.on_send_interruption = on_send_interruption
         self.on_toggle_mute = on_toggle_mute
+        self.embedding_service = embedding_service
         self.is_session_active = is_session_active
 
         # Heterogeneous page registry — navigation is duck-typed.
@@ -125,7 +128,11 @@ class DeveloperWindow(ctk.CTkToplevel):
             on_toggle_mute=self.on_toggle_mute,
             is_session_active=self.is_session_active,
         )
-        self._pages["local"] = LocalChatPage(self.page_container, app_config=self.config)
+        self._pages["local"] = LocalChatPage(
+            self.page_container,
+            app_config=self.config,
+            embedding_service=self.embedding_service,
+        )
         self._pages["memories"] = MemoryPage(self.page_container)
         self._pages["tasks"] = TasksPage(self.page_container)
 
