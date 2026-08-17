@@ -23,7 +23,6 @@ from src.db import (
 )
 from src.services.embeddings import EmbeddingService
 from src.gui.windows.app_window import GeminiLiveApp
-from src.services.stt import LocalTranscriptService
 from src.services.task_scheduler import TaskScheduler
 
 logger = logging.getLogger(__name__)
@@ -33,9 +32,7 @@ _TITLE_MAX_CHARS = 60
 
 
 def _map_message_role(role: str) -> MessageRole:
-    """Normalize transcript role names (from the live client or local STT) to a
-    persisted MessageRole. Local STT emits lowercase 'user'/'model'; the live
-    client emits 'User Event'/'Model'."""
+    """Normalize transcript role names to a persisted MessageRole."""
     normalized = role.strip().lower()
     if normalized in ("user",):
         return MessageRole.USER
@@ -57,9 +54,6 @@ class ApplicationController:
         self.player: Optional[AudioPlayer] = None
         self.client: Optional[GeminiLiveClient] = None
         self.gui: Optional[GeminiLiveApp] = None
-
-        # Local transcript service is bypassed in favor of native Gemini Live cloud transcripts.
-        self.transcript_service: Optional[LocalTranscriptService] = None
 
         # On-device embeddings (fastembed) for semantic memory over messages.
         self.embedding_service = EmbeddingService(model_name=config.embedding_model)
@@ -169,8 +163,6 @@ class ApplicationController:
 
         if self.client and self.async_loop and self.async_loop.is_running():
             self._begin_conversation()
-            if self.transcript_service:
-                self.transcript_service.start()
             logger.info("Scheduling Live session start...")
             self._session_task = asyncio.run_coroutine_threadsafe(
                 self.client.start_session(),
@@ -255,8 +247,6 @@ class ApplicationController:
         """
         conversation_id = self._active_conversation_id
         self._active_conversation_id = None
-        if self.transcript_service:
-            self.transcript_service.stop()
         if conversation_id is None:
             return
         try:

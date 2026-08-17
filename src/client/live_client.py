@@ -17,7 +17,6 @@ from src.audio.recorder import AudioRecorder
 from src.audio.player import AudioPlayer
 from src.client.tools import ToolContext, build_gemini_tools, dispatch_tool_call
 from src.services.embeddings import EmbeddingService
-from src.services.stt import LocalTranscriptService
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +33,6 @@ class GeminiLiveClient:
         on_log: Optional[Callable[[str], None]] = None,
         on_tool_reaction: Optional[Callable[[str], None]] = None,
         on_session_ended: Optional[Callable[[], None]] = None,
-        transcript_service: Optional[LocalTranscriptService] = None,
         embedding_service: Optional[EmbeddingService] = None,
     ):
         self.config = config
@@ -45,7 +43,6 @@ class GeminiLiveClient:
         self.on_log = on_log
         self.on_tool_reaction = on_tool_reaction
         self.on_session_ended = on_session_ended
-        self.transcript_service = transcript_service
         self.embedding_service = embedding_service
 
         self.is_connected = False

@@ -63,12 +63,6 @@ class AppConfig:
     database_url: str = os.getenv("DATABASE_URL", f"sqlite:///{DEFAULT_DB_PATH.as_posix()}")
     database_path: Path = field(default_factory=lambda: DEFAULT_DB_PATH)
 
-    # Local speech-to-text (faster-whisper) for conversation history.
-    # Runs on-device, so it is free and works offline; only the transcript
-    # quality/speed trade-off changes with model size.
-    stt_model_size: str = os.getenv("STT_MODEL_SIZE", "small")
-    stt_language: str = os.getenv("STT_LANGUAGE", "en")
-
     # Local embeddings (fastembed) for semantic memory over past messages.
     embedding_model: str = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
 

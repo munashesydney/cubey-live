@@ -178,7 +178,7 @@ class AudioRecorder:
         # happens on the asyncio thread, where asyncio.Queue is safe to mutate.
         self._loop.call_soon_threadsafe(self._enqueue_latest, data)
 
-        # Fan out to secondary consumers (e.g. local STT for conversation history).
+        # Fan out to optional secondary consumers.
         # This runs on the sounddevice audio thread; sinks must be thread-safe.
         if self.on_audio_chunk and not self.is_muted:
             try:

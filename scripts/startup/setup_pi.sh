@@ -8,7 +8,7 @@
 #     bash scripts/startup/setup_pi.sh
 #
 # Installs system packages, Python dependencies, .env, database migrations,
-# pre-downloads the faster-whisper + Silero VAD models, and (by default)
+# pre-downloads the embedding and Local LLM models, and (by default)
 # installs a systemd service so Cubey starts automatically at boot.
 # Pass --no-autostart to skip the systemd service.
 #
@@ -27,7 +27,6 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 # ---------------------------------------------------------------------------
 if [[ "$(uname -m)" != "aarch64" && "$(uname -m)" != "arm64" ]]; then
     echo "ERROR: 64-bit Raspberry Pi OS is required (found: $(uname -m))." >&2
-    echo "faster-whisper needs arm64 wheels; reinstall Raspberry Pi OS 64-bit." >&2
     exit 1
 fi
 
@@ -99,30 +98,6 @@ echo "==> Running database migrations..."
     cd "${PROJECT_ROOT}"
     "${VENV}/bin/python" -m alembic upgrade head
 )
-
-# ---------------------------------------------------------------------------
-# Pre-download STT models (whisper 'small' + Silero VAD)
-# ---------------------------------------------------------------------------
-echo "==> Pre-downloading faster-whisper model and Silero VAD..."
-set -a
-# shellcheck disable=SC1091
-[ -f "${PROJECT_ROOT}/.env" ] && source "${PROJECT_ROOT}/.env"
-set +a
-STT_MODEL_SIZE="${STT_MODEL_SIZE:-small}"
-
-"${VENV}/bin/python" - "${STT_MODEL_SIZE}" <<'PY'
-import sys
-
-import numpy as np
-from faster_whisper import WhisperModel
-
-size = sys.argv[1]
-print(f"Loading faster-whisper '{size}' (downloads on first run)...")
-model = WhisperModel(size, device="cpu", compute_type="int8")
-# A silence transcribe with vad_filter also pulls the Silero VAD model.
-model.transcribe(np.zeros(16000, dtype=np.float32), language="en", vad_filter=True)
-print("STT models ready.")
-PY
 
 # ---------------------------------------------------------------------------
 # Pre-download embedding model (fastembed)
