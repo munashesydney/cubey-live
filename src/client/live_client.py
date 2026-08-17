@@ -191,7 +191,7 @@ class GeminiLiveClient:
                         types.StartSensitivity.START_SENSITIVITY_HIGH
                     ),
                     end_of_speech_sensitivity=(
-                        types.EndSensitivity.END_SENSITIVITY_HIGH
+                        types.EndSensitivity.END_SENSITIVITY_LOW
                     ),
                     prefix_padding_ms=self.config.vad_prefix_padding_ms,
                     silence_duration_ms=self.config.vad_silence_duration_ms,
@@ -441,7 +441,7 @@ class GeminiLiveClient:
                         if output_transcription.finished:
                             self._flush_model_text()
 
-                    # 3. Handle model speech turn audio and text
+                    # 3. Handle model speech turn audio
                     model_turn = server_content.model_turn
                     if model_turn is not None:
                         # Flush any pending user text when model begins response
@@ -450,8 +450,6 @@ class GeminiLiveClient:
                             if part.inline_data and part.inline_data.data:
                                 self.player.play_chunk(part.inline_data.data)
                                 self._model_turn_active = True
-                            if part.text and part.text not in "".join(self._model_text_buffer):
-                                self._model_text_buffer.append(part.text)
 
                     # Flush accumulated text at the end of turn
                     if server_content.turn_complete:
