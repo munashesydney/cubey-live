@@ -1,9 +1,9 @@
-"""Audio device selection that prefers native low-latency Windows endpoints."""
+"""Audio device selection and hardware capability probing (WASAPI, ALSA, I2S)."""
 
 from dataclasses import dataclass
 import logging
 import platform
-from typing import Optional, Union
+from typing import Optional, Tuple, Union
 
 import sounddevice as sd
 
@@ -16,6 +16,8 @@ DeviceId = Optional[Union[int, str]]
 class AudioDeviceSelection:
     device: DeviceId
     sample_rate: int
+    channels: int
+    dtype: str
     name: str
     host_api: str
 
@@ -25,13 +27,15 @@ def select_audio_device(
     desired_sample_rate: int,
     explicit_device: Optional[str] = None,
     prefer_low_latency: bool = True,
+    explicit_sample_rate: int = 0,
+    explicit_channels: int = 0,
+    explicit_dtype: str = "",
 ) -> AudioDeviceSelection:
-    """Resolve an input/output endpoint and a rate it supports natively.
+    """Resolve an input/output endpoint, rate, channel count, and bit depth.
 
-    PortAudio's Windows MME defaults add roughly 90 ms in each direction on
-    common hardware. WASAPI shared endpoints report about 3 ms, but generally
-    require their native mix rate (usually 48 kHz), so the audio classes
-    resample at the application boundary.
+    Supports native low-latency Windows endpoints (WASAPI 48kHz) as well as
+    Raspberry Pi / Linux ALSA I2S hardware (MAX98357A DAC & INMP441 mics
+    requiring 48kHz stereo int32 / S32_LE).
     """
     if kind not in {"input", "output"}:
         raise ValueError("kind must be 'input' or 'output'")
@@ -44,36 +48,79 @@ def select_audio_device(
     ):
         device = _windows_wasapi_default(kind)
 
+    # Defaults if no device info available
+    default_rate = explicit_sample_rate if explicit_sample_rate > 0 else desired_sample_rate
+    default_channels = explicit_channels if explicit_channels > 0 else 1
+    default_dtype = explicit_dtype if explicit_dtype else "int16"
+
     if device is None:
-        return AudioDeviceSelection(None, desired_sample_rate, "system default", "default")
+        return AudioDeviceSelection(
+            device=None,
+            sample_rate=default_rate,
+            channels=default_channels,
+            dtype=default_dtype,
+            name="system default",
+            host_api="default",
+        )
 
     try:
         info = sd.query_devices(device=device, kind=kind)
         host_api = sd.query_hostapis(info["hostapi"])["name"]
-        stream_rate = _supported_rate(device, kind, desired_sample_rate, info)
+        
+        # If user explicitly specified hardware parameters, honor them
+        if explicit_sample_rate > 0 and explicit_channels > 0 and explicit_dtype:
+            return AudioDeviceSelection(
+                device=device,
+                sample_rate=explicit_sample_rate,
+                channels=explicit_channels,
+                dtype=explicit_dtype,
+                name=info.get("name", str(device)),
+                host_api=host_api,
+            )
+
+        stream_rate, stream_channels, stream_dtype = _resolve_device_settings(
+            device=device,
+            kind=kind,
+            desired_rate=desired_sample_rate,
+            info=info,
+            explicit_rate=explicit_sample_rate,
+            explicit_channels=explicit_channels,
+            explicit_dtype=explicit_dtype,
+        )
+
         selection = AudioDeviceSelection(
             device=device,
             sample_rate=stream_rate,
-            name=info["name"],
+            channels=stream_channels,
+            dtype=stream_dtype,
+            name=info.get("name", str(device)),
             host_api=host_api,
         )
         logger.info(
-            "Selected %s device '%s' via %s at %d Hz",
+            "Selected %s device '%s' via %s: %d Hz, %d ch, %s",
             kind,
             selection.name,
             selection.host_api,
             selection.sample_rate,
+            selection.channels,
+            selection.dtype,
         )
         return selection
     except Exception as exc:
         logger.warning(
-            "Could not use requested low-latency %s device %r (%s); "
-            "falling back to the system default",
+            "Could not query requested %s device %r (%s); using configured defaults",
             kind,
             device,
             exc,
         )
-        return AudioDeviceSelection(None, desired_sample_rate, "system default", "default")
+        return AudioDeviceSelection(
+            device=device,
+            sample_rate=default_rate,
+            channels=default_channels,
+            dtype=default_dtype,
+            name=str(device) if device is not None else "system default",
+            host_api="default",
+        )
 
 
 def _parse_device(value: Optional[str]) -> DeviceId:
@@ -95,17 +142,49 @@ def _windows_wasapi_default(kind: str) -> Optional[int]:
     return None
 
 
-def _supported_rate(device: DeviceId, kind: str, desired: int, info) -> int:
+def _resolve_device_settings(
+    device: DeviceId,
+    kind: str,
+    desired_rate: int,
+    info: dict,
+    explicit_rate: int = 0,
+    explicit_channels: int = 0,
+    explicit_dtype: str = "",
+) -> Tuple[int, int, str]:
+    """Probe hardware to find supported sample rate, channels, and bit depth."""
     checker = sd.check_input_settings if kind == "input" else sd.check_output_settings
-    kwargs = {
-        "device": device,
-        "channels": 1,
-        "dtype": "int16",
-    }
-    try:
-        checker(samplerate=desired, **kwargs)
-        return desired
-    except Exception:
-        native = int(round(float(info["default_samplerate"])))
-        checker(samplerate=native, **kwargs)
-        return native
+    native_rate = int(round(float(info.get("default_samplerate", 48000))))
+
+    # Candidates to probe in order of preference
+    candidates = []
+
+    # If partial explicit settings were provided
+    if explicit_rate or explicit_channels or explicit_dtype:
+        r = explicit_rate or native_rate or desired_rate
+        c = explicit_channels or (1 if kind == "input" else 2)
+        d = explicit_dtype or "int16"
+        candidates.append((r, c, d))
+
+    # Standard combinations to probe
+    candidates.extend([
+        (desired_rate, 1, "int16"),
+        (native_rate, 1, "int16"),
+        (48000, 2, "int32"),   # Raspberry Pi I2S DAC (MAX98357A / INMP441)
+        (48000, 2, "int16"),
+        (44100, 2, "int16"),
+        (native_rate, 2, "int32"),
+        (native_rate, 2, "int16"),
+    ])
+
+    for rate, ch, dt in candidates:
+        try:
+            checker(device=device, samplerate=rate, channels=ch, dtype=dt)
+            return rate, ch, dt
+        except Exception:
+            continue
+
+    # Fallback to explicit or safe defaults
+    final_rate = explicit_rate or native_rate or desired_rate
+    final_ch = explicit_channels or (2 if platform.system() == "Linux" else 1)
+    final_dt = explicit_dtype or ("int32" if platform.system() == "Linux" else "int16")
+    return final_rate, final_ch, final_dt

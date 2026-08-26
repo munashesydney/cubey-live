@@ -97,12 +97,18 @@ class ApplicationController:
             self.config.input_sample_rate,
             self.config.input_device,
             self.config.prefer_low_latency_devices,
+            explicit_sample_rate=self.config.device_sample_rate,
+            explicit_channels=self.config.device_channels,
+            explicit_dtype=self.config.device_dtype,
         )
         output_device = select_audio_device(
             "output",
             self.config.output_sample_rate,
             self.config.output_device,
             self.config.prefer_low_latency_devices,
+            explicit_sample_rate=self.config.device_sample_rate,
+            explicit_channels=self.config.device_channels,
+            explicit_dtype=self.config.device_dtype,
         )
         self.player = AudioPlayer(
             sample_rate=self.config.output_sample_rate,
@@ -111,6 +117,8 @@ class ApplicationController:
             max_buffer_ms=self.config.output_buffer_ms,
             device=output_device.device,
             device_sample_rate=output_device.sample_rate,
+            device_channels=output_device.channels,
+            device_dtype=output_device.dtype,
         )
         
         self.recorder = AudioRecorder(
@@ -120,6 +128,8 @@ class ApplicationController:
             max_queue_ms=self.config.input_queue_ms,
             device=input_device.device,
             device_sample_rate=input_device.sample_rate,
+            device_channels=input_device.channels,
+            device_dtype=input_device.dtype,
             on_level_change=self._on_mic_level_changed,
         )
 

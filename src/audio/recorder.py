@@ -11,7 +11,7 @@ import numpy as np
 import sounddevice as sd
 from typing import Callable, Optional
 
-from src.audio.resample import resample_pcm16
+from src.audio.resample import convert_device_to_pcm16_mono
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +26,8 @@ class AudioRecorder:
         max_queue_ms: int = 240,
         device=None,
         device_sample_rate: Optional[int] = None,
+        device_channels: Optional[int] = None,
+        device_dtype: Optional[str] = None,
         on_level_change: Optional[Callable[[float], None]] = None,
         on_audio_chunk: Optional[Callable[[bytes], None]] = None
     ):
@@ -35,6 +37,10 @@ class AudioRecorder:
         self.max_queue_ms = max_queue_ms
         self.device = device
         self.device_sample_rate = device_sample_rate or sample_rate
+        self.device_channels = device_channels or channels
+        self.device_dtype = device_dtype or 'int16'
+        self.bytes_per_sample = 4 if self.device_dtype.lower().strip() in ("int32", "s32", "s32_le", "float32", "f32") else 2
+
         # Run the hardware callback at 10 ms for low device latency, then
         # aggregate into the configured 20 ms Gemini packet size below.
         self.device_chunk_size = max(
@@ -70,16 +76,18 @@ class AudioRecorder:
             self.stream = sd.RawInputStream(
                 device=self.device,
                 samplerate=self.device_sample_rate,
-                channels=self.channels,
-                dtype='int16',
+                channels=self.device_channels,
+                dtype=self.device_dtype,
                 blocksize=self.device_chunk_size,
                 latency='low',
                 callback=self._audio_callback
             )
             self.stream.start()
             logger.info(
-                "Microphone recorder started (%d Hz device -> %d Hz Gemini)",
+                "Microphone recorder started (%d Hz %d ch %s device -> %d Hz Gemini)",
                 self.device_sample_rate,
+                self.device_channels,
+                self.device_dtype,
                 self.sample_rate,
             )
         except Exception as e:
@@ -98,6 +106,9 @@ class AudioRecorder:
                 )
                 self.device = None
                 self.device_sample_rate = self.sample_rate
+                self.device_channels = self.channels
+                self.device_dtype = 'int16'
+                self.bytes_per_sample = 2
                 self.device_chunk_size = self.chunk_size
                 try:
                     self.stream = sd.RawInputStream(
@@ -151,18 +162,19 @@ class AudioRecorder:
         if not self.is_recording or self._loop is None:
             return
             
-        resampled = resample_pcm16(
+        converted = convert_device_to_pcm16_mono(
             bytes(indata),
-            self.device_sample_rate,
-            self.sample_rate,
-            self.channels,
+            source_rate=self.device_sample_rate,
+            target_rate=self.sample_rate,
+            source_channels=self.device_channels,
+            source_dtype=self.device_dtype,
         )
 
         if self.is_muted:
             # Send silent PCM frame if muted
-            resampled = b'\x00' * len(resampled)
+            converted = b'\x00' * len(converted)
 
-        self._packet_buffer.extend(resampled)
+        self._packet_buffer.extend(converted)
         packet_bytes = self.chunk_size * self.channels * 2
         while len(self._packet_buffer) >= packet_bytes:
             data = bytes(self._packet_buffer[:packet_bytes])

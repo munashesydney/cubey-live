@@ -41,6 +41,9 @@ class AppConfig:
     output_buffer_ms: int = int(os.getenv("AUDIO_OUTPUT_BUFFER_MS", "2000"))
     input_device: str = os.getenv("AUDIO_INPUT_DEVICE", "")
     output_device: str = os.getenv("AUDIO_OUTPUT_DEVICE", "")
+    device_sample_rate: int = int(os.getenv("AUDIO_DEVICE_SAMPLE_RATE", "0"))
+    device_channels: int = int(os.getenv("AUDIO_DEVICE_CHANNELS", "0"))
+    device_dtype: str = os.getenv("AUDIO_DEVICE_DTYPE", "")
     prefer_low_latency_devices: bool = os.getenv(
         "AUDIO_PREFER_LOW_LATENCY_DEVICE", "true"
     ).strip().lower() not in {"0", "false", "no", "off"}

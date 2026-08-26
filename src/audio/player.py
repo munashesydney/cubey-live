@@ -10,7 +10,7 @@ import time
 import sounddevice as sd
 from typing import Deque, Optional
 
-from src.audio.resample import resample_pcm16
+from src.audio.resample import convert_pcm16_mono_to_device
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +25,8 @@ class AudioPlayer:
         max_buffer_ms: int = 750,
         device=None,
         device_sample_rate: Optional[int] = None,
+        device_channels: Optional[int] = None,
+        device_dtype: Optional[str] = None,
     ):
         self.sample_rate = sample_rate
         self.channels = channels
@@ -32,12 +34,16 @@ class AudioPlayer:
         self.max_buffer_ms = max_buffer_ms
         self.device = device
         self.device_sample_rate = device_sample_rate or sample_rate
+        self.device_channels = device_channels or channels
+        self.device_dtype = device_dtype or 'int16'
+        self.bytes_per_sample = 4 if self.device_dtype.lower().strip() in ("int32", "s32", "s32_le", "float32", "f32") else 2
+
         self.device_block_size = max(
             1, round(self.block_size * self.device_sample_rate / self.sample_rate)
         )
         self.max_buffer_bytes = max(
-            self.device_block_size * self.channels * 2,
-            int(self.device_sample_rate * self.channels * 2 * max_buffer_ms / 1000),
+            self.device_block_size * self.device_channels * self.bytes_per_sample,
+            int(self.device_sample_rate * self.device_channels * self.bytes_per_sample * max_buffer_ms / 1000),
         )
 
         self._chunks: Deque[memoryview] = deque()
@@ -74,8 +80,8 @@ class AudioPlayer:
             self.stream = sd.RawOutputStream(
                 device=self.device,
                 samplerate=self.device_sample_rate,
-                channels=self.channels,
-                dtype='int16',
+                channels=self.device_channels,
+                dtype=self.device_dtype,
                 latency='low',
                 blocksize=self.device_block_size,
                 callback=self._audio_callback,
@@ -95,6 +101,9 @@ class AudioPlayer:
                 )
                 self.device = None
                 self.device_sample_rate = self.sample_rate
+                self.device_channels = self.channels
+                self.device_dtype = 'int16'
+                self.bytes_per_sample = 2
                 self.device_block_size = self.block_size
                 self.max_buffer_bytes = max(
                     self.device_block_size * self.channels * 2,
@@ -125,9 +134,11 @@ class AudioPlayer:
             raise
             
         logger.info(
-            "Audio player started (%d Hz Gemini -> %d Hz device, %d-frame callback)",
+            "Audio player started (%d Hz Gemini -> %d Hz %d ch %s device, %d-frame callback)",
             self.sample_rate,
             self.device_sample_rate,
+            self.device_channels,
+            self.device_dtype,
             self.device_block_size,
         )
 
@@ -150,11 +161,12 @@ class AudioPlayer:
     def play_chunk(self, pcm_data: bytes) -> None:
         """Enqueue PCM 16-bit mono bytes for playback."""
         if self.is_playing and pcm_data:
-            device_pcm = resample_pcm16(
+            device_pcm = convert_pcm16_mono_to_device(
                 pcm_data,
-                self.sample_rate,
-                self.device_sample_rate,
-                self.channels,
+                source_rate=self.sample_rate,
+                target_rate=self.device_sample_rate,
+                target_channels=self.device_channels,
+                target_dtype=self.device_dtype,
             )
             view = memoryview(device_pcm)
             with self._buffer_lock:
@@ -175,7 +187,7 @@ class AudioPlayer:
                 logger.info(
                     "Gemini delivered %.0f ms of audio ahead of playback; buffering full speech",
                     buffered_bytes
-                    / (self.device_sample_rate * self.channels * 2)
+                    / (self.device_sample_rate * self.device_channels * self.bytes_per_sample)
                     * 1000,
                 )
 
