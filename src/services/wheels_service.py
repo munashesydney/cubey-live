@@ -105,7 +105,7 @@ class WheelsService:
         """Choose reasonable default port based on current operating system."""
         system = platform.system().lower()
         if "linux" in system:
-            return "/dev/serial0"
+            return "/dev/ttyAMA0"
         elif "darwin" in system:
             return "/dev/cu.usbserial-0001"
         else:
@@ -125,7 +125,7 @@ class WheelsService:
         # Ensure platform-specific defaults are present in list
         system = platform.system().lower()
         if "linux" in system:
-            for p in ["/dev/serial0", "/dev/ttyAMA0", "/dev/ttyUSB0", "/dev/ttyACM0"]:
+            for p in ["/dev/ttyAMA0", "/dev/serial0", "/dev/ttyUSB0", "/dev/ttyACM0"]:
                 if p not in ports:
                     ports.append(p)
         elif "windows" in system:
