@@ -15,3 +15,6 @@ huggingface-hub>=0.28
 
 # Task scheduling (cron expressions)
 croniter>=2.0
+
+# Hardware UART / Serial communication with ESP32
+pyserial>=3.5

@@ -1,0 +1,459 @@
+"""
+Wheels Service module for Cubey robot.
+
+Manages hardware UART / Serial communication between Raspberry Pi 5 and
+ESP32-S3 (cubey_wheels), telemetry parsing (cliff sensors, motion state, speed),
+and pulse/continuous motion dispatch.
+"""
+
+import logging
+import platform
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+# Try importing pyserial; provide graceful fallback if not installed
+try:
+    import serial
+    import serial.tools.list_ports
+    PYSERIAL_AVAILABLE = True
+except ImportError:
+    serial = None
+    PYSERIAL_AVAILABLE = False
+    logger.warning("pyserial is not installed. Running in mock/simulation mode.")
+
+
+@dataclass
+class TelemetryData:
+    """Parsed real-time telemetry from cubey_wheels firmware."""
+    front_distance_mm: int = 0
+    back_distance_mm: int = 0
+    front_cliff: bool = False
+    back_cliff: bool = False
+    motion: str = "STOPPED"
+    speed: int = 180
+    timestamp: float = field(default_factory=time.time)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "front_distance_mm": self.front_distance_mm,
+            "back_distance_mm": self.back_distance_mm,
+            "front_cliff": self.front_cliff,
+            "back_cliff": self.back_cliff,
+            "motion": self.motion,
+            "speed": self.speed,
+            "timestamp": self.timestamp,
+        }
+
+
+class WheelsService:
+    """
+    Coordinates serial communication with the ESP32 mecanum wheel controller.
+    """
+
+    # Supported motion command names matching firmware
+    COMMANDS = [
+        "forward",
+        "backward",
+        "strafeLeft",
+        "strafeRight",
+        "rotateLeft",
+        "rotateRight",
+        "forwardLeft",
+        "forwardRight",
+        "backwardLeft",
+        "backwardRight",
+        "stop",
+    ]
+
+    def __init__(
+        self,
+        default_port: Optional[str] = None,
+        default_baudrate: int = 115200,
+        on_telemetry: Optional[Callable[[TelemetryData], None]] = None,
+        on_log: Optional[Callable[[str], None]] = None,
+        on_connection_change: Optional[Callable[[bool, str], None]] = None,
+    ):
+        self.port: str = default_port or self._get_default_port_for_platform()
+        self.baudrate: int = default_baudrate
+
+        self.on_telemetry = on_telemetry
+        self.on_log = on_log
+        self.on_connection_change = on_connection_change
+
+        self._serial: Optional[Any] = None
+        self._write_lock = threading.Lock()
+        self._is_connected: bool = False
+        self._is_mock: bool = False
+
+        self._reader_thread: Optional[threading.Thread] = None
+        self._running: bool = False
+
+        # Continuous movement repeat timer
+        self._continuous_timer: Optional[threading.Timer] = None
+        self._continuous_command: Optional[str] = None
+        self._continuous_lock = threading.Lock()
+
+        # Telemetry state cache
+        self.telemetry = TelemetryData()
+
+    @staticmethod
+    def _get_default_port_for_platform() -> str:
+        """Choose reasonable default port based on current operating system."""
+        system = platform.system().lower()
+        if "linux" in system:
+            return "/dev/serial0"
+        elif "darwin" in system:
+            return "/dev/cu.usbserial-0001"
+        else:
+            return "COM3"
+
+    @classmethod
+    def list_available_ports(cls) -> List[str]:
+        """Scan system for available serial ports with standard fallbacks."""
+        ports = []
+        if PYSERIAL_AVAILABLE and serial is not None:
+            try:
+                for port_info in serial.tools.list_ports.comports():
+                    ports.append(port_info.device)
+            except Exception as e:
+                logger.warning("Error scanning serial ports: %s", e)
+
+        # Ensure platform-specific defaults are present in list
+        system = platform.system().lower()
+        if "linux" in system:
+            for p in ["/dev/serial0", "/dev/ttyAMA0", "/dev/ttyUSB0", "/dev/ttyACM0"]:
+                if p not in ports:
+                    ports.append(p)
+        elif "windows" in system:
+            for p in ["COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8"]:
+                if p not in ports:
+                    ports.append(p)
+
+        if "MOCK_SIMULATOR" not in ports:
+            ports.append("MOCK_SIMULATOR")
+
+        return ports
+
+    @property
+    def is_connected(self) -> bool:
+        return self._is_connected
+
+    @property
+    def is_mock(self) -> bool:
+        return self._is_mock
+
+    def connect(self, port: Optional[str] = None, baudrate: Optional[int] = None) -> bool:
+        """
+        Open serial connection to ESP32 on specified port and baudrate.
+        If port is 'MOCK_SIMULATOR', enters simulated mode.
+        """
+        if port:
+            self.port = port
+        if baudrate:
+            self.baudrate = baudrate
+
+        self.disconnect()
+
+        if self.port == "MOCK_SIMULATOR" or not PYSERIAL_AVAILABLE:
+            self._is_mock = True
+            self._is_connected = True
+            self._running = True
+            self._reader_thread = threading.Thread(
+                target=self._mock_reader_loop, daemon=True, name="WheelsMockReader"
+            )
+            self._reader_thread.start()
+            self._emit_log(f"Connected to {self.port} (Mock/Simulated Mode)")
+            self._emit_connection_change(True, f"Mock Mode ({self.port})")
+            return True
+
+        try:
+            self._serial = serial.Serial(
+                port=self.port,
+                baudrate=self.baudrate,
+                timeout=1.0,
+                write_timeout=1.0,
+            )
+            self._is_mock = False
+            self._is_connected = True
+            self._running = True
+
+            self._reader_thread = threading.Thread(
+                target=self._serial_reader_loop, daemon=True, name="WheelsSerialReader"
+            )
+            self._reader_thread.start()
+
+            self._emit_log(f"Connected to hardware UART: {self.port} @ {self.baudrate} baud")
+            self._emit_connection_change(True, f"Connected ({self.port})")
+
+            # Request initial status
+            self.request_status()
+            return True
+        except Exception as e:
+            logger.error("Failed to connect to serial port %s: %s", self.port, e)
+            self._is_connected = False
+            self._serial = None
+            self._emit_log(f"Connection failed to {self.port}: {e}")
+            self._emit_connection_change(False, f"Connection Failed: {e}")
+            return False
+
+    def disconnect(self) -> None:
+        """Safely close serial port and terminate background worker threads."""
+        self._stop_continuous_repeat()
+        self._running = False
+
+        if self._serial:
+            try:
+                self._serial.close()
+            except Exception as e:
+                logger.warning("Error closing serial port: %s", e)
+            self._serial = None
+
+        if self._reader_thread and self._reader_thread.is_alive():
+            self._reader_thread.join(timeout=0.5)
+        self._reader_thread = None
+
+        was_connected = self._is_connected
+        self._is_connected = False
+        self._is_mock = False
+
+        if was_connected:
+            self._emit_log("Disconnected from serial port.")
+            self._emit_connection_change(False, "Disconnected")
+
+    # ------------------------------------------------------------------
+    # Command Dispatchers
+    # ------------------------------------------------------------------
+
+    def send_raw(self, line: str) -> bool:
+        """Write raw ASCII line over serial port."""
+        if not self._is_connected:
+            self._emit_log(f"Cannot send '{line}': not connected")
+            return False
+
+        line = line.strip()
+        data = (line + "\n").encode("utf-8")
+
+        if self._is_mock:
+            self._emit_log(f"[TX-MOCK] {line}")
+            self._handle_mock_command(line)
+            return True
+
+        with self._write_lock:
+            if not self._serial or not self._serial.is_open:
+                self._emit_log(f"Serial port not open for '{line}'")
+                return False
+            try:
+                self._serial.write(data)
+                self._serial.flush()
+                self._emit_log(f"[TX] {line}")
+                return True
+            except Exception as e:
+                logger.error("Serial write failed: %s", e)
+                self._emit_log(f"[TX ERROR] {e}")
+                return False
+
+    def move(self, direction: str) -> bool:
+        """Send a single motion command (e.g. 'forward', 'strafeLeft')."""
+        return self.send_raw(f"CMD:{direction}")
+
+    def stop(self) -> bool:
+        """Emergency stop: stops continuous repeat and sends stop command."""
+        self._stop_continuous_repeat()
+        return self.send_raw("CMD:stop")
+
+    def set_speed(self, speed: int) -> bool:
+        """Update robot motor speed (70-255)."""
+        speed = max(70, min(255, int(speed)))
+        return self.send_raw(f"SPEED:{speed}")
+
+    def test_motor(self, motor_name: str, direction: int, speed: int = 0) -> bool:
+        """
+        Diagnostic command to spin an individual motor.
+        motor_name: 'fl', 'fr', 'bl', 'br'
+        direction: 1 (fwd), -1 (rev), 0 (stop)
+        """
+        if speed > 0:
+            return self.send_raw(f"MOTOR:{motor_name},{direction},{speed}")
+        return self.send_raw(f"MOTOR:{motor_name},{direction}")
+
+    def pulse(self, direction: str, duration_ms: int = 250) -> None:
+        """
+        Move in a direction for a short duration, then automatically stop.
+        Useful for precise step testing.
+        """
+        def _pulse_worker():
+            self.move(direction)
+            time.sleep(duration_ms / 1000.0)
+            self.send_raw("CMD:stop")
+
+        threading.Thread(target=_pulse_worker, daemon=True, name="WheelsPulseWorker").start()
+
+    def start_continuous(self, direction: str, interval_ms: int = 200) -> None:
+        """
+        Begin continuous movement stream for hold-to-move controls.
+        Periodically repeats command to prevent ESP32 700ms timeout.
+        """
+        with self._continuous_lock:
+            self._continuous_command = direction
+            self.move(direction)
+
+            def _repeat_step():
+                with self._continuous_lock:
+                    if self._continuous_command == direction and self._is_connected:
+                        self.move(direction)
+                        self._continuous_timer = threading.Timer(
+                            interval_ms / 1000.0, _repeat_step
+                        )
+                        self._continuous_timer.daemon = True
+                        self._continuous_timer.start()
+
+            if self._continuous_timer:
+                self._continuous_timer.cancel()
+            self._continuous_timer = threading.Timer(interval_ms / 1000.0, _repeat_step)
+            self._continuous_timer.daemon = True
+            self._continuous_timer.start()
+
+    def stop_continuous(self) -> None:
+        """Stop hold-to-move repeat and stop wheels."""
+        self._stop_continuous_repeat()
+        self.stop()
+
+    def _stop_continuous_repeat(self) -> None:
+        with self._continuous_lock:
+            self._continuous_command = None
+            if self._continuous_timer:
+                self._continuous_timer.cancel()
+                self._continuous_timer = None
+
+    def send_ping(self) -> bool:
+        """Send PING heartbeat."""
+        return self.send_raw("PING")
+
+    def request_status(self) -> bool:
+        """Request telemetry snapshot."""
+        return self.send_raw("STATUS")
+
+    # ------------------------------------------------------------------
+    # Telemetry & Line Parsing
+    # ------------------------------------------------------------------
+
+    def _parse_incoming_line(self, line: str) -> None:
+        """Process incoming line from ESP32."""
+        line = line.strip()
+        if not line:
+            return
+
+        self._emit_log(f"[RX] {line}")
+
+        if line.startswith("TELEMETRY:"):
+            self._parse_telemetry(line[len("TELEMETRY:"):])
+        elif line.startswith("ACK:"):
+            pass
+        elif line == "PONG":
+            pass
+
+    def _parse_telemetry(self, payload: str) -> None:
+        """
+        Parse key-value pairs formatted as:
+        front_dist=55,back_dist=58,front_cliff=0,back_cliff=0,motion=STOPPED,speed=180
+        """
+        try:
+            parts = payload.split(",")
+            kv = {}
+            for part in parts:
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    kv[k.strip()] = v.strip()
+
+            self.telemetry = TelemetryData(
+                front_distance_mm=int(kv.get("front_dist", self.telemetry.front_distance_mm)),
+                back_distance_mm=int(kv.get("back_dist", self.telemetry.back_distance_mm)),
+                front_cliff=kv.get("front_cliff", "0") in ("1", "true", "True"),
+                back_cliff=kv.get("back_cliff", "0") in ("1", "true", "True"),
+                motion=kv.get("motion", self.telemetry.motion),
+                speed=int(kv.get("speed", self.telemetry.speed)),
+                timestamp=time.time(),
+            )
+
+            if self.on_telemetry:
+                self.on_telemetry(self.telemetry)
+        except Exception as e:
+            logger.warning("Failed to parse telemetry '%s': %s", payload, e)
+
+    # ------------------------------------------------------------------
+    # Background Worker Loops
+    # ------------------------------------------------------------------
+
+    def _serial_reader_loop(self) -> None:
+        """Background thread reading lines from physical hardware UART."""
+        while self._running and self._serial and self._serial.is_open:
+            try:
+                line_bytes = self._serial.readline()
+                if line_bytes:
+                    line = line_bytes.decode("utf-8", errors="replace")
+                    self._parse_incoming_line(line)
+            except Exception as e:
+                if self._running:
+                    logger.error("Serial read error: %s", e)
+                    self._emit_log(f"[RX ERROR] {e}")
+                    time.sleep(0.1)
+                break
+
+    def _mock_reader_loop(self) -> None:
+        """Background thread simulating periodic telemetry for development."""
+        counter = 0
+        while self._running and self._is_mock:
+            time.sleep(0.25)
+            counter += 1
+            if counter % 4 == 0:
+                # Emit simulated telemetry
+                simulated_line = (
+                    f"TELEMETRY:front_dist=52,back_dist=55,"
+                    f"front_cliff=0,back_cliff=0,"
+                    f"motion={self.telemetry.motion},speed={self.telemetry.speed}"
+                )
+                self._parse_incoming_line(simulated_line)
+
+    def _handle_mock_command(self, line: str) -> None:
+        """Simulate responses for mock mode."""
+        if line.startswith("CMD:"):
+            cmd = line[4:]
+            self.telemetry.motion = cmd.upper()
+            self._parse_incoming_line(f"ACK:CMD:{cmd}")
+        elif line.startswith("SPEED:"):
+            spd = int(line[6:])
+            self.telemetry.speed = spd
+            self._parse_incoming_line(f"ACK:SPEED:{spd}")
+        elif line.startswith("MOTOR:"):
+            self._parse_incoming_line(f"ACK:{line}")
+        elif line == "PING":
+            self._parse_incoming_line("PONG")
+        elif line == "STATUS":
+            simulated = (
+                f"TELEMETRY:front_dist=52,back_dist=55,"
+                f"front_cliff=0,back_cliff=0,"
+                f"motion={self.telemetry.motion},speed={self.telemetry.speed}"
+            )
+            self._parse_incoming_line(simulated)
+
+    # ------------------------------------------------------------------
+    # Notification Helpers
+    # ------------------------------------------------------------------
+
+    def _emit_log(self, text: str) -> None:
+        if self.on_log:
+            try:
+                self.on_log(text)
+            except Exception as e:
+                logger.warning("Error in on_log callback: %s", e)
+
+    def _emit_connection_change(self, connected: bool, info: str) -> None:
+        if self.on_connection_change:
+            try:
+                self.on_connection_change(connected, info)
+            except Exception as e:
+                logger.warning("Error in on_connection_change callback: %s", e)

@@ -10,5 +10,13 @@ from .live_page import LivePage
 from .local_chat_page import LocalChatPage
 from .memory_page import MemoryPage
 from .tasks_page import TasksPage
+from .wheels_page import WheelsPage
 
-__all__ = ["HomePage", "LivePage", "LocalChatPage", "MemoryPage", "TasksPage"]
+__all__ = [
+    "HomePage",
+    "LivePage",
+    "LocalChatPage",
+    "MemoryPage",
+    "TasksPage",
+    "WheelsPage",
+]

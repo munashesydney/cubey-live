@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 # (page key, card title, description, fg color, hover color)
 _PAGE_CARDS = [
+    ("wheels", "🛞 Wheels", "Mecanum drive, motor testing & cliff sensors", "#FAB387", "#F5C2E7"),
     ("live", "✨ Gemini Live", "Session controls, events, transcripts & logs", "#A6E3A1", "#94E2D5"),
     ("local", "🦙 Local Chat", "Chat with the on-device Qwen model", "#CBA6F7", "#B4BEFE"),
     ("memories", "🧠 Memories", "Cubey's durable long-term memory bank", "#74C7EC", "#89DCEB"),
@@ -67,22 +68,23 @@ class HomePage(ctk.CTkFrame):
         # Page cards grid
         self.card_grid = ctk.CTkFrame(self, fg_color="transparent")
         self.card_grid.pack(fill="both", expand=True, padx=15, pady=(10, 5))
-        for i in range(2):
-            self.card_grid.columnconfigure(i, weight=1)
-            self.card_grid.rowconfigure(i, weight=1)
+        for c in range(3):
+            self.card_grid.columnconfigure(c, weight=1)
+        for r in range(2):
+            self.card_grid.rowconfigure(r, weight=1)
 
         for idx, (key, title, desc, color, hover) in enumerate(_PAGE_CARDS):
             btn = ctk.CTkButton(
                 self.card_grid,
                 text=f"{title}\n{desc}",
-                font=ctk.CTkFont(size=15, weight="bold"),
+                font=ctk.CTkFont(size=14, weight="bold"),
                 fg_color=color,
                 hover_color=hover,
                 text_color="#11111B",
                 corner_radius=12,
                 command=lambda k=key: self.on_navigate(k)
             )
-            btn.grid(row=idx // 2, column=idx % 2, sticky="nsew", padx=6, pady=6)
+            btn.grid(row=idx // 3, column=idx % 3, sticky="nsew", padx=6, pady=6)
 
         # Stats footer
         self.stats_label = ctk.CTkLabel(

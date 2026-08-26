@@ -2,14 +2,15 @@
 Developer Console shell module.
 
 The dev home window opened from the robot face screen. Provides a sidebar
-navigating between embedded pages: Home, Gemini Live, Local Chat, Memories,
+navigating between embedded pages: Home, Wheels, Gemini Live, Local Chat, Memories,
 and Tasks. Everything lives in one navigable window instead of a stack of
 popups.
 """
 
 import logging
-import customtkinter as ctk
 from typing import Any, Callable, Optional
+
+import customtkinter as ctk
 
 from src.config import AppConfig
 from src.gui.pages import (
@@ -18,6 +19,7 @@ from src.gui.pages import (
     LocalChatPage,
     MemoryPage,
     TasksPage,
+    WheelsPage,
 )
 from src.services.embeddings import EmbeddingService
 
@@ -30,6 +32,7 @@ class DeveloperWindow(ctk.CTkToplevel):
     # (page key, sidebar label) — order is the sidebar order.
     NAV_ITEMS = [
         ("home", "🏠 Home"),
+        ("wheels", "🛞 Wheels"),
         ("live", "✨ Gemini Live"),
         ("local", "🦙 Local Chat"),
         ("memories", "🧠 Memories"),
@@ -46,7 +49,7 @@ class DeveloperWindow(ctk.CTkToplevel):
         on_toggle_mute: Callable[[bool], None],
         embedding_service: EmbeddingService,
         is_session_active: bool = False,
-        **kwargs
+        **kwargs,
     ):
         super().__init__(master, **kwargs)
         self.config = config
@@ -84,14 +87,14 @@ class DeveloperWindow(ctk.CTkToplevel):
             self.sidebar,
             text="🛠️ Dev Console",
             font=ctk.CTkFont(size=17, weight="bold"),
-            text_color="#F5E0DC"
+            text_color="#F5E0DC",
         ).pack(anchor="w", padx=16, pady=(18, 2))
 
         ctk.CTkLabel(
             self.sidebar,
             text="Cubeo Controls",
             font=ctk.CTkFont(size=11),
-            text_color="#6C7086"
+            text_color="#6C7086",
         ).pack(anchor="w", padx=16, pady=(0, 14))
 
         for key, label in self.NAV_ITEMS:
@@ -105,7 +108,7 @@ class DeveloperWindow(ctk.CTkToplevel):
                 hover_color="#1E1E2E",
                 text_color="#CDD6F4",
                 font=ctk.CTkFont(size=13),
-                command=lambda k=key: self.show_page(k)
+                command=lambda k=key: self.show_page(k),
             )
             btn.pack(fill="x", padx=10, pady=2)
             self._nav_buttons[key] = btn
@@ -119,6 +122,7 @@ class DeveloperWindow(ctk.CTkToplevel):
         self._pages["home"] = HomePage(
             self.page_container, config=self.config, on_navigate=self.show_page
         )
+        self._pages["wheels"] = WheelsPage(self.page_container)
         self._pages["live"] = LivePage(
             self.page_container,
             config=self.config,
