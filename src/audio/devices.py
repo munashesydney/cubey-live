@@ -40,7 +40,7 @@ def select_audio_device(
     if kind not in {"input", "output"}:
         raise ValueError("kind must be 'input' or 'output'")
 
-    device: DeviceId = _parse_device(explicit_device)
+    device: DeviceId = _resolve_device_id(explicit_device, kind)
     if (
         device is None
         and prefer_low_latency
@@ -97,9 +97,10 @@ def select_audio_device(
             host_api=host_api,
         )
         logger.info(
-            "Selected %s device '%s' via %s: %d Hz, %d ch, %s",
+            "Selected %s device '%s' (id=%r) via %s: %d Hz, %d ch, %s",
             kind,
             selection.name,
+            selection.device,
             selection.host_api,
             selection.sample_rate,
             selection.channels,
@@ -114,23 +115,80 @@ def select_audio_device(
             exc,
         )
         return AudioDeviceSelection(
-            device=device,
+            device=None,
             sample_rate=default_rate,
             channels=default_channels,
             dtype=default_dtype,
-            name=str(device) if device is not None else "system default",
+            name="system default",
             host_api="default",
         )
 
 
-def _parse_device(value: Optional[str]) -> DeviceId:
-    if value is None or not value.strip():
+def _resolve_device_id(value: Optional[str], kind: str) -> DeviceId:
+    """Resolve an explicit device string (index, name, plughw:2,0, hw:2,0) to a PortAudio device."""
+    if value is None or not str(value).strip():
         return None
-    stripped = value.strip()
+
+    stripped = str(value).strip()
+
+    # 1. Integer index (e.g. "2" or 2)
     try:
         return int(stripped)
     except ValueError:
+        pass
+
+    # 2. Try direct query to see if sounddevice recognizes the name as-is
+    try:
+        sd.query_devices(device=stripped, kind=kind)
         return stripped
+    except Exception:
+        pass
+
+    # 3. Smart ALSA / hardware string parsing (e.g. "plughw:2,0", "hw:2,0", "card 2")
+    channel_key = "max_input_channels" if kind == "input" else "max_output_channels"
+
+    import re
+    card_match = re.search(r"(?:plughw|hw|card)[:,\s]*(\d+)", stripped, re.IGNORECASE)
+    card_num = card_match.group(1) if card_match else None
+
+    devices = []
+    try:
+        devices = sd.query_devices()
+    except Exception:
+        pass
+
+    # Priority A: Check for hw:X,Y or hw:X in device names
+    if card_num is not None:
+        for idx, dev in enumerate(devices):
+            name = dev.get("name", "")
+            max_ch = dev.get(channel_key, 0)
+            if max_ch > 0:
+                if f"hw:{card_num}" in name.lower() or f"card={card_num}" in name.lower() or f"({card_num}," in name:
+                    logger.info("Resolved audio device '%s' -> PortAudio index %d: '%s'", stripped, idx, name)
+                    return idx
+
+    # Priority B: Case-insensitive substring match against device names
+    clean_query = stripped.lower().replace("plughw:", "").replace("hw:", "").strip()
+    for idx, dev in enumerate(devices):
+        name = dev.get("name", "")
+        max_ch = dev.get(channel_key, 0)
+        if max_ch > 0 and clean_query and clean_query in name.lower():
+            logger.info("Resolved audio device '%s' -> PortAudio index %d: '%s'", stripped, idx, name)
+            return idx
+
+    # Priority C: If card_num is integer index within range
+    if card_num is not None:
+        try:
+            c_idx = int(card_num)
+            if 0 <= c_idx < len(devices):
+                if devices[c_idx].get(channel_key, 0) > 0:
+                    logger.info("Using device index %d from '%s'", c_idx, stripped)
+                    return c_idx
+        except Exception:
+            pass
+
+    logger.warning("Could not match audio device '%s' for %s; using default", stripped, kind)
+    return None
 
 
 def _windows_wasapi_default(kind: str) -> Optional[int]:

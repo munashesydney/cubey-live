@@ -101,10 +101,28 @@ class AudioRecorder:
                         pass
                     self.stream = None
                 logger.warning(
-                    "Preferred input device failed (%s); retrying system default",
+                    "Preferred input device %r failed (%s); retrying system default",
+                    self.device,
                     e,
                 )
                 self.device = None
+                # First try system default using the configured hardware rate & format
+                try:
+                    self.stream = sd.RawInputStream(
+                        samplerate=self.device_sample_rate,
+                        channels=self.device_channels,
+                        dtype=self.device_dtype,
+                        blocksize=self.device_chunk_size,
+                        latency='low',
+                        callback=self._audio_callback,
+                    )
+                    self.stream.start()
+                    logger.info("Microphone recorder using system-default at %d Hz, %d ch, %s", self.device_sample_rate, self.device_channels, self.device_dtype)
+                    return
+                except Exception:
+                    pass
+
+                # Second fallback: standard Gemini rate
                 self.device_sample_rate = self.sample_rate
                 self.device_channels = self.channels
                 self.device_dtype = 'int16'
@@ -120,7 +138,7 @@ class AudioRecorder:
                         callback=self._audio_callback,
                     )
                     self.stream.start()
-                    logger.info("Microphone recorder using system-default fallback")
+                    logger.info("Microphone recorder using standard 16kHz fallback")
                     return
                 except Exception:
                     logger.exception("System-default input fallback also failed")

@@ -96,10 +96,28 @@ class AudioPlayer:
                         pass
                     self.stream = None
                 logger.warning(
-                    "Preferred output device failed (%s); retrying system default",
+                    "Preferred output device %r failed (%s); retrying system default",
+                    self.device,
                     e,
                 )
                 self.device = None
+                # First try system default using the configured hardware rate & format
+                try:
+                    self.stream = sd.RawOutputStream(
+                        samplerate=self.device_sample_rate,
+                        channels=self.device_channels,
+                        dtype=self.device_dtype,
+                        latency='low',
+                        blocksize=self.device_block_size,
+                        callback=self._audio_callback,
+                    )
+                    self.stream.start()
+                    logger.info("Audio player using system-default at %d Hz, %d ch, %s", self.device_sample_rate, self.device_channels, self.device_dtype)
+                    return
+                except Exception:
+                    pass
+
+                # Second fallback: standard Gemini rate
                 self.device_sample_rate = self.sample_rate
                 self.device_channels = self.channels
                 self.device_dtype = 'int16'
@@ -125,7 +143,7 @@ class AudioPlayer:
                         callback=self._audio_callback,
                     )
                     self.stream.start()
-                    logger.info("Audio player using system-default fallback")
+                    logger.info("Audio player using standard 24kHz fallback")
                     return
                 except Exception:
                     logger.exception("System-default output fallback also failed")
