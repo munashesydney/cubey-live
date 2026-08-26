@@ -674,42 +674,53 @@ class WheelsPage(ctk.CTkFrame):
     # ------------------------------------------------------------------
 
     def _bind_keyboard_events(self) -> None:
-        """Keyboard navigation shortcuts when tab is active."""
-        bindings = {
-            "<w>": "forward",
-            "<W>": "forward",
-            "<s>": "backward",
-            "<S>": "backward",
-            "<a>": "strafeLeft",
-            "<A>": "strafeLeft",
-            "<d>": "strafeRight",
-            "<D>": "strafeRight",
-            "<q>": "rotateLeft",
-            "<Q>": "rotateLeft",
-            "<e>": "rotateRight",
-            "<E>": "rotateRight",
-        }
+        """Schedule safe keyboard bindings on the toplevel window."""
+        self.after(200, self._attach_window_bindings)
 
-        # Key press handler
-        for key, cmd in bindings.items():
-            self.bind_all(key, lambda e, c=cmd: self._handle_key_press(c))
+    def _attach_window_bindings(self) -> None:
+        try:
+            top = self.winfo_toplevel()
+            if not top:
+                return
 
-        # Key release handler
-        self.bind_all("<KeyRelease-w>", lambda e: self._handle_key_release("forward"))
-        self.bind_all("<KeyRelease-W>", lambda e: self._handle_key_release("forward"))
-        self.bind_all("<KeyRelease-s>", lambda e: self._handle_key_release("backward"))
-        self.bind_all("<KeyRelease-S>", lambda e: self._handle_key_release("backward"))
-        self.bind_all("<KeyRelease-a>", lambda e: self._handle_key_release("strafeLeft"))
-        self.bind_all("<KeyRelease-A>", lambda e: self._handle_key_release("strafeLeft"))
-        self.bind_all("<KeyRelease-d>", lambda e: self._handle_key_release("strafeRight"))
-        self.bind_all("<KeyRelease-D>", lambda e: self._handle_key_release("strafeRight"))
-        self.bind_all("<KeyRelease-q>", lambda e: self._handle_key_release("rotateLeft"))
-        self.bind_all("<KeyRelease-Q>", lambda e: self._handle_key_release("rotateLeft"))
-        self.bind_all("<KeyRelease-e>", lambda e: self._handle_key_release("rotateRight"))
-        self.bind_all("<KeyRelease-E>", lambda e: self._handle_key_release("rotateRight"))
+            bindings = {
+                "<w>": "forward",
+                "<W>": "forward",
+                "<s>": "backward",
+                "<S>": "backward",
+                "<a>": "strafeLeft",
+                "<A>": "strafeLeft",
+                "<d>": "strafeRight",
+                "<D>": "strafeRight",
+                "<q>": "rotateLeft",
+                "<Q>": "rotateLeft",
+                "<e>": "rotateRight",
+                "<E>": "rotateRight",
+            }
 
-        # Space for emergency stop
-        self.bind_all("<space>", lambda e: self._on_stop_clicked())
+            for key, cmd in bindings.items():
+                top.bind(key, lambda e, c=cmd: self._handle_key_press(c), add="+")
+
+            releases = [
+                ("<KeyRelease-w>", "forward"),
+                ("<KeyRelease-W>", "forward"),
+                ("<KeyRelease-s>", "backward"),
+                ("<KeyRelease-S>", "backward"),
+                ("<KeyRelease-a>", "strafeLeft"),
+                ("<KeyRelease-A>", "strafeLeft"),
+                ("<KeyRelease-d>", "strafeRight"),
+                ("<KeyRelease-D>", "strafeRight"),
+                ("<KeyRelease-q>", "rotateLeft"),
+                ("<KeyRelease-Q>", "rotateLeft"),
+                ("<KeyRelease-e>", "rotateRight"),
+                ("<KeyRelease-E>", "rotateRight"),
+            ]
+            for key, cmd in releases:
+                top.bind(key, lambda e, c=cmd: self._handle_key_release(c), add="+")
+
+            top.bind("<space>", lambda e: self._on_stop_clicked(), add="+")
+        except Exception as e:
+            logger.warning("Could not bind keyboard shortcuts: %s", e)
 
     def _handle_key_press(self, command: str) -> None:
         # Ignore if user is currently typing inside an Entry/Textbox widget
