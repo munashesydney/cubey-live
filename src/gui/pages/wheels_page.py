@@ -52,6 +52,8 @@ class WheelsPage(ctk.CTkFrame):
         self._current_speed: int = 180
         self._pulse_duration_ms: int = 250
         self._control_mode: str = "hold"  # "hold" or "pulse"
+        self._pending_logs: List[str] = []
+        self._log_flush_scheduled: bool = False
 
         self._create_layout()
         self._bind_keyboard_events()
@@ -603,6 +605,14 @@ class WheelsPage(ctk.CTkFrame):
 
     def _attach_movement_events(self, button: ctk.CTkButton, command: str) -> None:
         """Attach pointer down / up / click handlers for continuous vs pulse modes."""
+        def _restore_style():
+            if command in ("forward", "backward", "strafeLeft", "strafeRight"):
+                button.configure(fg_color=COLOR_PRIMARY, text_color="#11111B")
+            elif command in ("rotateLeft", "rotateRight"):
+                button.configure(fg_color=COLOR_PURPLE, text_color="#11111B")
+            else:
+                button.configure(fg_color=COLOR_SURFACE0, text_color=COLOR_TEXT)
+
         def _on_press(event=None):
             if self._control_mode == "hold":
                 self._active_button = button
@@ -616,16 +626,17 @@ class WheelsPage(ctk.CTkFrame):
                 if self._active_button == button:
                     self._active_button = None
                 self.service.stop_continuous()
-                # Restore button default styling
-                if command in ("forward", "backward", "strafeLeft", "strafeRight"):
-                    button.configure(fg_color=COLOR_PRIMARY, text_color="#11111B")
-                elif command in ("rotateLeft", "rotateRight"):
-                    button.configure(fg_color=COLOR_PURPLE, text_color="#11111B")
-                else:
-                    button.configure(fg_color=COLOR_SURFACE0, text_color=COLOR_TEXT)
+                _restore_style()
+
+        def _on_leave(event=None):
+            if self._control_mode == "hold" and self._active_button == button:
+                self._active_button = None
+                self.service.stop_continuous()
+                _restore_style()
 
         button.bind("<ButtonPress-1>", _on_press)
         button.bind("<ButtonRelease-1>", _on_release)
+        button.bind("<Leave>", _on_leave)
 
     def _on_stop_clicked(self) -> None:
         """Stop button clicked."""
@@ -796,43 +807,63 @@ class WheelsPage(ctk.CTkFrame):
     # ------------------------------------------------------------------
 
     def _on_telemetry_received(self, data: TelemetryData) -> None:
-        """Update live UI telemetry badges."""
+        """Update live UI telemetry badges (dispatched on main idle)."""
         def _update():
             if not self.winfo_exists():
                 return
-            self.front_dist_label.configure(text=f"{data.front_distance_mm} mm")
-            self.back_dist_label.configure(text=f"{data.back_distance_mm} mm")
+            try:
+                self.front_dist_label.configure(text=f"{data.front_distance_mm} mm")
+                self.back_dist_label.configure(text=f"{data.back_distance_mm} mm")
 
-            if data.front_cliff:
-                self.front_cliff_badge.configure(
-                    text="⚠️ CLIFF DETECTED", text_color=COLOR_DANGER
+                if data.front_cliff:
+                    self.front_cliff_badge.configure(
+                        text="⚠️ CLIFF DETECTED", text_color=COLOR_DANGER
+                    )
+                else:
+                    self.front_cliff_badge.configure(text="Safe", text_color=COLOR_SUCCESS)
+
+                if data.back_cliff:
+                    self.back_cliff_badge.configure(
+                        text="⚠️ CLIFF DETECTED", text_color=COLOR_DANGER
+                    )
+                else:
+                    self.back_cliff_badge.configure(text="Safe", text_color=COLOR_SUCCESS)
+
+                motion_color = COLOR_SUCCESS if data.motion != "STOPPED" else COLOR_WARNING
+                self.motion_label.configure(
+                    text=f"State: {data.motion}", text_color=motion_color
                 )
-            else:
-                self.front_cliff_badge.configure(text="Safe", text_color=COLOR_SUCCESS)
+            except Exception:
+                pass
 
-            if data.back_cliff:
-                self.back_cliff_badge.configure(
-                    text="⚠️ CLIFF DETECTED", text_color=COLOR_DANGER
-                )
-            else:
-                self.back_cliff_badge.configure(text="Safe", text_color=COLOR_SUCCESS)
-
-            motion_color = COLOR_SUCCESS if data.motion != "STOPPED" else COLOR_WARNING
-            self.motion_label.configure(
-                text=f"State: {data.motion}", text_color=motion_color
-            )
-
-        self.after(0, _update)
+        self.after_idle(_update)
 
     def _on_log_received(self, text: str) -> None:
-        """Append line to embedded terminal."""
-        def _append():
-            if not self.winfo_exists():
-                return
-            self.terminal_box.insert("end", text + "\n")
-            self.terminal_box.see("end")
+        """Buffer incoming log line and schedule batched UI flush to prevent GUI freezing."""
+        self._pending_logs.append(text)
+        if not self._log_flush_scheduled:
+            self._log_flush_scheduled = True
+            self.after(50, self._flush_pending_logs)
 
-        self.after(0, _append)
+    def _flush_pending_logs(self) -> None:
+        """Batch-insert pending log lines into the embedded terminal."""
+        self._log_flush_scheduled = False
+        if not self.winfo_exists() or not self._pending_logs:
+            return
+
+        chunk = "\n".join(self._pending_logs) + "\n"
+        self._pending_logs.clear()
+
+        try:
+            self.terminal_box.insert("end", chunk)
+            # Limit scrollback to ~300 lines to prevent Tkinter canvas rendering lag
+            line_count = int(self.terminal_box.index("end-1c").split(".")[0])
+            if line_count > 350:
+                self.terminal_box.delete("1.0", f"{line_count - 250}.0")
+            self.terminal_box.see("end")
+        except Exception:
+            pass
 
     def _clear_terminal(self) -> None:
+        self._pending_logs.clear()
         self.terminal_box.delete("1.0", "end")
