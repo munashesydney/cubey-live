@@ -37,9 +37,9 @@ if ! command -v systemctl >/dev/null 2>&1; then
     exit 1
 fi
 
-if ! command -v pactl >/dev/null 2>&1; then
-    echo "ERROR: pactl is missing (the pulseaudio-utils package was not installed)." >&2
-    echo "Install it with: sudo apt-get install -y pulseaudio-utils" >&2
+if ! command -v pw-dump >/dev/null 2>&1; then
+    echo "ERROR: pw-dump is missing (the pipewire-bin package was not installed)." >&2
+    echo "Install it with: sudo apt-get install -y pipewire-bin" >&2
     exit 1
 fi
 
@@ -58,10 +58,11 @@ systemctl --user restart pipewire.service pipewire-pulse.service wireplumber.ser
 source_ready=false
 sink_ready=false
 for _ in $(seq 1 40); do
-    if pactl get-source-volume cubey_echo_cancel_source >/dev/null 2>&1; then
+    graph_state="$(pw-dump --no-colors 2>/dev/null || true)"
+    if grep -Fq '"node.name": "cubey_echo_cancel_source"' <<< "${graph_state}"; then
         source_ready=true
     fi
-    if pactl get-sink-volume cubey_echo_cancel_sink >/dev/null 2>&1; then
+    if grep -Fq '"node.name": "cubey_echo_cancel_sink"' <<< "${graph_state}"; then
         sink_ready=true
     fi
     if [[ ${source_ready} == true && ${sink_ready} == true ]]; then

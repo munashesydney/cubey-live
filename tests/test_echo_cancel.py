@@ -1,5 +1,6 @@
 """Tests for fail-closed PipeWire acoustic echo-cancellation routing."""
 
+import json
 import subprocess
 import unittest
 from unittest.mock import patch
@@ -17,12 +18,12 @@ class EchoCancellationRoutingTests(unittest.TestCase):
                 "clean_source",
                 "reference_sink",
                 system_name="Windows",
-                pactl_path="pactl",
+                pw_dump_path="pw-dump",
             )
 
-    def test_requires_pactl(self):
+    def test_requires_pw_dump(self):
         with patch("src.audio.echo_cancel.shutil.which", return_value=None):
-            with self.assertRaisesRegex(EchoCancellationUnavailable, "pactl"):
+            with self.assertRaisesRegex(EchoCancellationUnavailable, "pw-dump"):
                 prepare_pipewire_echo_cancellation(
                     "clean_source",
                     "reference_sink",
@@ -31,7 +32,19 @@ class EchoCancellationRoutingTests(unittest.TestCase):
 
     def test_verifies_endpoints_and_sets_process_routing(self):
         environment = {"PULSE_PROP": "existing=value"}
-        successful_query = subprocess.CompletedProcess([], 0, "ready", "")
+        graph = [
+            {"info": {"props": {
+                "node.name": "clean_source",
+                "media.class": "Audio/Source",
+            }}},
+            {"info": {"props": {
+                "node.name": "reference_sink",
+                "media.class": "Audio/Sink",
+            }}},
+        ]
+        successful_query = subprocess.CompletedProcess(
+            [], 0, json.dumps(graph), ""
+        )
 
         with patch(
             "src.audio.echo_cancel.subprocess.run",
@@ -43,7 +56,7 @@ class EchoCancellationRoutingTests(unittest.TestCase):
                 host_device="pulse",
                 environment=environment,
                 system_name="Linux",
-                pactl_path="/usr/bin/pactl",
+                pw_dump_path="/usr/bin/pw-dump",
             )
 
         self.assertEqual(routing.source_name, "clean_source")
@@ -55,15 +68,12 @@ class EchoCancellationRoutingTests(unittest.TestCase):
         self.assertIn("application.name=Cubey", environment["PULSE_PROP"])
         self.assertEqual(
             [call.args[0] for call in run.call_args_list],
-            [
-                ["/usr/bin/pactl", "get-source-volume", "clean_source"],
-                ["/usr/bin/pactl", "get-sink-volume", "reference_sink"],
-            ],
+            [["/usr/bin/pw-dump", "--no-colors"]],
         )
 
     def test_missing_endpoint_fails_before_changing_environment(self):
         environment = {}
-        missing = subprocess.CompletedProcess([], 1, "", "No such entity")
+        missing = subprocess.CompletedProcess([], 0, "[]", "")
 
         with patch("src.audio.echo_cancel.subprocess.run", return_value=missing):
             with self.assertRaisesRegex(
@@ -74,7 +84,7 @@ class EchoCancellationRoutingTests(unittest.TestCase):
                     "reference_sink",
                     environment=environment,
                     system_name="Linux",
-                    pactl_path="/usr/bin/pactl",
+                    pw_dump_path="/usr/bin/pw-dump",
                 )
 
         self.assertNotIn("PULSE_SOURCE", environment)

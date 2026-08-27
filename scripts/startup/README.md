@@ -68,8 +68,7 @@ journalctl -u cubey -n 50            # recent logs
   `amixer cset numid=3 <n>` / `speaker-test`.
 - **AEC endpoint unavailable** — while logged into Cubey's desktop user, run
   `bash scripts/audio/setup_pipewire_aec.sh`, then restart Cubey. Verify the
-  virtual devices with `pactl get-source-volume cubey_echo_cancel_source` and
-  `pactl get-sink-volume cubey_echo_cancel_sink`.
+  virtual devices with `pw-dump --no-colors | grep cubey_echo_cancel`.
 - **Cubey starts hearing itself again** — check
   `journalctl --user -u pipewire -n 80`. Cubey intentionally refuses to open
   a Live session when AEC is enabled but the WebRTC graph or PortAudio Pulse

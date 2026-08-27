@@ -54,9 +54,9 @@ sudo apt-get update
 sudo apt-get install -y \
     python3-venv python3-pip python3-tk \
     portaudio19-dev libasound2-dev \
-    pipewire pipewire-pulse wireplumber \
+    pipewire pipewire-bin pipewire-pulse wireplumber \
     libpipewire-0.3-modules libspa-0.2-modules \
-    libasound2-plugins pulseaudio-utils \
+    libasound2-plugins \
     libgomp1 librnnoise0 \
     libjpeg-dev libpng-dev zlib1g-dev \
     cmake build-essential \
