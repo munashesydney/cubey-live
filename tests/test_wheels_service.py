@@ -78,7 +78,7 @@ class WheelsServiceProtocolTests(unittest.TestCase):
         telemetry_events = []
         self.service.on_telemetry = lambda telem: telemetry_events.append(telem)
 
-        raw_line = "TELEMETRY:front_dist=62,back_dist=65,front_cliff=0,back_cliff=1,motion=FORWARD,speed=210"
+        raw_line = "TELEMETRY:front_dist=62,back_dist=65,front_cliff=0,back_cliff=1,motion=FORWARD,speed=210,batt_v=7.85,batt_pct=72"
         self.service._parse_incoming_line(raw_line)
 
         self.assertEqual(len(telemetry_events), 1)
@@ -89,6 +89,8 @@ class WheelsServiceProtocolTests(unittest.TestCase):
         self.assertTrue(t.back_cliff)
         self.assertEqual(t.motion, "FORWARD")
         self.assertEqual(t.speed, 210)
+        self.assertEqual(t.battery_voltage, 7.85)
+        self.assertEqual(t.battery_pct, 72)
 
     def test_ping_and_status(self):
         sent_lines = []

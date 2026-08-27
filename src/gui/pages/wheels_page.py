@@ -445,6 +445,14 @@ class WheelsPage(ctk.CTkFrame):
         )
         self.motion_label.pack(side="left")
 
+        self.battery_label = ctk.CTkLabel(
+            footer,
+            text="🔋 Battery: —",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=COLOR_PRIMARY,
+        )
+        self.battery_label.pack(side="left", padx=(16, 0))
+
         ctk.CTkButton(
             footer,
             text="Ping",
@@ -833,6 +841,13 @@ class WheelsPage(ctk.CTkFrame):
                 self.motion_label.configure(
                     text=f"State: {data.motion}", text_color=motion_color
                 )
+
+                if data.battery_voltage > 0:
+                    batt_color = COLOR_SUCCESS if data.battery_pct >= 50 else (COLOR_WARNING if data.battery_pct >= 20 else COLOR_DANGER)
+                    self.battery_label.configure(
+                        text=f"🔋 Battery: {data.battery_pct}% ({data.battery_voltage:.2f}V)",
+                        text_color=batt_color
+                    )
             except Exception:
                 pass
 

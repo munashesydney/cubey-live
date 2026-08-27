@@ -35,6 +35,8 @@ class TelemetryData:
     back_cliff: bool = False
     motion: str = "STOPPED"
     speed: int = 180
+    battery_voltage: float = 0.0
+    battery_pct: int = 0
     timestamp: float = field(default_factory=time.time)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -45,6 +47,8 @@ class TelemetryData:
             "back_cliff": self.back_cliff,
             "motion": self.motion,
             "speed": self.speed,
+            "battery_voltage": self.battery_voltage,
+            "battery_pct": self.battery_pct,
             "timestamp": self.timestamp,
         }
 
@@ -376,6 +380,8 @@ class WheelsService:
                 back_cliff=kv.get("back_cliff", "0") in ("1", "true", "True"),
                 motion=kv.get("motion", self.telemetry.motion),
                 speed=int(kv.get("speed", self.telemetry.speed)),
+                battery_voltage=float(kv.get("batt_v", self.telemetry.battery_voltage)),
+                battery_pct=int(kv.get("batt_pct", self.telemetry.battery_pct)),
                 timestamp=time.time(),
             )
 
