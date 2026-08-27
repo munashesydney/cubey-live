@@ -1,18 +1,16 @@
 """
 #Audio Noise Suppression and Voice Enhancement Module.
 
-Provides production-grade noise cancellation for robot microphones:
+Provides streaming noise suppression for robot microphones:
 1. High-pass Rumble Filter to remove mechanical motor vibrations.
 2. Neural Noise Suppression (RNNoise GRU) via pyrnnoise or ctypes librnnoise.
-3. Adaptive Spectral Noise Gating as fallback.
-4. Soft speech normalization.
+3. Adaptive noise gating as fallback.
 """
 
 import ctypes
 import ctypes.util
 import logging
 import os
-import platform
 import numpy as np
 from typing import Any, Optional, Tuple
 
@@ -43,6 +41,8 @@ class RNNoiseCTypesWrapper:
             ctypes.POINTER(ctypes.c_float),
         ]
         self.state = self.lib.rnnoise_create(None)
+        if not self.state:
+            raise RuntimeError('rnnoise_create returned a null state')
 
     def process_frame(self, in_floats: np.ndarray) -> Tuple[np.ndarray, float]:
         out_floats = np.zeros(480, dtype=np.float32)
@@ -58,6 +58,12 @@ class RNNoiseCTypesWrapper:
             except Exception:
                 pass
             self.state = None
+
+    def reset(self) -> None:
+        self.destroy()
+        self.state = self.lib.rnnoise_create(None)
+        if not self.state:
+            raise RuntimeError('rnnoise_create returned a null state')
 
     def __del__(self):
         self.destroy()
@@ -158,10 +164,8 @@ class AudioDenoiser:
         self.highpass = HighPassFilter(sample_rate=sample_rate, cutoff_hz=80.0)
         self._rnnoise_py: Optional[Any] = None
         self._rnnoise_ctypes: Optional[RNNoiseCTypesWrapper] = None
-        self.backend_name = 'disabled' if not enabled else 'spectral_gate'
+        self.backend_name = 'disabled' if not enabled else 'initializing'
 
-        self._frame_samples = 160 if sample_rate == 16000 else 480
-        self._input_buffer = bytearray()
         self._noise_floor = 100.0
 
         if self.enabled:
@@ -177,18 +181,21 @@ class AudioDenoiser:
             except Exception as e:
                 logger.warning('Failed to initialize pyrnnoise (%s); trying ctypes', e)
 
-        lib_path = _find_system_librnnoise()
+        # The raw C API only accepts native 48 kHz / 480-sample frames. The
+        # pyrnnoise wrapper above performs its own resampling for our normal
+        # 16 kHz Gemini stream; do not feed 16 kHz samples directly to C.
+        lib_path = _find_system_librnnoise() if self.sample_rate == 48000 else None
         if lib_path:
             try:
-                self._rnnoise_ctypes = RFNoiseCTypesWrapper(lib_path)
+                self._rnnoise_ctypes = RNNoiseCTypesWrapper(lib_path)
                 self.backend_name = f'librnnoise ({os.path.basename(lib_path)})'
                 logger.info('Initialized system librnnoise (%s) at %d Hz', lib_path, self.sample_rate)
                 return
             except Exception as e:
                 logger.warning('Failed to load system librnnoise (%s); falling back to DSP gate', e)
 
-        self.backend_name = 'highpass_spectral_gate'
-        logger.info('Using highpass + adaptive spectral gate for noise suppression at %d Hz', self.sample_rate)
+        self.backend_name = 'highpass_adaptive_gate'
+        logger.info('Using highpass + adaptive noise gate for noise suppression at %d Hz', self.sample_rate)
 
     def process(self, pcm16_bytes: bytes) -> bytes:
         if not self.enabled or not pcm16_bytes:
@@ -201,10 +208,28 @@ class AudioDenoiser:
 
         if self._rnnoise_py is not None:
             try:
-                denoised_samples = self._rnnoise_py.process(samples.astype(np.int16))
-                samples = np.asarray(denoised_samples, dtype=np.float32)
-            except Exception:
-                pass
+                # pyrnnoise's streaming API accepts [channels, samples] and
+                # yields one or more (speech_probability, audio) frames.
+                output_frames = []
+                mono_chunk = np.atleast_2d(samples.astype(np.int16))
+                for _, denoised_frame in self._rnnoise_py.denoise_chunk(mono_chunk):
+                    output_frames.append(
+                        np.asarray(denoised_frame, dtype=np.float32).reshape(-1)
+                    )
+                if not output_frames:
+                    # The wrapper may retain a partial native RNNoise frame.
+                    return b''
+                samples = np.concatenate(output_frames)
+            except Exception as exc:
+                # Never silently turn a failed neural backend into raw-audio
+                # passthrough. Log once, disable it, and use the fallback.
+                logger.exception(
+                    'pyrnnoise processing failed; switching to adaptive noise gate: %s',
+                    exc,
+                )
+                self._rnnoise_py = None
+                self.backend_name = 'highpass_adaptive_gate (pyrnnoise failed)'
+                samples = self._apply_adaptive_gate(samples)
 
         elif self._rnnoise_ctypes is not None:
             pad_len = (480 - (len(samples) % 480)) % 480
@@ -223,12 +248,12 @@ class AudioDenoiser:
             samples = denoised
 
         else:
-            samples = self._apply_spectral_gate(samples)
+            samples = self._apply_adaptive_gate(samples)
 
         clipped = np.clip(samples, -32768, 32767).astype(np.int16)
         return clipped.tobytes()
 
-    def _apply_spectral_gate(self, samples: np.ndarray) -> np.ndarray:
+    def _apply_adaptive_gate(self, samples: np.ndarray) -> np.ndarray:
         if len(samples) == 0:
             return samples
 
@@ -245,5 +270,14 @@ class AudioDenoiser:
 
     def reset(self) -> None:
         self.highpass.reset()
-        self._input_buffer.clear()
+        if self._rnnoise_py is not None:
+            try:
+                self._rnnoise_py.reset()
+            except Exception as exc:
+                logger.warning('Could not reset pyrnnoise state: %s', exc)
+        elif self._rnnoise_ctypes is not None:
+            try:
+                self._rnnoise_ctypes.reset()
+            except Exception as exc:
+                logger.warning('Could not reset librnnoise state: %s', exc)
         self._noise_floor = 100.0
