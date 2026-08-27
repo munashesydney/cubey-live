@@ -12,6 +12,7 @@ import sounddevice as sd
 from typing import Callable, Optional
 
 from src.audio.resample import convert_device_to_pcm16_mono
+from src.audio.denoise import AudioDenoiser
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,7 @@ class AudioRecorder:
         device_sample_rate: Optional[int] = None,
         device_channels: Optional[int] = None,
         device_dtype: Optional[str] = None,
+        enable_denoise: bool = True,
         on_level_change: Optional[Callable[[float], None]] = None,
         on_audio_chunk: Optional[Callable[[bytes], None]] = None
     ):
@@ -40,6 +42,10 @@ class AudioRecorder:
         self.device_channels = device_channels or channels
         self.device_dtype = device_dtype or 'int16'
         self.bytes_per_sample = 4 if self.device_dtype.lower().strip() in ("int32", "s32", "s32_le", "float32", "f32") else 2
+
+        self.denoiser = AudioDenoiser(
+            sample_rate=self.sample_rate, enabled=enable_denoise
+        )
 
         # Run the hardware callback at 10 ms for low device latency, then
         # aggregate into the configured 20 ms Gemini packet size below.
@@ -160,6 +166,8 @@ class AudioRecorder:
 
     def clear_queue(self) -> None:
         """Discard stale captured audio between sessions."""
+        if hasattr(self, 'denoiser') and self.denoiser:
+            self.denoiser.reset()
         while True:
             try:
                 self.audio_queue.get_nowait()
@@ -187,6 +195,9 @@ class AudioRecorder:
             source_channels=self.device_channels,
             source_dtype=self.device_dtype,
         )
+
+        if self.denoiser is not None and not self.is_muted:
+            converted = self.denoiser.process(converted)
 
         if self.is_muted:
             # Send silent PCM frame if muted

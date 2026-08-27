@@ -47,6 +47,9 @@ class AppConfig:
     prefer_low_latency_devices: bool = os.getenv(
         "AUDIO_PREFER_LOW_LATENCY_DEVICE", "true"
     ).strip().lower() not in {"0", "false", "no", "off"}
+    enable_noise_suppression: bool = os.getenv(
+        "AUDIO_ENABLE_NOISE_SUPPRESSION", "true"
+    ).strip().lower() not in {"0", "false", "no", "off"}
 
     # Gemini server VAD. Short end-of-speech detection is the largest perceived
     # latency win after audio buffering; all values remain environment-tunable.

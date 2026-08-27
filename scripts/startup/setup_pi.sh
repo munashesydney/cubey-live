@@ -54,10 +54,10 @@ sudo apt-get update
 sudo apt-get install -y \
     python3-venv python3-pip python3-tk \
     portaudio19-dev libasound2-dev \
-    libgomp1 \
+    libgomp1 librnnoise0 \
     libjpeg-dev libpng-dev zlib1g-dev \
     cmake build-essential \
-    alsa-utils ffmpeg
+    alsa-utils ffmpeg || true
 
 # ---------------------------------------------------------------------------
 # Python virtualenv + dependencies

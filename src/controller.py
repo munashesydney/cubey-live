@@ -130,6 +130,7 @@ class ApplicationController:
             device_sample_rate=input_device.sample_rate,
             device_channels=input_device.channels,
             device_dtype=input_device.dtype,
+            enable_denoise=self.config.enable_noise_suppression,
             on_level_change=self._on_mic_level_changed,
         )
 
