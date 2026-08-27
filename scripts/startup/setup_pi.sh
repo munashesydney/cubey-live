@@ -60,7 +60,7 @@ sudo apt-get install -y \
     libgomp1 librnnoise0 \
     libjpeg-dev libpng-dev zlib1g-dev \
     cmake build-essential \
-    alsa-utils ffmpeg || true
+    alsa-utils ffmpeg
 
 # ---------------------------------------------------------------------------
 # Python virtualenv + dependencies

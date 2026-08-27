@@ -32,12 +32,16 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-for command_name in systemctl pactl; do
-    if ! command -v "${command_name}" >/dev/null 2>&1; then
-        echo "ERROR: ${command_name} is missing. Run scripts/startup/setup_pi.sh first." >&2
-        exit 1
-    fi
-done
+if ! command -v systemctl >/dev/null 2>&1; then
+    echo "ERROR: systemctl is missing; Raspberry Pi OS with systemd is required." >&2
+    exit 1
+fi
+
+if ! command -v pactl >/dev/null 2>&1; then
+    echo "ERROR: pactl is missing (the pulseaudio-utils package was not installed)." >&2
+    echo "Install it with: sudo apt-get install -y pulseaudio-utils" >&2
+    exit 1
+fi
 
 if [[ ! -f "${SOURCE_CONFIG}" ]]; then
     echo "ERROR: PipeWire configuration template is missing: ${SOURCE_CONFIG}" >&2
