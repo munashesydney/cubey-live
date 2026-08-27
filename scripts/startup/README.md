@@ -9,6 +9,7 @@ One-shot bootstrap for running Cubey on a fresh Raspberry Pi.
 | `setup_pi.sh` | Installs everything: system packages, Python deps, `.env`, DB migrations, local models, boot autostart. Idempotent. |
 | `run.sh` | Starts Cubey with the project virtualenv (manual start). |
 | `cubey.service` | systemd unit template installed by `setup_pi.sh` for boot autostart. |
+| `../audio/setup_pipewire_aec.sh` | Installs and verifies PipeWire/WebRTC acoustic echo cancellation. |
 
 ## Prerequisites
 
@@ -29,13 +30,14 @@ bash scripts/startup/setup_pi.sh
 The script will:
 
 1. Install system packages (`python3-venv`, `python3-tk`, PortAudio/ALSA,
-   Pillow build deps, `alsa-utils`, `ffmpeg`).
+   Pillow build deps, PipeWire/WebRTC AEC, `alsa-utils`, `ffmpeg`).
 2. Create a virtualenv at `.venv` and `pip install -r requirements.txt`.
 3. Create `.env` from `env.example` and prompt for `GEMINI_API_KEY`.
 4. Run `alembic upgrade head` to create `data/cubey.db`.
 5. Pre-download the embedding model (`fastembed`) and Local LLM (`Qwen 2B GGUF`).
-6. Print the detected audio devices.
-7. Install and start the `cubey.service` systemd unit (boot autostart).
+6. Install and verify Cubey's echo-cancelled virtual microphone and speaker.
+7. Print the detected audio devices.
+8. Install and start the `cubey.service` systemd unit (boot autostart).
 
 ### Options
 
@@ -64,6 +66,14 @@ journalctl -u cubey -n 50            # recent logs
 - **Wrong audio device** (e.g. HDMI instead of the headphone jack): run
   `sudo raspi-config` → System Options → Audio, or set it with
   `amixer cset numid=3 <n>` / `speaker-test`.
+- **AEC endpoint unavailable** — while logged into Cubey's desktop user, run
+  `bash scripts/audio/setup_pipewire_aec.sh`, then restart Cubey. Verify the
+  virtual devices with `pactl get-source-volume cubey_echo_cancel_source` and
+  `pactl get-sink-volume cubey_echo_cancel_sink`.
+- **Cubey starts hearing itself again** — check
+  `journalctl --user -u pipewire -n 80`. Cubey intentionally refuses to open
+  a Live session when AEC is enabled but the WebRTC graph or PortAudio Pulse
+  bridge is unavailable.
 - **GUI won't start under systemd** — the service assumes the desktop session
   is on `DISPLAY=:0` and that your user has a logged-in session. If you use a
   different display number, edit `/etc/systemd/system/cubey.service`

@@ -51,6 +51,23 @@ class AppConfig:
         "AUDIO_ENABLE_NOISE_SUPPRESSION", "true"
     ).strip().lower() not in {"0", "false", "no", "off"}
 
+    # Full-duplex acoustic echo cancellation on Raspberry Pi. The setup
+    # script creates these PipeWire/WebRTC virtual endpoints. Cubey connects
+    # through the PulseAudio compatibility device so PULSE_SOURCE/PULSE_SINK
+    # can route only this process without changing the desktop defaults.
+    enable_echo_cancellation: bool = os.getenv(
+        "AUDIO_ENABLE_ECHO_CANCELLATION", "false"
+    ).strip().lower() not in {"0", "false", "no", "off"}
+    echo_cancel_source: str = os.getenv(
+        "AUDIO_ECHO_CANCEL_SOURCE", "cubey_echo_cancel_source"
+    )
+    echo_cancel_sink: str = os.getenv(
+        "AUDIO_ECHO_CANCEL_SINK", "cubey_echo_cancel_sink"
+    )
+    echo_cancel_host_device: str = os.getenv(
+        "AUDIO_ECHO_CANCEL_HOST_DEVICE", "pulse"
+    )
+
     # Gemini server VAD. Short end-of-speech detection is the largest perceived
     # latency win after audio buffering; all values remain environment-tunable.
     vad_prefix_padding_ms: int = int(os.getenv("GEMINI_VAD_PREFIX_MS", "20"))

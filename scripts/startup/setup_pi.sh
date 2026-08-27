@@ -54,6 +54,9 @@ sudo apt-get update
 sudo apt-get install -y \
     python3-venv python3-pip python3-tk \
     portaudio19-dev libasound2-dev \
+    pipewire pipewire-pulse wireplumber \
+    libpipewire-0.3-modules libspa-0.2-modules \
+    libasound2-plugins pulseaudio-utils \
     libgomp1 librnnoise0 \
     libjpeg-dev libpng-dev zlib1g-dev \
     cmake build-essential \
@@ -132,6 +135,13 @@ print(f"Downloading {filename} from {repo_id} to {models_dir} (this is ~1.4GB an
 hf_hub_download(repo_id=repo_id, filename=filename, local_dir=models_dir, local_dir_use_symlinks=False)
 print("Local LLM model ready.")
 PY
+
+# ---------------------------------------------------------------------------
+# PipeWire / WebRTC acoustic echo cancellation
+# ---------------------------------------------------------------------------
+echo "==> Configuring PipeWire WebRTC acoustic echo cancellation..."
+bash "${PROJECT_ROOT}/scripts/audio/setup_pipewire_aec.sh" \
+    --env "${PROJECT_ROOT}/.env"
 
 # ---------------------------------------------------------------------------
 # Audio sanity check

@@ -12,6 +12,10 @@ from src.config import config
 from src.audio.recorder import AudioRecorder
 from src.audio.player import AudioPlayer
 from src.audio.devices import select_audio_device
+from src.audio.echo_cancel import (
+    EchoCancellationUnavailable,
+    prepare_pipewire_echo_cancellation,
+)
 from src.client.live_client import GeminiLiveClient
 from src.db import (
     ConversationSource,
@@ -92,24 +96,56 @@ class ApplicationController:
         ).start()
 
         # 2. Create audio pipeline components
+        input_device_name = self.config.input_device
+        output_device_name = self.config.output_device
+        explicit_sample_rate = self.config.device_sample_rate
+        explicit_channels = self.config.device_channels
+        explicit_dtype = self.config.device_dtype
+
+        if self.config.enable_echo_cancellation:
+            routing = prepare_pipewire_echo_cancellation(
+                source_name=self.config.echo_cancel_source,
+                sink_name=self.config.echo_cancel_sink,
+                host_device=self.config.echo_cancel_host_device,
+            )
+            if input_device_name or output_device_name:
+                logger.info(
+                    "AEC enabled; ignoring direct AUDIO_INPUT_DEVICE/AUDIO_OUTPUT_DEVICE overrides"
+                )
+            input_device_name = routing.host_device
+            output_device_name = routing.host_device
+            # Raw I2S overrides describe the physical devices. PipeWire owns
+            # those now and negotiates the virtual stream formats itself.
+            explicit_sample_rate = 0
+            explicit_channels = 0
+            explicit_dtype = ""
+
         input_device = select_audio_device(
             "input",
             self.config.input_sample_rate,
-            self.config.input_device,
+            input_device_name,
             self.config.prefer_low_latency_devices,
-            explicit_sample_rate=self.config.device_sample_rate,
-            explicit_channels=self.config.device_channels,
-            explicit_dtype=self.config.device_dtype,
+            explicit_sample_rate=explicit_sample_rate,
+            explicit_channels=explicit_channels,
+            explicit_dtype=explicit_dtype,
         )
         output_device = select_audio_device(
             "output",
             self.config.output_sample_rate,
-            self.config.output_device,
+            output_device_name,
             self.config.prefer_low_latency_devices,
-            explicit_sample_rate=self.config.device_sample_rate,
-            explicit_channels=self.config.device_channels,
-            explicit_dtype=self.config.device_dtype,
+            explicit_sample_rate=explicit_sample_rate,
+            explicit_channels=explicit_channels,
+            explicit_dtype=explicit_dtype,
         )
+        if self.config.enable_echo_cancellation and (
+            input_device.device is None or output_device.device is None
+        ):
+            raise EchoCancellationUnavailable(
+                "PipeWire AEC endpoints exist, but PortAudio's 'pulse' bridge "
+                "is unavailable. Install libasound2-plugins and rerun "
+                "scripts/audio/setup_pipewire_aec.sh."
+            )
         self.player = AudioPlayer(
             sample_rate=self.config.output_sample_rate,
             channels=self.config.channels,
