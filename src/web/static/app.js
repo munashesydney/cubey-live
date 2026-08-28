@@ -99,10 +99,22 @@
   // WebSocket Live Stream Connection
   // ------------------------------------------------------------------------
 
-  function connectWebSocket() {
+  async function connectWebSocket() {
+    let token = "";
+    try {
+      const res = await fetch("/api/auth/token");
+      if (res.ok) {
+        const data = await res.json();
+        token = data.token || "";
+      }
+    } catch (e) {
+      console.warn("Could not fetch auth token:", e);
+    }
+
     const loc = window.location;
     const proto = loc.protocol === "https:" ? "wss:" : "ws:";
-    const wsUrl = `${proto}//${loc.host}/ws/live_map`;
+    const tokenParam = token ? `?token=${encodeURIComponent(token)}` : "";
+    const wsUrl = `${proto}//${loc.host}/ws/live_map${tokenParam}`;
 
     ws = new WebSocket(wsUrl);
 

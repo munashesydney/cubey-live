@@ -144,6 +144,16 @@ class MappingService:
         """Enable active SLAM map updates from incoming LiDAR scans."""
         with self._lock:
             self.is_mapping = True
+
+        # Ensure LiDAR hardware is connected and active
+        try:
+            if not self.lidar_service.is_connected:
+                self.lidar_service.connect()
+            if not self.lidar_service.is_scanning:
+                self.lidar_service.start_scan()
+        except Exception as e:
+            logger.warning("Could not auto-start LiDAR for mapping: %s", e)
+
         logger.info("2D House Mapping session started.")
 
     def pause_mapping(self) -> None:

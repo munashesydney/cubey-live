@@ -97,6 +97,12 @@ class SaveMapRequest(BaseModel):
 # REST Endpoints
 # ---------------------------------------------------------------------------
 
+@app.get("/api/auth/token")
+async def get_websocket_token(_: str = Depends(verify_credentials)):
+    """Return WebSocket connection token for authenticated browser sessions."""
+    return {"token": config.web_password or "cubey"}
+
+
 @app.get("/api/status")
 async def get_system_status(_: str = Depends(verify_credentials)):
     """Return robot battery, motion state, LiDAR telemetry, and SLAM pose."""
@@ -270,27 +276,35 @@ async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(
       compressed grid, and telemetry.
     - Client -> Server: Teleoperation driving commands (joystick / WASD keys).
     """
-    # Verify auth token if configured
-    if config.web_password and not check_auth_token(token):
-        # Fallback to Basic Auth header if query token omitted
+    # Verify auth token, cookie, or basic auth header
+    expected_pass = config.web_password or "cubey"
+    cookie_token = websocket.cookies.get("cubey_auth")
+
+    is_authenticated = False
+    if token and secrets.compare_digest(token, expected_pass):
+        is_authenticated = True
+    elif cookie_token and secrets.compare_digest(cookie_token, expected_pass):
+        is_authenticated = True
+    else:
+        # Fallback to Basic Auth header
         headers = dict(websocket.headers)
         auth_header = headers.get("authorization", "")
         if auth_header.startswith("Basic "):
             try:
                 raw = base64.b64decode(auth_header[6:]).decode("utf-8")
                 user, pwd = raw.split(":", 1)
-                if not (
+                if (
                     secrets.compare_digest(user, config.web_username or "admin")
-                    and secrets.compare_digest(pwd, config.web_password or "cubey")
+                    and secrets.compare_digest(pwd, expected_pass)
                 ):
-                    await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-                    return
+                    is_authenticated = True
             except Exception:
-                await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-                return
-        else:
-            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-            return
+                pass
+
+    if config.web_password and not is_authenticated:
+        logger.warning("Rejected unauthenticated WebSocket connection attempt.")
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
 
     await ws_manager.connect(websocket)
     mapping_svc = get_mapping_service()
@@ -382,8 +396,15 @@ if STATIC_DIR.exists():
 
     @app.get("/")
     async def serve_index(_: str = Depends(verify_credentials)):
-        """Serve the main single-page web app."""
+        """Serve the main single-page web app and set session cookie."""
         index_path = STATIC_DIR / "index.html"
         if index_path.exists():
-            return FileResponse(index_path)
+            response = FileResponse(index_path)
+            response.set_cookie(
+                key="cubey_auth",
+                value=config.web_password or "cubey",
+                httponly=True,
+                samesite="lax",
+            )
+            return response
         return {"message": "Cubey Web Interface is running. Place index.html in src/web/static."}
