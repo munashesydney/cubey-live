@@ -1,16 +1,31 @@
 """
 High-performance, non-blocking camera video capture service.
-Supports native Raspberry Pi 5 libcamera/PiSP via Picamera2, standard OpenCV (USB/Windows),
-and synthetic test-pattern fallback.
+Supports:
+1. Native Raspberry Pi Picamera2 libcamera/PiSP backend.
+2. Native rpicam-vid / libcamera-vid hardware MJPEG stream subprocess.
+3. Standard OpenCV V4L2 / DirectShow (USB webcams / Windows).
+4. Fallback animated synthetic test pattern.
 """
 
+import io
 import logging
+import os
 import platform
+import shutil
+import subprocess
+import sys
 import threading
 import time
 from typing import Any, Callable, Optional
 import numpy as np
 from PIL import Image
+
+# Automatically add Debian / Raspberry Pi OS system dist-packages to sys.path
+# so Picamera2 / libcamera can be loaded inside virtual environments (.venv).
+if platform.system() == "Linux":
+    for p in ("/usr/lib/python3/dist-packages", "/usr/local/lib/python3/dist-packages"):
+        if p not in sys.path and os.path.exists(p):
+            sys.path.append(p)
 
 try:
     import cv2
@@ -43,6 +58,7 @@ class CameraService:
         self._lock = threading.Lock()
         self._cap: Optional[Any] = None
         self._picam: Optional[Any] = None
+        self._rpicam_process: Optional[subprocess.Popen] = None
         self._active_backend: str = "none"
         self._using_test_pattern = False
         self._ready_event = threading.Event()
@@ -80,7 +96,7 @@ class CameraService:
 
     @property
     def active_backend(self) -> str:
-        """Return the active camera backend: 'picamera2', 'opencv', or 'synthetic'."""
+        """Return active backend: 'picamera2', 'rpicam_vid', 'opencv', or 'synthetic'."""
         return self._active_backend
 
     def add_preview_listener(self, callback: Callable[[Image.Image], None]) -> None:
@@ -147,6 +163,18 @@ class CameraService:
             self._is_running = False
             self._ready_event.clear()
 
+        # Terminate rpicam-vid subprocess if running
+        if self._rpicam_process is not None:
+            try:
+                self._rpicam_process.terminate()
+                self._rpicam_process.wait(timeout=1.0)
+            except Exception:
+                try:
+                    self._rpicam_process.kill()
+                except Exception:
+                    pass
+            self._rpicam_process = None
+
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=1.5)
         self._thread = None
@@ -202,12 +230,17 @@ class CameraService:
         Return the latest frame compressed as JPEG bytes.
         Suitable for sending to Gemini Multimodal Live API.
         """
-        q = quality if quality is not None else self.jpeg_quality
         with self._lock:
-            if not self._is_running or self._latest_bgr is None:
+            if not self._is_running:
+                return None
+            # Return pre-encoded JPEG if available and default quality
+            if quality is None and self._latest_jpeg is not None:
+                return self._latest_jpeg
+            if self._latest_bgr is None:
                 return None
             bgr_copy = self._latest_bgr.copy()
 
+        q = quality if quality is not None else self.jpeg_quality
         if cv2 is not None:
             try:
                 encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), q]
@@ -221,7 +254,6 @@ class CameraService:
         try:
             rgb = cv2.cvtColor(bgr_copy, cv2.COLOR_BGR2RGB) if cv2 else bgr_copy
             pil_img = Image.fromarray(rgb)
-            import io
             bio = io.BytesIO()
             pil_img.save(bio, format="JPEG", quality=q)
             return bio.getvalue()
@@ -244,7 +276,7 @@ class CameraService:
 
         try:
             logger.info("Attempting to initialize native Picamera2 libcamera/PiSP backend...")
-            picam = Picamera2(camera_num=self.device_index)
+            picam = Picamera2(self.device_index)
             # Configure hardware preview stream in BGR888 format
             camera_config = picam.create_preview_configuration(
                 main={"format": "BGR888", "size": (self.width, self.height)},
@@ -261,8 +293,55 @@ class CameraService:
             )
             return True
         except Exception as e:
-            logger.info("Picamera2 backend not available: %s", e)
-            self._picam = None
+            logger.info("Picamera2 backend failed to initialize: %s", e)
+            if hasattr(self, "_picam") and self._picam is not None:
+                try:
+                    self._picam.close()
+                except Exception:
+                    pass
+                self._picam = None
+
+        return False
+
+    def _open_rpicam_vid(self) -> bool:
+        """Attempt to stream MJPEG directly from native rpicam-vid / libcamera-vid binary."""
+        rpicam_bin = shutil.which("rpicam-vid") or shutil.which("libcamera-vid")
+        if not rpicam_bin:
+            return False
+
+        cmd = [
+            rpicam_bin,
+            "-t", "0",
+            "--camera", str(self.device_index),
+            "--width", str(self.width),
+            "--height", str(self.height),
+            "--framerate", str(self.target_fps),
+            "--codec", "mjpeg",
+            "--quality", str(self.jpeg_quality),
+            "-o", "-",
+            "-n",
+            "--inline",
+        ]
+
+        try:
+            logger.info("Launching native Raspberry Pi hardware stream: %s", " ".join(cmd[:6]))
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                bufsize=1024 * 64,
+            )
+            time.sleep(0.3)
+            if proc.poll() is None:
+                self._rpicam_process = proc
+                self._active_backend = "rpicam_vid"
+                self._using_test_pattern = False
+                logger.info("✓ Opened native rpicam-vid hardware MJPEG stream.")
+                return True
+            else:
+                proc.kill()
+        except Exception as e:
+            logger.info("rpicam-vid launcher failed: %s", e)
 
         return False
 
@@ -295,13 +374,16 @@ class CameraService:
         return False
 
     def _open_camera(self) -> bool:
-        """Attempt to open hardware camera: Picamera2 first (Pi 5 / CSI), then OpenCV (USB/Windows)."""
-        # 1. Try native Picamera2 on Linux / Raspberry Pi
-        if platform.system() == "Linux" and Picamera2 is not None:
+        """Attempt to open hardware camera across all platforms with fallback hierarchy."""
+        # 1. On Linux / Pi 5: Try Picamera2
+        if platform.system() == "Linux":
             if self._open_picamera2():
                 return True
+            # 2. Try rpicam-vid / libcamera-vid CLI pipe
+            if self._open_rpicam_vid():
+                return True
 
-        # 2. Try OpenCV (USB webcam or Windows DirectShow)
+        # 3. Try standard OpenCV (USB webcams, Windows, macOS)
         if self._open_opencv():
             return True
 
@@ -318,13 +400,41 @@ class CameraService:
         self._ready_event.set()
         frame_interval = 1.0 / max(1, self.target_fps)
         sim_angle = 0.0
+        mjpeg_buffer = bytearray()
 
         while self._is_running:
             loop_start = time.perf_counter()
             bgr_frame: Optional[np.ndarray] = None
+            jpeg_data: Optional[bytes] = None
 
-            # 1. Read frame from Picamera2 if active
-            if self._picam is not None:
+            # 1. Read frame from rpicam-vid MJPEG pipe if active
+            if self._rpicam_process is not None and self._rpicam_process.stdout:
+                try:
+                    while self._is_running:
+                        chunk = self._rpicam_process.stdout.read(4096)
+                        if not chunk:
+                            break
+                        mjpeg_buffer.extend(chunk)
+                        start = mjpeg_buffer.find(b"\xff\xd8")
+                        end = mjpeg_buffer.find(b"\xff\xd9")
+                        if start != -1 and end != -1 and end > start:
+                            jpeg_data = bytes(mjpeg_buffer[start : end + 2])
+                            mjpeg_buffer = mjpeg_buffer[end + 2 :]
+                            if cv2 is not None:
+                                bgr_frame = cv2.imdecode(
+                                    np.frombuffer(jpeg_data, np.uint8), cv2.IMREAD_COLOR
+                                )
+                            else:
+                                bio = io.BytesIO(jpeg_data)
+                                pil_tmp = Image.open(bio)
+                                bgr_frame = np.array(pil_tmp)[:, :, ::-1]
+                            break
+                except Exception as e:
+                    logger.warning("Error parsing rpicam-vid MJPEG stream: %s", e)
+                    bgr_frame = None
+
+            # 2. Read frame from Picamera2 if active
+            elif self._picam is not None:
                 try:
                     bgr_frame = self._picam.capture_array("main")
                 except Exception as e:
@@ -332,7 +442,7 @@ class CameraService:
                     has_camera = False
                     self._using_test_pattern = True
 
-            # 2. Read frame from OpenCV if active
+            # 3. Read frame from OpenCV if active
             elif has_camera and self._cap is not None:
                 try:
                     ret, frame = self._cap.read()
@@ -347,7 +457,7 @@ class CameraService:
                     has_camera = False
                     self._using_test_pattern = True
 
-            # 3. Fallback synthetic pattern if hardware frame is unavailable
+            # 4. Fallback synthetic pattern if hardware frame is unavailable
             if bgr_frame is None:
                 sim_angle = (sim_angle + 0.05) % (2 * 3.14159)
                 bgr_frame = self._generate_test_pattern_bgr(sim_angle)
@@ -363,6 +473,7 @@ class CameraService:
             with self._lock:
                 self._latest_bgr = bgr_frame
                 self._latest_rgb = rgb_frame
+                self._latest_jpeg = jpeg_data
                 self._latest_timestamp = now
                 self._frame_count += 1
 
@@ -387,6 +498,13 @@ class CameraService:
             time.sleep(sleep_time)
 
         # Cleanup backends upon worker exit
+        if self._rpicam_process is not None:
+            try:
+                self._rpicam_process.terminate()
+            except Exception:
+                pass
+            self._rpicam_process = None
+
         if self._picam is not None:
             try:
                 self._picam.stop()

@@ -461,9 +461,13 @@ class LivePage(ctk.CTkFrame):
                             (max(10, target_w), max(10, target_h)),
                             Image.Resampling.BILINEAR,
                         )
-                        self._preview_tk_img = ImageTk.PhotoImage(resized)
+                        self._preview_ctk_img = ctk.CTkImage(
+                            light_image=resized,
+                            dark_image=resized,
+                            size=(max(10, target_w), max(10, target_h)),
+                        )
                         self.video_label.configure(
-                            image=self._preview_tk_img,
+                            image=self._preview_ctk_img,
                             text="",
                         )
                 else:
