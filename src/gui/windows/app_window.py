@@ -12,6 +12,7 @@ from typing import Any, Callable, Optional
 from src.config import AppConfig
 from src.gui.event_bridge import GuiEventBridge
 from src.gui.pages.robot_face_page import RobotFacePage
+from src.gui.pages.startup_page import StartupPage
 from src.gui.windows.developer_window import DeveloperWindow
 from src.services.embeddings import EmbeddingService
 
@@ -39,6 +40,7 @@ class GeminiLiveApp(ctk.CTk):
         on_toggle_camera: Optional[Callable[[Optional[bool]], bool]] = None,
         on_set_camera_device: Optional[Callable[[int], None]] = None,
         on_send_snapshot: Optional[Callable[[Optional[str]], None]] = None,
+        show_startup_screen: bool = True,
     ):
         super().__init__()
         self.config = config
@@ -78,7 +80,17 @@ class GeminiLiveApp(ctk.CTk):
             target_fps=self.config.gui_face_fps,
             supersampling=self.config.gui_face_supersampling,
         )
-        self.robot_face.pack(fill="both", expand=True)
+
+        # Build Startup Screen if enabled; otherwise show Robot Face immediately
+        if show_startup_screen:
+            self.startup_page: Optional[StartupPage] = StartupPage(
+                self,
+                on_startup_complete=self.finish_startup,
+            )
+            self.startup_page.pack(fill="both", expand=True)
+        else:
+            self.startup_page = None
+            self.robot_face.pack(fill="both", expand=True)
 
         # Bind hotkeys & mouse triggers for Developer Console
         self.bind("<Key-d>", lambda e: self.toggle_developer_console())
@@ -129,6 +141,16 @@ class GeminiLiveApp(ctk.CTk):
     def post_vision_state(self, is_vision_active: bool) -> None:
         self._event_bridge.post("vision", is_vision_active, latest=True)
 
+    def post_startup_progress(
+        self, progress: float, status_text: str, active_step_index: Optional[int] = None
+    ) -> None:
+        self._event_bridge.post(
+            "startup_progress", progress, status_text, active_step_index, latest=True
+        )
+
+    def post_startup_complete(self) -> None:
+        self._event_bridge.post("startup_complete", latest=True)
+
     def _drain_gui_events(self) -> None:
         """Apply queued updates from the Tk main thread in bounded batches."""
         handlers = {
@@ -140,6 +162,8 @@ class GeminiLiveApp(ctk.CTk):
             "listening": self.set_listening_state,
             "battery": self.update_battery_state,
             "vision": self.set_vision_state,
+            "startup_progress": self.update_startup_progress,
+            "startup_complete": self.finish_startup,
         }
         log_messages: list[str] = []
         for event in self._event_bridge.drain(_GUI_EVENT_BATCH_SIZE):
@@ -156,6 +180,26 @@ class GeminiLiveApp(ctk.CTk):
         if log_messages:
             self.append_logs(log_messages)
         self.after(_GUI_EVENT_POLL_MS, self._drain_gui_events)
+
+    def update_startup_progress(
+        self, progress: float, status_text: str, active_step_index: Optional[int] = None
+    ) -> None:
+        """Update startup loading screen progress."""
+        if self.startup_page is not None and self.startup_page.winfo_exists():
+            self.startup_page.set_progress(progress, status_text, active_step_index)
+
+    def finish_startup(self) -> None:
+        """Transition from StartupPage to RobotFacePage."""
+        if self.startup_page is not None:
+            try:
+                self.startup_page.pack_forget()
+                self.startup_page.destroy()
+            except Exception as e:
+                logger.debug("Error tearing down StartupPage: %s", e)
+            self.startup_page = None
+
+        if hasattr(self, "robot_face") and not self.robot_face.winfo_ismapped():
+            self.robot_face.pack(fill="both", expand=True)
 
     def toggle_developer_console(self) -> None:
         """Open or focus the Developer Control Window."""

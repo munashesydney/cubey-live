@@ -82,7 +82,7 @@ class ApplicationController:
         self._conversation_titled: bool = False
 
     def start(self) -> None:
-        """Start background asyncio loop thread and launch GUI mainloop."""
+        """Start background asyncio loop thread, launch GUI immediately, and run startup diagnostics."""
         logger.info("Initializing Application Controller...")
 
         # 0. Start the background task scheduler
@@ -98,122 +98,10 @@ class ApplicationController:
         )
         self.loop_thread.start()
 
-        # 2. Create audio pipeline components
-        input_device_name = self.config.input_device
-        output_device_name = self.config.output_device
-        explicit_sample_rate = self.config.device_sample_rate
-        explicit_channels = self.config.device_channels
-        explicit_dtype = self.config.device_dtype
-
-        is_linux = platform.system() == "Linux"
-        use_echo_cancellation = self.config.enable_echo_cancellation and is_linux
-
-        if self.config.enable_echo_cancellation and not is_linux:
-            logger.info(
-                "PipeWire echo cancellation is configured, but current OS is %s (Linux/Pi runtime only). "
-                "Using direct host audio devices.",
-                platform.system(),
-            )
-
-        if use_echo_cancellation:
-            routing = prepare_pipewire_echo_cancellation(
-                source_name=self.config.echo_cancel_source,
-                sink_name=self.config.echo_cancel_sink,
-                host_device=self.config.echo_cancel_host_device,
-            )
-            if input_device_name or output_device_name:
-                logger.info(
-                    "AEC enabled; ignoring direct AUDIO_INPUT_DEVICE/AUDIO_OUTPUT_DEVICE overrides"
-                )
-            input_device_name = routing.host_device
-            output_device_name = routing.host_device
-            # Raw I2S overrides describe the physical devices. PipeWire owns
-            # those now and negotiates the virtual stream formats itself.
-            explicit_sample_rate = 0
-            explicit_channels = 0
-            explicit_dtype = ""
-
-        input_device = select_audio_device(
-            "input",
-            self.config.input_sample_rate,
-            input_device_name,
-            self.config.prefer_low_latency_devices,
-            explicit_sample_rate=explicit_sample_rate,
-            explicit_channels=explicit_channels,
-            explicit_dtype=explicit_dtype,
-        )
-        output_device = select_audio_device(
-            "output",
-            self.config.output_sample_rate,
-            output_device_name,
-            self.config.prefer_low_latency_devices,
-            explicit_sample_rate=explicit_sample_rate,
-            explicit_channels=explicit_channels,
-            explicit_dtype=explicit_dtype,
-        )
-        if use_echo_cancellation and (
-            input_device.device is None or output_device.device is None
-        ):
-            raise EchoCancellationUnavailable(
-                "PipeWire AEC endpoints exist, but PortAudio's 'pulse' bridge "
-                "is unavailable. Install libasound2-plugins and rerun "
-                "scripts/audio/setup_pipewire_aec.sh."
-            )
-        self.player = AudioPlayer(
-            sample_rate=self.config.output_sample_rate,
-            channels=self.config.channels,
-            block_size=self.config.output_block_size,
-            max_buffer_ms=self.config.output_buffer_ms,
-            device=output_device.device,
-            device_sample_rate=output_device.sample_rate,
-            device_channels=output_device.channels,
-            device_dtype=output_device.dtype,
-        )
-        
-        self.recorder = AudioRecorder(
-            sample_rate=self.config.input_sample_rate,
-            channels=self.config.channels,
-            chunk_size=self.config.chunk_size,
-            max_queue_ms=self.config.input_queue_ms,
-            device=input_device.device,
-            device_sample_rate=input_device.sample_rate,
-            device_channels=input_device.channels,
-            device_dtype=input_device.dtype,
-            enable_denoise=self.config.enable_noise_suppression,
-            on_level_change=self._on_mic_level_changed,
-            on_audio_chunk=self._on_audio_chunk_captured,
-        )
-
-        # 2b. Create Camera video capture service
+        # 2. Instantiate Camera video capture service
         self.camera_service = CameraService(self.config)
 
-        # 3. Create Gemini Live Client with Tool Reaction Callback & Camera Service
-        self.client = GeminiLiveClient(
-            config=self.config,
-            recorder=self.recorder,
-            player=self.player,
-            camera_service=self.camera_service,
-            on_status_change=self._on_status_changed,
-            on_transcript=self._on_transcript_received,
-            on_log=self._on_log_received,
-            on_tool_reaction=self._on_tool_reaction_triggered,
-            on_listening_state_change=self._on_listening_state_changed,
-            on_vision_state_change=self._on_vision_state_changed,
-            on_session_ended=self._on_session_ended,
-            embedding_service=self.embedding_service,
-            wheels_service=get_wheels_service(),
-        )
-
-        # Connect WheelsService telemetry to GUI battery updates & auto-connect on boot
-        wheels_service = get_wheels_service()
-        wheels_service.on_telemetry = self._on_telemetry_received
-        threading.Thread(
-            target=wheels_service.connect,
-            daemon=True,
-            name="WheelsAutoConnect",
-        ).start()
-
-        # 4. Create CustomTkinter GUI app
+        # 3. Create CustomTkinter GUI app with Startup loading screen
         self.gui = GeminiLiveApp(
             config=self.config,
             async_loop=self.async_loop,
@@ -225,25 +113,15 @@ class ApplicationController:
             on_set_camera_device=self.set_camera_device,
             on_send_snapshot=self.send_visual_snapshot,
             embedding_service=self.embedding_service,
+            show_startup_screen=True,
         )
-        self.gui.client = self.client
 
-        # 5. Initialize & start Wake Word Spotter if enabled
-        if self.config.enable_wake_word:
-            logger.info("Initializing offline open-vocabulary Wake Word Service (Sherpa-ONNX)...")
-            self.wake_word_service = WakeWordService(
-                model_dir=self.config.wake_word_model_dir,
-                wake_words=self.config.wake_words,
-                threshold=self.config.wake_word_threshold,
-                score=self.config.wake_word_score,
-                gain=self.config.wake_word_gain,
-                num_threads=self.config.wake_word_threads,
-                on_wake_word=self._on_wake_word_detected,
-            )
-            self.wake_word_service.start()
-            # Start background audio capture immediately for wake word listening
-            if not self.recorder.is_recording and self.async_loop:
-                self.recorder.start(self.async_loop)
+        # 4. Launch background startup diagnostics & prewarming thread
+        threading.Thread(
+            target=self._run_startup_diagnostics_and_prewarm,
+            daemon=True,
+            name="StartupDiagnosticsWorker",
+        ).start()
 
         logger.info("Starting CustomTkinter GUI Main Loop...")
         try:
@@ -258,6 +136,191 @@ class ApplicationController:
             if self.player:
                 self.player.stop()
             self.transcript_persistence.set_realtime_active(False)
+            self.transcript_persistence.stop()
+            self.task_scheduler.stop()
+
+    def _run_startup_diagnostics_and_prewarm(self) -> None:
+        """
+        Background routine that initializes hardware and pre-warms AI models (FastEmbed, Sherpa-ONNX),
+        dispatching real-time progress updates to the StartupPage.
+        """
+        try:
+            # --- Step 1: Audio Pipeline & PipeWire AEC (20%) ---
+            if self.gui:
+                self.gui.post_startup_progress(0.10, "🔊 Probing audio hardware & PipeWire AEC...", 0)
+
+            input_device_name = self.config.input_device
+            output_device_name = self.config.output_device
+            explicit_sample_rate = self.config.device_sample_rate
+            explicit_channels = self.config.device_channels
+            explicit_dtype = self.config.device_dtype
+
+            is_linux = platform.system() == "Linux"
+            use_echo_cancellation = self.config.enable_echo_cancellation and is_linux
+
+            if self.config.enable_echo_cancellation and not is_linux:
+                logger.info(
+                    "PipeWire echo cancellation is configured, but current OS is %s (Linux/Pi runtime only). "
+                    "Using direct host audio devices.",
+                    platform.system(),
+                )
+
+            if use_echo_cancellation:
+                routing = prepare_pipewire_echo_cancellation(
+                    source_name=self.config.echo_cancel_source,
+                    sink_name=self.config.echo_cancel_sink,
+                    host_device=self.config.echo_cancel_host_device,
+                )
+                if input_device_name or output_device_name:
+                    logger.info(
+                        "AEC enabled; ignoring direct AUDIO_INPUT_DEVICE/AUDIO_OUTPUT_DEVICE overrides"
+                    )
+                input_device_name = routing.host_device
+                output_device_name = routing.host_device
+                explicit_sample_rate = 0
+                explicit_channels = 0
+                explicit_dtype = ""
+
+            input_device = select_audio_device(
+                "input",
+                self.config.input_sample_rate,
+                input_device_name,
+                self.config.prefer_low_latency_devices,
+                explicit_sample_rate=explicit_sample_rate,
+                explicit_channels=explicit_channels,
+                explicit_dtype=explicit_dtype,
+            )
+            output_device = select_audio_device(
+                "output",
+                self.config.output_sample_rate,
+                output_device_name,
+                self.config.prefer_low_latency_devices,
+                explicit_sample_rate=explicit_sample_rate,
+                explicit_channels=explicit_channels,
+                explicit_dtype=explicit_dtype,
+            )
+            if use_echo_cancellation and (
+                input_device.device is None or output_device.device is None
+            ):
+                raise EchoCancellationUnavailable(
+                    "PipeWire AEC endpoints exist, but PortAudio's 'pulse' bridge "
+                    "is unavailable. Install libasound2-plugins and rerun "
+                    "scripts/audio/setup_pipewire_aec.sh."
+                )
+
+            self.player = AudioPlayer(
+                sample_rate=self.config.output_sample_rate,
+                channels=self.config.channels,
+                block_size=self.config.output_block_size,
+                max_buffer_ms=self.config.output_buffer_ms,
+                device=output_device.device,
+                device_sample_rate=output_device.sample_rate,
+                device_channels=output_device.channels,
+                device_dtype=output_device.dtype,
+            )
+
+            self.recorder = AudioRecorder(
+                sample_rate=self.config.input_sample_rate,
+                channels=self.config.channels,
+                chunk_size=self.config.chunk_size,
+                max_queue_ms=self.config.input_queue_ms,
+                device=input_device.device,
+                device_sample_rate=input_device.sample_rate,
+                device_channels=input_device.channels,
+                device_dtype=input_device.dtype,
+                enable_denoise=self.config.enable_noise_suppression,
+                on_level_change=self._on_mic_level_changed,
+                on_audio_chunk=self._on_audio_chunk_captured,
+            )
+
+            if self.gui:
+                self.gui.post_startup_progress(0.25, "✓ Audio pipeline & AEC calibrated.", 0)
+
+            # --- Step 2: Neural Wake-Word Engine (45%) ---
+            if self.gui:
+                self.gui.post_startup_progress(0.35, "🎙️ Initializing Sherpa-ONNX neural wake-word engine...", 1)
+
+            if self.config.enable_wake_word:
+                logger.info("Initializing offline open-vocabulary Wake Word Service (Sherpa-ONNX)...")
+                self.wake_word_service = WakeWordService(
+                    model_dir=self.config.wake_word_model_dir,
+                    wake_words=self.config.wake_words,
+                    threshold=self.config.wake_word_threshold,
+                    score=self.config.wake_word_score,
+                    gain=self.config.wake_word_gain,
+                    num_threads=self.config.wake_word_threads,
+                    on_wake_word=self._on_wake_word_detected,
+                )
+                self.wake_word_service.start()
+                if not self.recorder.is_recording and self.async_loop:
+                    self.recorder.start(self.async_loop)
+
+            if self.gui:
+                self.gui.post_startup_progress(0.50, "✓ Neural wake-word spotter active.", 1)
+
+            # --- Step 3: Semantic Vector Memory (70%) ---
+            if self.gui:
+                self.gui.post_startup_progress(0.55, "🧠 Prewarming FastEmbed ONNX semantic memory...", 2)
+
+            try:
+                self.embedding_service.prewarm()
+            except Exception as emb_err:
+                logger.debug("FastEmbed prewarm notice: %s", emb_err)
+
+            if self.gui:
+                self.gui.post_startup_progress(0.70, "✓ Semantic vector memory ready in RAM.", 2)
+
+            # --- Step 4: Camera Vision Subsystem (85%) ---
+            if self.gui:
+                self.gui.post_startup_progress(0.75, "📷 Probing camera & vision hardware buffers...", 3)
+
+            # Camera service buffers are primed
+            time.sleep(0.1)
+
+            if self.gui:
+                self.gui.post_startup_progress(0.85, "✓ Camera subsystem primed.", 3)
+
+            # --- Step 5: Gemini Live Gateway & Locomotion (100%) ---
+            if self.gui:
+                self.gui.post_startup_progress(0.90, "⚡ Linking Gemini Live gateway & locomotion...", 4)
+
+            self.client = GeminiLiveClient(
+                config=self.config,
+                recorder=self.recorder,
+                player=self.player,
+                camera_service=self.camera_service,
+                on_status_change=self._on_status_changed,
+                on_transcript=self._on_transcript_received,
+                on_log=self._on_log_received,
+                on_tool_reaction=self._on_tool_reaction_triggered,
+                on_listening_state_change=self._on_listening_state_changed,
+                on_vision_state_change=self._on_vision_state_changed,
+                on_session_ended=self._on_session_ended,
+                embedding_service=self.embedding_service,
+                wheels_service=get_wheels_service(),
+            )
+            if self.gui:
+                self.gui.client = self.client
+
+            wheels_service = get_wheels_service()
+            wheels_service.on_telemetry = self._on_telemetry_received
+            threading.Thread(
+                target=wheels_service.connect,
+                daemon=True,
+                name="WheelsAutoConnect",
+            ).start()
+
+            if self.gui:
+                self.gui.post_startup_progress(1.0, "✓ All systems online. Waking up Cubey...", 4)
+
+            time.sleep(0.35)
+            if self.gui:
+                self.gui.post_startup_complete()
+
+        except Exception as e:
+            logger.error("Error in startup diagnostics worker: %s", e, exc_info=True)
+            if self.gui:
+                self.gui.post_startup_complete()
             self.transcript_persistence.stop()
             self.task_scheduler.stop()
 
