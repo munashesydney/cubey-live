@@ -53,6 +53,10 @@ class AppConfig:
     gui_fullscreen: bool = os.getenv(
         "GUI_FULLSCREEN", "true"
     ).strip().lower() not in {"0", "false", "no", "off"}
+    # Raspberry Pi-friendly face rendering. Animation physics remain time
+    # compensated, so reducing FPS lowers CPU without slowing reactions.
+    gui_face_fps: int = int(os.getenv("GUI_FACE_FPS", "30"))
+    gui_face_supersampling: int = int(os.getenv("GUI_FACE_SUPERSAMPLING", "2"))
 
     # Full-duplex acoustic echo cancellation on Raspberry Pi. The setup
     # script creates these PipeWire/WebRTC virtual endpoints. Cubey connects

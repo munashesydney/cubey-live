@@ -1,11 +1,13 @@
 """
 Cubeo Robot Face page.
-High-performance 2x Super-Sampled PIL Anti-Aliased Graphics Engine rendering silky smooth,
+High-performance 2x super-sampled PIL anti-aliased graphics engine rendering smooth,
 expressive EMO-style robot eyes with Bezier crescent arcs, slanted trapezoid morphs,
 and 3D perspective transformations.
 """
 
 import math
+import logging
+import time
 import tkinter as tk
 import customtkinter as ctk
 from PIL import Image, ImageDraw, ImageTk
@@ -13,12 +15,30 @@ from typing import Callable, Optional
 
 from src.gui.pages.animations import EyeAnimationEngine
 
+logger = logging.getLogger(__name__)
+
 class RobotFacePage(ctk.CTkFrame):
     """Page displaying Cubeo's animated OLED robot face with 2x SSAA anti-aliased Pillow rendering."""
 
-    def __init__(self, master, on_open_developer_console: Optional[Callable[[], None]] = None, **kwargs):
+    def __init__(
+        self,
+        master,
+        on_open_developer_console: Optional[Callable[[], None]] = None,
+        target_fps: int = 30,
+        supersampling: int = 2,
+        **kwargs,
+    ):
         super().__init__(master, fg_color="#0A0A0F", corner_radius=0, **kwargs)
         self.on_open_developer_console = on_open_developer_console
+        self.target_fps = max(15, min(int(target_fps), 60))
+        self.supersampling = max(1, min(int(supersampling), 3))
+        self._frame_interval = 1.0 / self.target_fps
+        self._last_frame_at = time.perf_counter()
+        logger.info(
+            "Robot face renderer configured for %d FPS at %dx supersampling",
+            self.target_fps,
+            self.supersampling,
+        )
 
         # Base expressive EMO eye dimensions (Large & Prominent)
         self.base_eye_width = 160
@@ -29,6 +49,7 @@ class RobotFacePage(ctk.CTkFrame):
 
         # Image cache reference for Tkinter Garbage Collector
         self._tk_img: Optional[ImageTk.PhotoImage] = None
+        self._canvas_image_id: Optional[int] = None
 
         # Create 100% full-bleed drawing canvas
         self.canvas = tk.Canvas(
@@ -57,7 +78,7 @@ class RobotFacePage(ctk.CTkFrame):
         )
         self.dev_btn.place(relx=0.98, rely=0.96, anchor="se")
 
-        # Start blink timer and main 60 FPS animation loop
+        # Start blink timer and the CPU-bounded animation loop.
         self._schedule_random_blink()
         self._animation_loop()
 
@@ -82,9 +103,15 @@ class RobotFacePage(ctk.CTkFrame):
         self._schedule_random_blink()
 
     def _animation_loop(self) -> None:
-        """Main 60 FPS animation loop advancing animation engine frame."""
-        self.animation_engine.update_animation_frame()
-        self.after(16, self._animation_loop)
+        """Advance time-correct animation at a Pi-friendly render cadence."""
+        frame_started = time.perf_counter()
+        elapsed = max(1 / 120, min(frame_started - self._last_frame_at, 0.1))
+        self._last_frame_at = frame_started
+        self.animation_engine.update_animation_frame(frame_scale=elapsed * 60.0)
+
+        render_time = time.perf_counter() - frame_started
+        delay_ms = max(1, round((self._frame_interval - render_time) * 1000))
+        self.after(delay_ms, self._animation_loop)
 
     def _draw_face(self) -> None:
         """Render ultra-fast, smooth PIL image of EMO eyes onto canvas at native resolution."""
@@ -95,7 +122,9 @@ class RobotFacePage(ctk.CTkFrame):
             return
 
         # Create PIL native-resolution canvas with OLED pitch black background
-        pil_img = Image.new("RGBA", (w, h), (10, 10, 15, 255))
+        # The full-screen background is opaque; RGB saves 25% of its memory
+        # bandwidth while the smaller eye layers remain RGBA for masking.
+        pil_img = Image.new("RGB", (w, h), (10, 10, 15))
 
         # Calculate responsive eye base scale
         base_scale = min(w / 1104.0, h / 631.0)
@@ -178,8 +207,12 @@ class RobotFacePage(ctk.CTkFrame):
 
         # Update Tkinter canvas image efficiently
         self._tk_img = ImageTk.PhotoImage(pil_img)
-        self.canvas.delete("all")
-        self.canvas.create_image(0, 0, image=self._tk_img, anchor="nw")
+        if self._canvas_image_id is None:
+            self._canvas_image_id = self.canvas.create_image(
+                0, 0, image=self._tk_img, anchor="nw"
+            )
+        else:
+            self.canvas.itemconfigure(self._canvas_image_id, image=self._tk_img)
 
     def _render_single_emo_eye(
         self,
@@ -201,7 +234,7 @@ class RobotFacePage(ctk.CTkFrame):
         final_w = int(width + pad)
         final_h = int(height + pad)
         
-        ssaa = 3
+        ssaa = self.supersampling
         canvas_w = final_w * ssaa
         canvas_h = final_h * ssaa
 

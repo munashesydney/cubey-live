@@ -290,7 +290,8 @@ class LocalChatPage(ctk.CTkFrame):
         try:
             if not self.winfo_exists():
                 return
-            self.refresh_conversations_list()
+            if self.winfo_ismapped():
+                self.refresh_conversations_list()
             self.after(5000, self._schedule_conversation_refresh)
         except Exception:
             pass

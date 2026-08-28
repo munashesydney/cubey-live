@@ -284,10 +284,20 @@ class LivePage(ctk.CTkFrame):
 
     def append_log(self, message: str) -> None:
         """Thread-safe append to system log box."""
+        self.append_logs([message])
+
+    def append_logs(self, messages: list[str]) -> None:
+        """Append and trim a log batch with one text-widget mutation."""
+        if not messages:
+            return
         try:
             if self.winfo_exists() and hasattr(self, 'log_box') and self.log_box.winfo_exists():
                 timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-                self.log_box.insert("end", f"[{timestamp}] {message}\n")
+                chunk = "".join(f"[{timestamp}] {message}\n" for message in messages)
+                self.log_box.insert("end", chunk)
+                line_count = int(self.log_box.index("end-1c").split(".")[0])
+                if line_count > 600:
+                    self.log_box.delete("1.0", f"{line_count - 450}.0")
                 self.log_box.see("end")
         except Exception:
             pass

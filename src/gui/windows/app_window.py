@@ -10,11 +10,15 @@ import customtkinter as ctk
 from typing import Callable, Optional
 
 from src.config import AppConfig
+from src.gui.event_bridge import GuiEventBridge
 from src.gui.pages.robot_face_page import RobotFacePage
 from src.gui.windows.developer_window import DeveloperWindow
 from src.services.embeddings import EmbeddingService
 
 logger = logging.getLogger(__name__)
+
+_GUI_EVENT_POLL_MS = 16
+_GUI_EVENT_BATCH_SIZE = 256
 
 # Configure CustomTkinter default styling
 ctk.set_appearance_mode("dark")
@@ -56,11 +60,14 @@ class GeminiLiveApp(ctk.CTk):
         self.is_muted = False
         self.dev_window: Optional[DeveloperWindow] = None
         self._is_fullscreen = False
+        self._event_bridge = GuiEventBridge()
 
         # Build 100% full-bleed Robot Face display
         self.robot_face = RobotFacePage(
             self,
-            on_open_developer_console=self.toggle_developer_console
+            on_open_developer_console=self.toggle_developer_console,
+            target_fps=self.config.gui_face_fps,
+            supersampling=self.config.gui_face_supersampling,
         )
         self.robot_face.pack(fill="both", expand=True)
 
@@ -76,6 +83,54 @@ class GeminiLiveApp(ctk.CTk):
         # Auto-enter fullscreen if configured
         if getattr(self.config, "gui_fullscreen", False):
             self.after(150, self.enter_fullscreen)
+
+        # This is scheduled by the Tk thread itself. Background producers only
+        # touch GuiEventBridge's lock-protected Python containers.
+        self.after(_GUI_EVENT_POLL_MS, self._drain_gui_events)
+
+    # ------------------------------------------------------------------
+    # Thread-safe ingress. These methods never call Tk.
+    # ------------------------------------------------------------------
+
+    def post_status(self, status: str) -> None:
+        self._event_bridge.post("status", status, latest=True)
+
+    def post_mic_level(self, level: float) -> None:
+        self._event_bridge.post("mic_level", level, latest=True)
+
+    def post_transcript(self, role: str, text: str) -> None:
+        self._event_bridge.post("transcript", role, text)
+
+    def post_log(self, message: str) -> None:
+        self._event_bridge.post("log", message)
+
+    def post_reaction(self, reaction_type: str) -> None:
+        self._event_bridge.post("reaction", reaction_type)
+
+    def _drain_gui_events(self) -> None:
+        """Apply queued updates from the Tk main thread in bounded batches."""
+        handlers = {
+            "status": self.set_status,
+            "mic_level": self.update_mic_level,
+            "transcript": self.append_transcript,
+            "log": self.append_log,
+            "reaction": self.trigger_robot_reaction,
+        }
+        log_messages: list[str] = []
+        for event in self._event_bridge.drain(_GUI_EVENT_BATCH_SIZE):
+            if event.kind == "log":
+                log_messages.append(str(event.payload[0]))
+                continue
+            handler = handlers.get(event.kind)
+            if handler is None:
+                continue
+            try:
+                handler(*event.payload)
+            except Exception:
+                logger.exception("Failed to apply GUI event '%s'", event.kind)
+        if log_messages:
+            self.append_logs(log_messages)
+        self.after(_GUI_EVENT_POLL_MS, self._drain_gui_events)
 
     def toggle_developer_console(self) -> None:
         """Open or focus the Developer Control Window."""
@@ -118,6 +173,11 @@ class GeminiLiveApp(ctk.CTk):
         """Forward log message to developer window if open."""
         if self.dev_window and self.dev_window.winfo_exists():
             self.dev_window.append_log(message)
+
+    def append_logs(self, messages: list[str]) -> None:
+        """Forward a batch with a single Tk text-widget update."""
+        if self.dev_window and self.dev_window.winfo_exists():
+            self.dev_window.append_logs(messages)
 
     def trigger_robot_reaction(self, event_payload: str) -> None:
         """Trigger visual reaction animation on Cubeo face."""

@@ -206,3 +206,11 @@ class DeveloperWindow(ctk.CTkToplevel):
                 self._pages["live"].append_log(message)
         except Exception:
             pass
+
+    def append_logs(self, messages: list[str]) -> None:
+        """Forward a log batch to the Gemini Live page."""
+        try:
+            if self.winfo_exists():
+                self._pages["live"].append_logs(messages)
+        except Exception:
+            pass

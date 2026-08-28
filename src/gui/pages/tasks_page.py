@@ -69,7 +69,8 @@ class TasksPage(ctk.CTkFrame):
         if not self.winfo_exists():
             return
         try:
-            self.refresh_tasks()
+            if self.winfo_ismapped():
+                self.refresh_tasks()
         except Exception:
             pass
         self.after(5000, self._schedule_auto_refresh)

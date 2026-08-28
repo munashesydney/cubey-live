@@ -76,19 +76,19 @@ class GeminiLiveClient:
         """Helper to send log to logger and UI callback."""
         logger.info(message)
         if self.on_log:
-            if self._loop and self._loop.is_running():
-                self._loop.call_soon_threadsafe(self.on_log, message)
-            else:
+            try:
                 self.on_log(message)
+            except Exception:
+                logger.exception("Live log callback failed")
 
     def set_status(self, status: str) -> None:
         """Update connection status."""
         self.log(f"Status: {status}")
         if self.on_status_change:
-            if self._loop and self._loop.is_running():
-                self._loop.call_soon_threadsafe(self.on_status_change, status)
-            else:
+            try:
                 self.on_status_change(status)
+            except Exception:
+                logger.exception("Live status callback failed")
 
     async def start_session(self) -> None:
         """Run one logical Live session across retryable WebSocket connections."""
@@ -525,7 +525,10 @@ class GeminiLiveClient:
                 self.on_transcript("Model", text)
 
     def _dispatch_tool_reaction(self, reaction_type: str) -> None:
-        """Thread-safely dispatch tool reaction to GUI on main thread."""
-        if self.on_tool_reaction and self._loop:
-            self._loop.call_soon_threadsafe(self.on_tool_reaction, reaction_type)
+        """Dispatch a reaction through the controller's thread-safe bridge."""
+        if self.on_tool_reaction:
+            try:
+                self.on_tool_reaction(reaction_type)
+            except Exception:
+                logger.exception("Live reaction callback failed")
 

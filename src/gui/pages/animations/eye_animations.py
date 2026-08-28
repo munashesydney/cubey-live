@@ -1,6 +1,6 @@
 """
 Eye Animation Engine module.
-Coordinates 60 FPS organic random micro-gaze saccades, EMO-style spring physics,
+Coordinates time-correct organic random micro-gaze saccades, EMO-style spring physics,
 3D perspective tilt/shear, shape morphing, variable blink/wink patterns,
 and dynamic EMO idle action sequences.
 """
@@ -162,8 +162,9 @@ class EyeAnimationEngine:
     def slant_angle(self) -> float:
         return (self.slant_left + self.slant_right) / 2.0
 
-    def update_animation_frame(self) -> None:
-        """Advance animation state by 1 frame (~16ms at 60 FPS)."""
+    def update_animation_frame(self, frame_scale: float = 1.0) -> None:
+        """Advance animation using 60 FPS-equivalent, time-scaled physics."""
+        frame_scale = max(0.25, min(float(frame_scale), 6.0))
         now = time.time()
 
         # 1. Active Custom EMO Action Sequence Update
@@ -185,7 +186,7 @@ class EyeAnimationEngine:
 
         # Smooth Gaze Interpolation
         if self.saccade_t < 1.0:
-            self.saccade_t += 0.075
+            self.saccade_t += 0.075 * frame_scale
             progress = ease_out_cubic(self.saccade_t)
             self.gaze_x = self.start_gaze_x + (self.target_gaze_x - self.start_gaze_x) * progress
             self.gaze_y = self.start_gaze_y + (self.target_gaze_y - self.start_gaze_y) * progress
@@ -194,7 +195,7 @@ class EyeAnimationEngine:
             self.gaze_y = self.target_gaze_y
 
         # 3. Update Blinking Cycle
-        self._update_blink_cycle()
+        self._update_blink_cycle(frame_scale)
 
         # Check for pending shape change masked by blink
         if self.pending_shape_mode and self.pending_shape_mode != self.shape_mode:
@@ -205,7 +206,8 @@ class EyeAnimationEngine:
                 self.pending_shape_mode = None
 
         # 4. Spring Physics Lerp for Slants, Shear, Squish, and Eyelids
-        lerp_speed = 0.18
+        # Equivalent exponential convergence regardless of display FPS.
+        lerp_speed = 1.0 - math.pow(1.0 - 0.18, frame_scale)
         self.slant_left += (self.target_slant_l - self.slant_left) * lerp_speed
         self.slant_right += (self.target_slant_r - self.slant_right) * lerp_speed
         self.shear_x += (self.target_shear_x - self.shear_x) * lerp_speed
@@ -262,7 +264,7 @@ class EyeAnimationEngine:
                     self.blink_mode = "SLEEPY"
                     self.max_blink_steps = 22
 
-    def _update_blink_cycle(self) -> None:
+    def _update_blink_cycle(self, frame_scale: float = 1.0) -> None:
         """Process active blink or wink frame."""
         if not self.is_blinking:
             self.blink_scale_l = 1.0
@@ -322,7 +324,7 @@ class EyeAnimationEngine:
             self.blink_scale_l = val
             self.blink_scale_r = val
 
-        self.blink_step += 1
+        self.blink_step += frame_scale
         if self.blink_step > self.max_blink_steps:
             self.is_blinking = False
             self.blink_scale_l = 1.0

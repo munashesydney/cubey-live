@@ -243,21 +243,18 @@ class ApplicationController:
 
     def _on_tool_reaction_triggered(self, reaction_type: str) -> None:
         """Callback invoked when Gemini Live calls the 'react' tool."""
-        if self.gui and self.gui.winfo_exists():
-            self.gui.after(0, self.gui.trigger_robot_reaction, reaction_type)
+        if self.gui:
+            self.gui.post_reaction(reaction_type)
 
     def _on_mic_level_changed(self, level: float) -> None:
         """Callback from audio recorder (runs thread-safely)."""
-        try:
-            if self.gui and self.gui.winfo_exists():
-                self.gui.after(0, self.gui.update_mic_level, level)
-        except Exception:
-            pass
+        if self.gui:
+            self.gui.post_mic_level(level)
 
     def _on_status_changed(self, status: str) -> None:
         """Callback when Live client connection status changes."""
-        if self.gui and self.gui.winfo_exists():
-            self.gui.after(0, self.gui.set_status, status)
+        if self.gui:
+            self.gui.post_status(status)
 
     def _on_transcript_received(self, role: str, text: str) -> None:
         """Callback when transcript text is received from Gemini or User event.
@@ -266,13 +263,13 @@ class ApplicationController:
         handoff before forwarding the line to the GUI.
         """
         self._persist_message(role, text)
-        if self.gui and self.gui.winfo_exists():
-            self.gui.after(0, self.gui.append_transcript, role, text)
+        if self.gui:
+            self.gui.post_transcript(role, text)
 
     def _on_log_received(self, message: str) -> None:
         """Callback for log messages."""
-        if self.gui and self.gui.winfo_exists():
-            self.gui.after(0, self.gui.append_log, message)
+        if self.gui:
+            self.gui.post_log(message)
 
     # ------------------------------------------------------------------
     # Database-backed conversation lifecycle
