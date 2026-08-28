@@ -180,6 +180,7 @@ class ApplicationController:
             on_transcript=self._on_transcript_received,
             on_log=self._on_log_received,
             on_tool_reaction=self._on_tool_reaction_triggered,
+            on_listening_state_change=self._on_listening_state_changed,
             on_session_ended=self._on_session_ended,
             embedding_service=self.embedding_service,
             wheels_service=get_wheels_service(),
@@ -242,7 +243,10 @@ class ApplicationController:
         asyncio.set_event_loop(loop)
         loop.run_forever()
 
-    def start_live_session(self) -> None:
+    def start_live_session(
+        self,
+        initial_interrupt: Optional[str] = "[WAKE UP - USER STARTED LIVE SESSION]",
+    ) -> None:
         """Schedule start_session coroutine on background asyncio thread."""
         try:
             if not self.config.api_key:
@@ -257,7 +261,7 @@ class ApplicationController:
                 if self.wake_word_service:
                     self.wake_word_service.pause()
 
-                # Ensure glowing listening visual side waves are active on robot face
+                # Ensure glowing listening visual HUD is active on robot face
                 if self.gui:
                     self.gui.post_listening(True)
 
@@ -265,7 +269,7 @@ class ApplicationController:
                 self._begin_conversation()
                 logger.info("Scheduling Gemini Live session start...")
                 self._session_task = asyncio.run_coroutine_threadsafe(
-                    self.client.start_session(),
+                    self.client.start_session(initial_interrupt=initial_interrupt),
                     self.async_loop
                 )
 
@@ -308,9 +312,10 @@ class ApplicationController:
     def _on_wake_word_detected(self, keyword: str) -> None:
         """
         Callback from Sherpa-ONNX when a wake-up phrase is recognized.
-        Triggers listening eye animation, colored side waves, and auto-starts Gemini Live.
+        Triggers listening eye animation, HUD indicator, and auto-starts Gemini Live with wake-up interrupt.
         """
         logger.info("🎯 Wake word recognized: '%s'! Waking up and starting Gemini Live...", keyword)
+        wake_interrupt = f"[WAKE UP - USER SAID '{keyword.upper()}']"
         if self.gui:
             self.gui.post_log(f"🎯 Wake Word Detected: '{keyword}'! Waking up...")
             self.gui.post_reaction("listening")
@@ -319,7 +324,9 @@ class ApplicationController:
 
         # Auto-start Gemini Live conversation session if not already connected
         if self.client and not self.client.is_connected:
-            self.start_live_session()
+            self.start_live_session(initial_interrupt=wake_interrupt)
+        elif self.client and self.client.is_connected:
+            self.send_interruption(wake_interrupt)
 
     def send_interruption(self, text_payload: str) -> None:
         """
@@ -332,6 +339,11 @@ class ApplicationController:
                 self.client.interrupt_with_text(text_payload),
                 self.async_loop
             )
+
+    def _on_listening_state_changed(self, is_listening: bool) -> None:
+        """Callback when Gemini Live client changes listening visibility (e.g. hidden while model speaks)."""
+        if self.gui:
+            self.gui.post_listening(is_listening)
 
     def _on_tool_reaction_triggered(self, reaction_type: str) -> None:
         """Callback invoked when Gemini Live calls the 'react' tool."""
@@ -347,6 +359,8 @@ class ApplicationController:
         """Callback from audio recorder (runs thread-safely)."""
         if self.gui:
             self.gui.post_mic_level(level)
+        if self.client and self.client.is_connected and level >= 0.08:
+            self.client.record_user_activity()
 
     def _on_status_changed(self, status: str) -> None:
         """Callback when Live client connection status changes."""

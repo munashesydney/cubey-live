@@ -37,6 +37,7 @@ class GeminiLiveClient:
         on_transcript: Optional[Callable[[str, str], None]] = None,
         on_log: Optional[Callable[[str], None]] = None,
         on_tool_reaction: Optional[Callable[[str], None]] = None,
+        on_listening_state_change: Optional[Callable[[bool], None]] = None,
         on_session_ended: Optional[Callable[[], None]] = None,
         embedding_service: Optional[EmbeddingService] = None,
         wheels_service: Optional[Any] = None,
@@ -48,6 +49,7 @@ class GeminiLiveClient:
         self.on_transcript = on_transcript
         self.on_log = on_log
         self.on_tool_reaction = on_tool_reaction
+        self.on_listening_state_change = on_listening_state_change
         self.on_session_ended = on_session_ended
         self.embedding_service = embedding_service
         self.wheels_service = wheels_service
@@ -60,6 +62,9 @@ class GeminiLiveClient:
         self._user_text_buffer: list[str] = []
         self._model_text_buffer: list[str] = []
         self._model_turn_active = False
+        self._is_listening_visible = False
+        self._last_user_activity_at: float = time.monotonic()
+        self._pending_initial_interrupt: Optional[str] = None
 
         self._pause_mic_until: float = 0.0
         self._session_resumption_handle: Optional[str] = None
@@ -90,7 +95,21 @@ class GeminiLiveClient:
             except Exception:
                 logger.exception("Live status callback failed")
 
-    async def start_session(self) -> None:
+    def set_listening_state(self, is_listening: bool, force: bool = False) -> None:
+        """Notify UI whether microphone listening HUD should be active."""
+        if force or self._is_listening_visible != is_listening:
+            self._is_listening_visible = is_listening
+            if self.on_listening_state_change:
+                try:
+                    self.on_listening_state_change(is_listening)
+                except Exception:
+                    logger.exception("Live listening state change callback failed")
+
+    def record_user_activity(self) -> None:
+        """Mark recent user speech or interaction to reset the 10s silence watchdog timer."""
+        self._last_user_activity_at = time.monotonic()
+
+    async def start_session(self, initial_interrupt: Optional[str] = None) -> None:
         """Run one logical Live session across retryable WebSocket connections."""
         self._loop = asyncio.get_running_loop()
         self._stop_event.clear()
@@ -99,6 +118,9 @@ class GeminiLiveClient:
         self._model_text_buffer.clear()
         self._session_resumption_handle = None
         self._has_connected_once = False
+        self._pending_initial_interrupt = initial_interrupt
+        self._last_user_activity_at = time.monotonic()
+        self.set_listening_state(True, force=True)
         self.set_status("Connecting to Gemini Live API...")
 
         fatal_error: Optional[Exception] = None
@@ -257,6 +279,7 @@ class GeminiLiveClient:
             self._session = session
             self.is_connected = True
             self._connection_started_at = time.monotonic()
+            self._last_user_activity_at = time.monotonic()
             self.set_status(
                 "Reconnected & Live 🟢"
                 if self._has_connected_once
@@ -275,20 +298,27 @@ class GeminiLiveClient:
                 self.recorder.clear_queue()
             self.recorder.is_live_active = True
 
+            # If an initial wake-up / start text interrupt was queued, dispatch it immediately
+            if self._pending_initial_interrupt:
+                init_payload = self._pending_initial_interrupt
+                self._pending_initial_interrupt = None
+                asyncio.create_task(self.interrupt_with_text(init_payload))
+
             send_task = asyncio.create_task(self._send_audio_loop())
             receive_task = asyncio.create_task(self._receive_responses_loop())
+            watchdog_task = asyncio.create_task(self._inactivity_watchdog_loop())
             stop_task = asyncio.create_task(self._stop_event.wait())
-            self._tasks = [send_task, receive_task]
+            self._tasks = [send_task, receive_task, watchdog_task]
 
             try:
                 done, _ = await asyncio.wait(
-                    [send_task, receive_task, stop_task],
+                    [send_task, receive_task, watchdog_task, stop_task],
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if stop_task in done:
                     return
 
-                for task in (send_task, receive_task):
+                for task in (send_task, receive_task, watchdog_task):
                     if task not in done:
                         continue
                     error = task.exception()
@@ -297,10 +327,10 @@ class GeminiLiveClient:
                 raise ConnectionError("Gemini Live audio task stopped unexpectedly")
             finally:
                 self.recorder.is_live_active = False
-                for task in (send_task, receive_task, stop_task):
+                for task in (send_task, receive_task, watchdog_task, stop_task):
                     task.cancel()
                 await asyncio.gather(
-                    send_task, receive_task, stop_task, return_exceptions=True
+                    send_task, receive_task, watchdog_task, stop_task, return_exceptions=True
                 )
                 self.is_connected = False
                 self._session = None
@@ -349,8 +379,10 @@ class GeminiLiveClient:
             self.log("⚠️ Cannot send interruption: Live session is not connected.")
             return
 
+        self.record_user_activity()
         self.player.clear()
         self._pause_mic_until = time.monotonic() + 0.5
+        self.set_listening_state(True)
         
         self.log(f"⚡ [EVENT CONTEXT SENT TO AI]: '{text_payload}'")
 
@@ -462,12 +494,14 @@ class GeminiLiveClient:
                     input_transcription = server_content.input_transcription
                     if input_transcription is not None:
                         if input_transcription.text:
+                            self.record_user_activity()
                             self._user_text_buffer.append(input_transcription.text)
                             self.log(
                                 f"🎤 [Gemini Live User STT Chunk]: '{input_transcription.text}' "
                                 f"(finished={input_transcription.finished})"
                             )
                         if input_transcription.finished:
+                            self.record_user_activity()
                             self._flush_user_text()
 
                     # 2. Handle native model output speech transcription from Gemini Live
@@ -491,12 +525,16 @@ class GeminiLiveClient:
                             if part.inline_data and part.inline_data.data:
                                 self.player.play_chunk(part.inline_data.data)
                                 self._model_turn_active = True
+                                # Hide microphone animation while Cubey is talking
+                                self.set_listening_state(False)
 
                     # Flush accumulated text at the end of turn
                     if server_content.turn_complete:
                         self._flush_user_text()
                         self._flush_model_text()
                         self._model_turn_active = False
+                        # Wait until physical audio output finishes before restoring microphone animation
+                        asyncio.create_task(self._wait_for_playback_done_and_restore_listening())
 
                     # Handle server-side barge-in / interruption signal
                     if server_content.interrupted:
@@ -504,6 +542,8 @@ class GeminiLiveClient:
                         self._flush_model_text()
                         self._model_turn_active = False
                         self.player.clear()
+                        self.record_user_activity()
+                        self.set_listening_state(True)
                         self.log("⚡ [Server Barge-in Detected] Gemini cut off generation.")
 
         except asyncio.CancelledError:
@@ -511,6 +551,41 @@ class GeminiLiveClient:
         except Exception as e:
             self.log(f"Error in receive responses loop: {e}")
             raise
+
+    async def _wait_for_playback_done_and_restore_listening(self) -> None:
+        """Wait until physical audio output has drained, then restore the listening animation."""
+        while self.player.is_speaking and self.is_connected and not self._stop_event.is_set():
+            await asyncio.sleep(0.05)
+        if self.is_connected and not self._stop_event.is_set() and not self._model_turn_active:
+            self.set_listening_state(True)
+            self._last_user_activity_at = time.monotonic()
+
+    async def _inactivity_watchdog_loop(self) -> None:
+        """Monitor user silence and automatically close session after 10 seconds of inactivity."""
+        timeout = getattr(self.config, "live_inactivity_timeout_seconds", 10.0)
+        if timeout <= 0:
+            return
+
+        check_interval = max(0.02, min(0.25, timeout / 5.0))
+        while self.is_connected and not self._stop_event.is_set():
+            await asyncio.sleep(check_interval)
+            if not self.is_connected or self._stop_event.is_set():
+                break
+
+            # If model is actively speaking or buffering audio, keep timer refreshed
+            if self._model_turn_active or self.player.is_speaking:
+                self._last_user_activity_at = time.monotonic()
+                continue
+
+            silence_duration = time.monotonic() - self._last_user_activity_at
+            if silence_duration >= timeout:
+                self.log(
+                    f"⏰ Inactivity timeout: {silence_duration:.1f}s without user speech. "
+                    "Closing Gemini Live session..."
+                )
+                self.set_status("Idle (10s Silence Timeout) 💤")
+                self.stop_session()
+                break
 
     def _flush_user_text(self) -> None:
         """Emit accumulated user speech transcript line and reset the buffer."""

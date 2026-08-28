@@ -5,12 +5,14 @@ Configuration settings for Cubey - the Gemini Live Voice & Interruption Simulato
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from dotenv import load_dotenv
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 from src.ai.prompts.local_llm import SYSTEM_PROMPT as _LOCAL_LLM_SYSTEM_PROMPT
-
-# Load environment variables from .env if present
-load_dotenv()
 
 # Project root (two levels up from src/config.py -> project root)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -87,6 +89,11 @@ class AppConfig:
     )
     live_reconnect_max_delay: float = float(
         os.getenv("GEMINI_RECONNECT_MAX_DELAY", "5.0")
+    )
+
+    # Inactivity watchdog: Auto-close Live session if no user speech for X seconds.
+    live_inactivity_timeout_seconds: float = float(
+        os.getenv("LIVE_INACTIVITY_TIMEOUT_SECONDS", "10.0")
     )
 
     # Database Parameters
