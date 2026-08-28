@@ -285,6 +285,7 @@ body, html {
 .swatch.free { background: var(--surface1); }
 .swatch.unknown { background: var(--base); border: 1px dashed var(--surface0); }
 .swatch.trail { background: var(--yellow); }
+.swatch.path { background: var(--sky); border: 1px dashed rgba(255, 255, 255, 0.6); }
 
 /* --------------------------------------------------------------------------
    Floating Remote Drive HUD & Virtual Joystick

@@ -218,6 +218,11 @@ async def send_drive_command(req: DriveCommandRequest, _: str = Depends(verify_c
     if not wheels_svc.is_connected:
         wheels_svc.connect()
 
+    # Yield autonomous exploration to manual teleoperation
+    mapping_svc = get_mapping_service()
+    if hasattr(mapping_svc, "navigator"):
+        mapping_svc.navigator.yield_to_teleop(3.0)
+
     if req.speed is not None:
         wheels_svc.set_speed(req.speed)
 
@@ -356,6 +361,9 @@ async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(
                     "battery_pct": wheels_svc.telemetry.battery_pct,
                     "motion": wheels_svc.telemetry.motion,
                     "lidar_rate_hz": lidar_svc.latest_scan.scan_rate_hz,
+                    "planned_path": snapshot.planned_path,
+                    "target_frontier": snapshot.target_frontier,
+                    "nav_state": mapping_svc.navigator.state.value if hasattr(mapping_svc, "navigator") else "IDLE",
                     "timestamp": snapshot.timestamp,
                 }
                 await websocket.send_json(payload)
@@ -376,6 +384,10 @@ async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(
                 if not wheels_svc.is_connected:
                     wheels_svc.connect()
                 wheels_svc.set_speed(speed)
+
+                if hasattr(mapping_svc, "navigator"):
+                    mapping_svc.navigator.yield_to_teleop(3.0)
+
                 logger.info(
                     "WS Drive CMD: %s (speed=%s, continuous=%s, wheels_connected=%s on %s)",
                     action,

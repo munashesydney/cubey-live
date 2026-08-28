@@ -18,6 +18,9 @@
   let robotPose = { x_m: 0.0, y_m: 0.0, theta_deg: 0.0 };
   let trajectory = [];
   let laserScan = [];
+  let plannedPath = [];
+  let targetFrontier = null;
+  let navState = "IDLE";
 
   // Occupancy Grid Metadata & Buffer
   let gridWidth = 400;
@@ -176,11 +179,21 @@
       }
     }
 
+    plannedPath = data.planned_path || [];
+    targetFrontier = data.target_frontier || null;
+    navState = data.nav_state || "IDLE";
+
     // Update Header Badges
     lblActiveMapName.textContent = activeMapName;
     if (isMapping) {
       pillStatus.classList.add("active");
-      lblMappingState.textContent = "Mapping Active";
+      let stateLabel = "Auto-Exploring";
+      if (navState === "PLANNING") stateLabel = "Planning Route...";
+      else if (navState === "OBSTACLE_AVOIDANCE") stateLabel = "Obstacle Detected";
+      else if (navState === "TELEOP_OVERRIDE") stateLabel = "Manual Driving";
+      else if (navState === "COMPLETED") stateLabel = "House Mapped! 🎉";
+
+      lblMappingState.textContent = stateLabel;
       btnMappingText.textContent = "Pause Mapping";
       btnToggleMapping.classList.replace("btn-primary", "btn-secondary");
     } else {
@@ -307,7 +320,48 @@
       ctx.stroke();
     }
 
-    // 5. Draw Laser Scan Rays (Instantaneous laser hits)
+    // 5. Draw Autonomous Planned A* Route (Glowing Cyan Dashed Line)
+    if (plannedPath && plannedPath.length > 1) {
+      ctx.save();
+      ctx.strokeStyle = "#89DCEB";
+      ctx.lineWidth = Math.max(3, viewScale * 0.05);
+      ctx.setLineDash([8, 6]);
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.beginPath();
+      for (let i = 0; i < plannedPath.length; i++) {
+        const [px, py] = plannedPath[i];
+        const cx = px * viewScale;
+        const cy = -py * viewScale;
+        if (i === 0) ctx.moveTo(cx, cy);
+        else ctx.lineTo(cx, cy);
+      }
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // 6. Draw Target Frontier Marker (Pulsing Target)
+    if (targetFrontier) {
+      const [tx, ty] = targetFrontier;
+      const cx = tx * viewScale;
+      const cy = -ty * viewScale;
+      const pRadius = Math.max(8, viewScale * 0.16);
+
+      ctx.save();
+      ctx.strokeStyle = "#CBA6F7";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(cx, cy, pRadius, 0, Math.PI * 2);
+      ctx.stroke();
+
+      ctx.fillStyle = "#F38BA8";
+      ctx.beginPath();
+      ctx.arc(cx, cy, Math.max(3, viewScale * 0.05), 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+
+    // 7. Draw Laser Scan Rays (Instantaneous laser hits)
     if (laserScan.length > 0) {
       const rx = robotPose.x_m * viewScale;
       const ry = -robotPose.y_m * viewScale;
@@ -325,7 +379,7 @@
       }
     }
 
-    // 6. Draw Robot Pose Avatar
+    // 8. Draw Robot Pose Avatar
     const rx = robotPose.x_m * viewScale;
     const ry = -robotPose.y_m * viewScale;
     const rRadius = Math.max(12, viewScale * 0.18); // ~18cm robot radius

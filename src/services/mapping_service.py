@@ -63,13 +63,15 @@ class MappingSnapshot:
     map_name: str
     active_map_id: Optional[int]
     total_explored_cells: int
+    planned_path: List[Tuple[float, float]] = field(default_factory=list)
+    target_frontier: Optional[Tuple[float, float]] = None
     timestamp: float = field(default_factory=time.time)
 
 
 class MappingService:
     """
     Coordinates 2D SLAM occupancy grid mapping, LiDAR scan-matching pose estimation,
-    and map persistence.
+    autonomous frontier exploration, and map persistence.
     """
 
     def __init__(
@@ -78,6 +80,7 @@ class MappingService:
         height: int = 400,
         resolution_m: float = 0.05,  # 5cm per pixel -> 20m x 20m map
         lidar_service=None,
+        wheels_service=None,
     ):
         self.width = width
         self.height = height
@@ -105,6 +108,14 @@ class MappingService:
         self.map_name: str = "Live Floorplan"
 
         self.on_snapshot: Optional[Callable[[MappingSnapshot], None]] = None
+
+        # Autonomous Frontier Navigation Manager
+        from src.services.navigation import AutoNavigator
+        self.navigator = AutoNavigator(
+            mapping_service=self,
+            lidar_service=self.lidar_service,
+            wheels_service=wheels_service,
+        )
 
         # Subscribe to LiDAR scan stream
         self._original_lidar_callback = self.lidar_service.on_scan_data
@@ -137,11 +148,11 @@ class MappingService:
         return 0 <= gx < self.width and 0 <= gy < self.height
 
     # ------------------------------------------------------------------
-    # Mapping Controls
+    # Mapping & Autonomous Exploration Controls
     # ------------------------------------------------------------------
 
     def start_mapping(self) -> None:
-        """Enable active SLAM map updates from incoming LiDAR scans."""
+        """Enable active SLAM map updates and launch autonomous frontier exploration."""
         with self._lock:
             self.is_mapping = True
 
@@ -154,16 +165,20 @@ class MappingService:
         except Exception as e:
             logger.warning("Could not auto-start LiDAR for mapping: %s", e)
 
-        logger.info("2D House Mapping session started.")
+        # Launch autonomous navigation
+        self.navigator.start()
+        logger.info("2D House Mapping & Autonomous Exploration session started.")
 
     def pause_mapping(self) -> None:
-        """Pause grid updates while keeping current map state."""
+        """Pause grid updates and autonomous exploration while keeping current map state."""
         with self._lock:
             self.is_mapping = False
+        self.navigator.stop()
         logger.info("2D House Mapping session paused.")
 
     def reset_map(self) -> None:
-        """Clear grid back to unexplored space and reset robot pose."""
+        """Clear grid back to unexplored space, reset robot pose, and stop autonomous navigation."""
+        self.navigator.stop()
         with self._lock:
             self._log_odds.fill(0.0)
             self._grid.fill(-1)
@@ -376,6 +391,8 @@ class MappingService:
                 map_name=self.map_name,
                 active_map_id=self.active_map_id,
                 total_explored_cells=explored_cells,
+                planned_path=list(self.navigator.current_path),
+                target_frontier=self.navigator.target_frontier,
             )
 
         if self.on_snapshot:
@@ -415,6 +432,8 @@ class MappingService:
                 map_name=self.map_name,
                 active_map_id=self.active_map_id,
                 total_explored_cells=explored_cells,
+                planned_path=list(self.navigator.current_path),
+                target_frontier=self.navigator.target_frontier,
             )
 
     # ------------------------------------------------------------------
