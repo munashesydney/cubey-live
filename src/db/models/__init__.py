@@ -1,6 +1,7 @@
 """ORM models. Importing this package registers all models with Base.metadata."""
 
 from src.db.models.conversation import Conversation, ConversationSource, ConversationStatus
+from src.db.models.map import MapModel
 from src.db.models.memory import Memory, MemoryStatus
 from src.db.models.memory_embedding import MemoryEmbedding
 from src.db.models.message import Message, MessageRole
@@ -11,6 +12,7 @@ __all__ = [
     "Conversation",
     "ConversationSource",
     "ConversationStatus",
+    "MapModel",
     "Memory",
     "MemoryEmbedding",
     "MemoryStatus",

@@ -227,5 +227,8 @@ echo "==> Setup complete!"
 echo "    Manual start:  ${VENV}/bin/python ${PROJECT_ROOT}/main.py"
 echo "    Or use:        bash ${SCRIPT_DIR}/run.sh"
 echo
+echo "    2D House Mapper & Remote Control Web App:"
+echo "      http://$(hostname).local:8000  (Default: admin / cubey)"
+echo
 echo "    If audio picks the wrong device, configure it with:"
 echo "      sudo raspi-config  (System Options > Audio)"

@@ -152,6 +152,15 @@ class AppConfig:
         "LIDAR_AUTO_CONNECT", "false"
     ).strip().lower() not in {"0", "false", "no", "off"}
 
+    # Web Server & Remote Map Control (SLAM & Live View)
+    web_server_enabled: bool = os.getenv(
+        "WEB_SERVER_ENABLED", "true"
+    ).strip().lower() not in {"0", "false", "no", "off"}
+    web_host: str = os.getenv("WEB_HOST", "0.0.0.0")
+    web_port: int = int(os.getenv("WEB_PORT", "8000"))
+    web_username: str = os.getenv("WEB_USERNAME", "admin")
+    web_password: str = os.getenv("WEB_PASSWORD", "cubey")
+
     def validate(self) -> None:
         """Validate critical configuration fields."""
         if not self.api_key:

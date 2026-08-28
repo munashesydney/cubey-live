@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>🤖 Cubey 2D House Mapper & Teleop</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <!-- Google Fonts for modern typography -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+  <!-- Pako for fast client-side zlib decompression -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"></script>
+</head>
+<body>
+  <div id="app-container">
+    <!-- Top Floating Navbar -->
+    <header class="glass-nav">
+      <div class="nav-left">
+        <div class="brand">
+          <span class="brand-icon">🤖</span>
+          <div class="brand-text">
+            <span class="brand-title">Cubey Mapper</span>
+            <span class="brand-subtitle" id="lbl-active-map-name">Live Floorplan</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="nav-center">
+        <div class="status-pill" id="pill-status">
+          <span class="dot live-dot"></span>
+          <span id="lbl-mapping-state">Mapping Idle</span>
+        </div>
+        <div class="telemetry-badge" id="badge-battery">
+          <span class="icon">🔋</span> <span id="lbl-battery-pct">--%</span>
+        </div>
+        <div class="telemetry-badge" id="badge-lidar">
+          <span class="icon">📡</span> <span id="lbl-lidar-hz">0.0 Hz</span>
+        </div>
+        <div class="telemetry-badge" id="badge-pose">
+          <span class="icon">📍</span> <span id="lbl-pose-text">X: 0.0m Y: 0.0m 0°</span>
+        </div>
+      </div>
+
+      <div class="nav-right">
+        <button id="btn-toggle-mapping" class="btn btn-primary">
+          <span class="btn-icon">▶</span> <span id="btn-mapping-text">Start Mapping</span>
+        </button>
+        <button id="btn-save-map" class="btn btn-secondary">
+          <span class="btn-icon">💾</span> Save Map
+        </button>
+        <button id="btn-open-library" class="btn btn-secondary">
+          <span class="btn-icon">🗺️</span> Maps
+        </button>
+        <button id="btn-reset-map" class="btn btn-danger-outline" title="Clear Grid">
+          <span class="btn-icon">🔄</span> Reset
+        </button>
+      </div>
+    </header>
+
+    <!-- Main Map Canvas Viewport -->
+    <main id="viewport">
+      <canvas id="map-canvas"></canvas>
+
+      <!-- Floating View Controls -->
+      <div class="floating-controls view-controls">
+        <button id="btn-zoom-in" class="fab" title="Zoom In">+</button>
+        <button id="btn-zoom-out" class="fab" title="Zoom Out">−</button>
+        <button id="btn-recenter" class="fab" title="Center on Robot">🎯</button>
+        <button id="btn-export-png" class="fab" title="Export PNG">📷</button>
+      </div>
+
+      <!-- Floating Scale & Legend Overlay -->
+      <div class="floating-legend glass-panel">
+        <div class="legend-item"><span class="swatch occupied"></span> Walls / Obstacles</div>
+        <div class="legend-item"><span class="swatch free"></span> Free Space</div>
+        <div class="legend-item"><span class="swatch unknown"></span> Unexplored</div>
+        <div class="legend-item"><span class="swatch trail"></span> Robot Trail</div>
+      </div>
+
+      <!-- Remote Control Joystick HUD (Bottom Right / Mobile) -->
+      <div class="floating-drive-hud glass-panel">
+        <div class="hud-header">
+          <span class="hud-title">🎮 Remote Drive</span>
+          <span class="speed-label" id="lbl-speed-val">Speed: 180</span>
+        </div>
+
+        <div class="joystick-wrapper">
+          <div id="virtual-joystick">
+            <div id="joystick-knob"></div>
+          </div>
+        </div>
+
+        <div class="drive-slider-row">
+          <label for="speed-slider">Speed:</label>
+          <input type="range" id="speed-slider" min="100" max="255" value="180" step="5">
+        </div>
+
+        <div class="drive-key-hint">
+          <span>⌨️ Keys: <strong>W/A/S/D</strong> Move · <strong>Q/E</strong> Rotate · <strong>Space</strong> Stop</span>
+        </div>
+      </div>
+    </main>
+
+    <!-- Save Map Modal -->
+    <div id="modal-save" class="modal-backdrop hidden">
+      <div class="modal-card glass-panel">
+        <h3>💾 Save Floor Plan to SQLite</h3>
+        <p>Enter a descriptive name for your house map (e.g. "Main Floor", "Kitchen"):</p>
+        <input type="text" id="input-map-name" class="modal-input" placeholder="e.g. Ground Floor" value="My House Map">
+        <div class="modal-actions">
+          <button id="btn-confirm-save" class="btn btn-primary">Save Floorplan</button>
+          <button id="btn-cancel-save" class="btn btn-secondary">Cancel</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Map Library Modal -->
+    <div id="modal-library" class="modal-backdrop hidden">
+      <div class="modal-card modal-card-wide glass-panel">
+        <div class="modal-header">
+          <h3>🗺️ Saved House Maps</h3>
+          <button id="btn-close-library" class="btn-close">✕</button>
+        </div>
+        <div id="maps-list-container" class="maps-grid">
+          <!-- Loaded dynamically from /api/maps -->
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

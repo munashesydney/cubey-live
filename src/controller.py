@@ -90,6 +90,9 @@ class ApplicationController:
         self.task_scheduler.start()
         self.transcript_persistence.start()
 
+        # Start Web Server & SLAM mapper if enabled
+        self._start_web_server()
+
         # 1. Start dedicated background thread for asyncio event loop
         self.async_loop = asyncio.new_event_loop()
         self.loop_thread = threading.Thread(
@@ -128,6 +131,8 @@ class ApplicationController:
         try:
             self.gui.mainloop()
         finally:
+            if hasattr(self, "web_server") and self.web_server:
+                self.web_server.should_exit = True
             if self.wake_word_service:
                 self.wake_word_service.stop()
             if self.camera_service:
@@ -143,6 +148,37 @@ class ApplicationController:
             self.transcript_persistence.set_realtime_active(False)
             self.transcript_persistence.stop()
             self.task_scheduler.stop()
+
+    def _start_web_server(self) -> None:
+        """Launch FastAPI / Uvicorn server in a dedicated background daemon thread."""
+        if not getattr(self.config, "web_server_enabled", True):
+            return
+
+        try:
+            from src.web.app import app as web_app
+            import uvicorn
+
+            cfg = uvicorn.Config(
+                app=web_app,
+                host=self.config.web_host,
+                port=self.config.web_port,
+                log_level="warning",
+                access_log=False,
+            )
+            self.web_server = uvicorn.Server(cfg)
+            web_thread = threading.Thread(
+                target=self.web_server.run,
+                daemon=True,
+                name="CubeyWebServerThread",
+            )
+            web_thread.start()
+            logger.info(
+                "Cubey Web Server started on http://%s:%d",
+                self.config.web_host,
+                self.config.web_port,
+            )
+        except Exception as e:
+            logger.warning("Failed to start Cubey Web Server: %s", e)
 
     def _run_startup_diagnostics_and_prewarm(self) -> None:
         """
