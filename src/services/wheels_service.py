@@ -169,7 +169,7 @@ class WheelsService:
     def connect(self, port: Optional[str] = None, baudrate: Optional[int] = None) -> bool:
         """
         Open serial connection to ESP32 on specified port and baudrate.
-        If port is 'MOCK_SIMULATOR', enters simulated mode.
+        If port fails or is not explicitly set, probes available candidate ports.
         """
         if port:
             self.port = port
@@ -188,37 +188,56 @@ class WheelsService:
             self._reader_thread.start()
             self._emit_log(f"Connected to {self.port} (Mock/Simulated Mode)")
             self._emit_connection_change(True, f"Mock Mode ({self.port})")
+            logger.info("WheelsService connected in MOCK_SIMULATOR mode.")
             return True
 
-        try:
-            self._serial = serial.Serial(
-                port=self.port,
-                baudrate=self.baudrate,
-                timeout=1.0,
-                write_timeout=1.0,
-            )
-            self._is_mock = False
-            self._is_connected = True
-            self._running = True
+        # Build candidate ports list to try
+        candidate_ports = [self.port]
+        for p in self.list_available_ports():
+            if p not in candidate_ports and p != "MOCK_SIMULATOR":
+                candidate_ports.append(p)
 
-            self._reader_thread = threading.Thread(
-                target=self._serial_reader_loop, daemon=True, name="WheelsSerialReader"
-            )
-            self._reader_thread.start()
+        for candidate in candidate_ports:
+            try:
+                logger.info("Attempting to connect WheelsService to UART on %s @ %d baud...", candidate, self.baudrate)
+                self._serial = serial.Serial(
+                    port=candidate,
+                    baudrate=self.baudrate,
+                    timeout=1.0,
+                    write_timeout=1.0,
+                )
+                self.port = candidate
+                self._is_mock = False
+                self._is_connected = True
+                self._running = True
 
-            self._emit_log(f"Connected to hardware UART: {self.port} @ {self.baudrate} baud")
-            self._emit_connection_change(True, f"Connected ({self.port})")
+                self._reader_thread = threading.Thread(
+                    target=self._serial_reader_loop, daemon=True, name="WheelsSerialReader"
+                )
+                self._reader_thread.start()
 
-            # Request initial status
-            self.request_status()
-            return True
-        except Exception as e:
-            logger.error("Failed to connect to serial port %s: %s", self.port, e)
-            self._is_connected = False
-            self._serial = None
-            self._emit_log(f"Connection failed to {self.port}: {e}")
-            self._emit_connection_change(False, f"Connection Failed: {e}")
-            return False
+                self._emit_log(f"Connected to hardware UART: {self.port} @ {self.baudrate} baud")
+                self._emit_connection_change(True, f"Connected ({self.port})")
+                logger.info("WheelsService successfully connected to ESP32 on %s @ %d baud.", self.port, self.baudrate)
+
+                # Request initial status
+                self.request_status()
+                return True
+            except Exception as e:
+                logger.debug("Could not connect WheelsService to port %s: %s", candidate, e)
+                if self._serial:
+                    try:
+                        self._serial.close()
+                    except Exception:
+                        pass
+                self._serial = None
+
+        logger.warning("WheelsService could not find physical ESP32 UART on candidates %s", candidate_ports)
+        self._is_connected = False
+        self._serial = None
+        self._emit_log(f"Connection failed across candidates: {candidate_ports}")
+        self._emit_connection_change(False, "Connection Failed")
+        return False
 
     def disconnect(self) -> None:
         """Safely close serial port and terminate background worker threads."""

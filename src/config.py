@@ -144,6 +144,10 @@ class AppConfig:
         "CAMERA_AUTO_START_WITH_LIVE", "false"
     ).strip().lower() not in {"0", "false", "no", "off"}
 
+    # ESP32-S3 Mecanum Wheels & Motors UART Parameters
+    wheels_port: str = os.getenv("WHEELS_PORT", "")
+    wheels_baudrate: int = int(os.getenv("WHEELS_BAUDRATE", "115200"))
+
     # Waveshare / Slamtec RPLIDAR C1 Parameters
     lidar_port: str = os.getenv("LIDAR_PORT", "")
     lidar_baudrate: int = int(os.getenv("LIDAR_BAUDRATE", "460800"))

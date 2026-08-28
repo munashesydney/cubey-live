@@ -215,8 +215,20 @@ async def reset_mapping_grid(_: str = Depends(verify_credentials)):
 async def send_drive_command(req: DriveCommandRequest, _: str = Depends(verify_credentials)):
     """Drive Cubey's mecanum wheel base."""
     wheels_svc = get_wheels_service()
+    if not wheels_svc.is_connected:
+        wheels_svc.connect()
+
     if req.speed is not None:
         wheels_svc.set_speed(req.speed)
+
+    logger.info(
+        "HTTP Drive CMD: action=%s, speed=%s, continuous=%s (Wheels connected=%s on %s)",
+        req.action,
+        req.speed,
+        req.continuous,
+        wheels_svc.is_connected,
+        wheels_svc.port,
+    )
 
     if req.action == "stop":
         wheels_svc.stop()
@@ -225,13 +237,14 @@ async def send_drive_command(req: DriveCommandRequest, _: str = Depends(verify_c
     else:
         wheels_svc.pulse(req.action, req.duration_ms or 250)
 
-    return {"status": "command_sent", "action": req.action}
+    return {"status": "command_sent", "action": req.action, "connected": wheels_svc.is_connected}
 
 
 @app.post("/api/control/stop")
 async def stop_all_motors(_: str = Depends(verify_credentials)):
     """Emergency stop for motors."""
     wheels_svc = get_wheels_service()
+    logger.info("HTTP Drive CMD: Emergency STOP")
     wheels_svc.stop()
     return {"status": "stopped"}
 
@@ -360,7 +373,17 @@ async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(
             if mtype == "drive":
                 action = msg.get("action", "stop")
                 speed = msg.get("speed", 180)
+                if not wheels_svc.is_connected:
+                    wheels_svc.connect()
                 wheels_svc.set_speed(speed)
+                logger.info(
+                    "WS Drive CMD: %s (speed=%s, continuous=%s, wheels_connected=%s on %s)",
+                    action,
+                    speed,
+                    msg.get("continuous", False),
+                    wheels_svc.is_connected,
+                    wheels_svc.port,
+                )
                 if action == "stop":
                     wheels_svc.stop()
                 elif msg.get("continuous", False):
@@ -369,6 +392,7 @@ async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(
                     wheels_svc.pulse(action, msg.get("duration_ms", 250))
 
             elif mtype == "stop":
+                logger.info("WS Drive CMD: STOP")
                 wheels_svc.stop()
 
             elif mtype == "start_mapping":
