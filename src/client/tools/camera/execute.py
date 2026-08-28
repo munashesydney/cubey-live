@@ -31,12 +31,12 @@ def _on_camera_timer_expired(
     camera_service: Optional[Any],
     live_client: Optional[Any],
 ) -> None:
-    """Invoked when the 30-second camera timer expires to automatically turn off camera."""
+    """Invoked when the camera timer expires to automatically turn off camera and notify AI."""
     global _active_camera_timer
     with _timer_lock:
         _active_camera_timer = None
 
-    logger.info("⏱️ [Camera Timer Expired]: 30 seconds elapsed. Automatically turning off camera feed.")
+    logger.info("⏱️ [Camera Timer Expired]: Visual feed window elapsed. Turning off camera.")
 
     try:
         if on_toggle_camera:
@@ -48,6 +48,30 @@ def _on_camera_timer_expired(
                 camera_service.stop()
     except Exception as e:
         logger.warning("Error turning off camera on timer expiry: %s", e)
+
+    # Dispatch text interrupt to prompt Gemini Live to speak findings or re-open camera
+    try:
+        if live_client and getattr(live_client, "is_connected", False):
+            prompt = (
+                "[SYSTEM NOTIFICATION]: The camera observation feed has ended and the camera is now closed. "
+                "Please report and summarize what you observed out loud to the user now, "
+                "or call the 'camera' tool again if you still need visual input to answer their request."
+            )
+            loop = getattr(live_client, "_loop", None)
+            if loop and loop.is_running():
+                import asyncio
+                asyncio.run_coroutine_threadsafe(live_client.interrupt_with_text(prompt), loop)
+            elif loop:
+                loop.create_task(live_client.interrupt_with_text(prompt))
+            elif hasattr(live_client, "interrupt_with_text"):
+                import asyncio
+                try:
+                    current_loop = asyncio.get_running_loop()
+                    current_loop.create_task(live_client.interrupt_with_text(prompt))
+                except RuntimeError:
+                    pass
+    except Exception as e:
+        logger.warning("Error dispatching camera expiry text interrupt: %s", e)
 
 
 def execute_camera_tool(

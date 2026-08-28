@@ -693,8 +693,8 @@ class GeminiLiveClient:
             if not self.is_connected or self._stop_event.is_set():
                 break
 
-            # If model is actively speaking or buffering audio, keep timer refreshed
-            if self._model_turn_active or self.player.is_speaking:
+            # If model is actively speaking, buffering audio, or streaming camera video, keep timer refreshed
+            if self._model_turn_active or self.player.is_speaking or self._is_camera_streaming:
                 self._last_user_activity_at = time.monotonic()
                 continue
 
