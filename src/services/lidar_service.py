@@ -506,7 +506,8 @@ class LidarService:
 
         for pt in points:
             dist = pt.distance_mm
-            if dist < 40 or dist > 16000:  # Filter out out-of-range/zero readings
+            # Filter out robot chassis reflections (< 170mm) and out-of-range (> 16000mm)
+            if dist < 170 or dist > 16000:
                 continue
 
             angle = pt.angle_deg

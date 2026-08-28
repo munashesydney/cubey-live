@@ -147,9 +147,9 @@ class AutoNavigator:
                     time.sleep(0.10)
                     continue
 
-                # 2. Check real-time LiDAR safety collision buffer
+                # 2. Check real-time LiDAR safety collision buffer (ignoring robot chassis < 170mm)
                 min_front = self.lidar_service.latest_scan.min_front_dist_mm
-                if min_front < self.safety_stop_dist_mm:
+                if 170 <= min_front < self.safety_stop_dist_mm:
                     if self.state == NavigationState.NAVIGATING:
                         logger.warning(
                             "Autonomous Navigation Obstacle Warning: %d mm in front. Halting.",
@@ -176,7 +176,7 @@ class AutoNavigator:
             except Exception as e:
                 logger.error("Error in AutoNavigator loop: %s", e, exc_info=True)
 
-            time.sleep(0.10)
+            time.sleep(0.08)
 
     # ------------------------------------------------------------------
     # Frontier Selection & Path Generation
@@ -238,7 +238,7 @@ class AutoNavigator:
         if planned_path and chosen_target:
             with self._lock:
                 self.current_path = planned_path
-                self.current_waypoint_idx = 1  # Skip start point (robot's current pose)
+                self.current_waypoint_idx = 0
                 self.target_frontier = chosen_target
                 self.state = NavigationState.NAVIGATING
             logger.info(
@@ -247,41 +247,47 @@ class AutoNavigator:
                 chosen_target,
             )
         else:
-            # If path planner was blocked by tight inflation, spin slightly to clear view
-            logger.info("Frontier path blocked by narrow corridor. Rotating to clear view.")
+            # If path planner was blocked by narrow corridor, steer smoothly to clear view
+            logger.info("Frontier path blocked. Steering to open field of view.")
             self.wheels_service.set_speed(self.drive_speed)
-            self.wheels_service.pulse("rotateRight", 300)
-            time.sleep(0.4)
+            self.wheels_service.pulse("rotateRight", 250)
+            time.sleep(0.3)
 
     # ------------------------------------------------------------------
-    # Waypoint Following & Mecanum Trajectory Controller
+    # Pure-Pursuit Waypoint Following & Smooth Motion Controller
     # ------------------------------------------------------------------
 
     def _follow_path(self) -> None:
-        """Steer mecanum wheel base along the calculated A* waypoint route."""
-        if not self.current_path or self.current_waypoint_idx >= len(self.current_path):
-            # Reached end of path! Re-evaluate frontiers
+        """Steer mecanum wheel base along the calculated A* waypoint route with look-ahead pure pursuit."""
+        if not self.current_path:
             self.wheels_service.stop()
             self.state = NavigationState.PLANNING
             return
 
-        target_x, target_y = self.current_path[self.current_waypoint_idx]
         robot_pose = self.mapping_service.pose
+        LOOKAHEAD_DIST_M = 0.35  # Look ahead 35 cm along path for smooth curves
 
+        # Advance waypoint index along path until finding a point >= LOOKAHEAD_DIST_M away
+        while self.current_waypoint_idx < len(self.current_path) - 1:
+            wp_x, wp_y = self.current_path[self.current_waypoint_idx]
+            dist_to_wp = math.hypot(wp_x - robot_pose.x_m, wp_y - robot_pose.y_m)
+            if dist_to_wp >= LOOKAHEAD_DIST_M:
+                break
+            self.current_waypoint_idx += 1
+
+        # Check if arrived at final destination waypoint
+        final_x, final_y = self.current_path[-1]
+        dist_to_final = math.hypot(final_x - robot_pose.x_m, final_y - robot_pose.y_m)
+        if dist_to_final < self.waypoint_reach_dist_m:
+            logger.info("Reached frontier destination! Re-evaluating next room...")
+            self.wheels_service.stop()
+            self.state = NavigationState.PLANNING
+            return
+
+        # Target look-ahead waypoint
+        target_x, target_y = self.current_path[self.current_waypoint_idx]
         dx = target_x - robot_pose.x_m
         dy = target_y - robot_pose.y_m
-        dist = math.hypot(dx, dy)
-
-        # Check if arrived at current waypoint
-        if dist < self.waypoint_reach_dist_m:
-            self.current_waypoint_idx += 1
-            if self.current_waypoint_idx >= len(self.current_path):
-                self.wheels_service.stop()
-                self.state = NavigationState.PLANNING
-                return
-            target_x, target_y = self.current_path[self.current_waypoint_idx]
-            dx = target_x - robot_pose.x_m
-            dy = target_y - robot_pose.y_m
 
         # Target angle in world frame (0° = North / +Y, 90° = East / +X, clockwise)
         target_heading_rad = math.atan2(dx, dy)
@@ -292,15 +298,15 @@ class AutoNavigator:
 
         self.wheels_service.set_speed(self.drive_speed)
 
-        # Mecanum Steering Logic
-        if abs(heading_diff) > 40.0:
-            # Significant angle mismatch: rotate in place to face target
+        # Smooth Continuous Mecanum Steering
+        if abs(heading_diff) > 55.0:
+            # Significant angle mismatch: rotate smoothly towards target
             cmd = "rotateRight" if heading_diff > 0 else "rotateLeft"
-            self.wheels_service.pulse(cmd, 180)
+            self.wheels_service.move(cmd)
         elif abs(heading_diff) > 18.0:
-            # Moderate angle mismatch: curve forward
+            # Moderate angle mismatch: curve smoothly forward
             cmd = "forwardRight" if heading_diff > 0 else "forwardLeft"
-            self.wheels_service.pulse(cmd, 220)
+            self.wheels_service.move(cmd)
         else:
             # Aligned: drive straight forward
-            self.wheels_service.pulse("forward", 220)
+            self.wheels_service.move("forward")

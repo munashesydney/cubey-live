@@ -285,7 +285,7 @@ class MappingService:
 
         for pt in scan_points:
             dist_m = pt.distance_mm / 1000.0
-            if dist_m < 0.15 or dist_m > 14.0:
+            if dist_m < 0.17 or dist_m > 14.0:
                 continue
 
             pt_rad = math.radians(pt.angle_deg)
