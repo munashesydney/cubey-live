@@ -2,11 +2,12 @@
 Cubeo Robot Face page.
 High-performance super-sampled PIL anti-aliased graphics engine rendering smooth,
 expressive EMO-style robot eyes, sleep breathing animations with floating Zzz snore particles,
-and sleek glowing charging HUD indicators.
+and sleek glowing charging & listening HUD indicators.
 """
 
 import logging
 import math
+import os
 import random
 import time
 import tkinter as tk
@@ -59,7 +60,7 @@ class RobotFacePage(ctk.CTkFrame):
         self.battery_pct = 100
         self.is_sleeping = False
 
-        # Wake Word / Gemini Live Listening State & Side Waves
+        # Wake Word / Gemini Live Listening State & Top HUD Indicator
         self.is_listening = False
         self.listening_intensity = 0.0
         self.current_mic_level = 0.0
@@ -111,7 +112,7 @@ class RobotFacePage(ctk.CTkFrame):
         self.animation_engine.set_sleeping(is_sleeping)
 
     def set_listening(self, is_listening: bool) -> None:
-        """Toggle listening state for glowing side wave visualizer."""
+        """Toggle listening state for glowing top listening HUD indicator."""
         self.is_listening = is_listening
         if is_listening:
             # Wake up if sleeping when listening begins
@@ -151,7 +152,7 @@ class RobotFacePage(ctk.CTkFrame):
         self._last_frame_at = frame_started
         self.animation_engine.update_animation_frame(frame_scale=elapsed * 60.0)
 
-        # Smoothly interpolate listening intensity (side wave fade-in / fade-out)
+        # Smoothly interpolate listening intensity (top HUD fade-in / fade-out)
         target_intensity = 1.0 if self.is_listening else 0.0
         self.listening_intensity += (target_intensity - self.listening_intensity) * min(1.0, elapsed * 8.0)
         if abs(self.listening_intensity - target_intensity) < 0.01:
@@ -162,7 +163,7 @@ class RobotFacePage(ctk.CTkFrame):
         self.after(delay_ms, self._animation_loop)
 
     def _draw_face(self) -> None:
-        """Render ultra-fast, smooth PIL image of EMO eyes, sleep Zzz, listening waves, and charging HUD onto canvas."""
+        """Render ultra-fast, smooth PIL image of EMO eyes, sleep Zzz, listening HUD, and charging HUD onto canvas."""
         w = self.canvas.winfo_width()
         h = self.canvas.winfo_height()
 
@@ -258,13 +259,28 @@ class RobotFacePage(ctk.CTkFrame):
         if self.animation_engine.is_sleeping or shape_mode == "crescent_sleep":
             self._draw_zzz_particles(draw_main, right_cx, cy, base_scale, now)
 
-        # Draw Glowing Charging HUD Battery Indicator if charging
-        if self.is_charging or self.animation_engine.is_charging:
-            self._draw_charging_hud(draw_main, w, h, base_scale, now)
+        # Calculate layout offsets for top status HUDs (Charging & Listening)
+        is_charging_active = self.is_charging or self.animation_engine.is_charging
+        is_listening_active = self.listening_intensity > 0.01
 
-        # Draw Glowing Colored Listening Side Waves if active
-        if self.listening_intensity > 0.01:
-            self._draw_listening_waves(draw_main, w, h, base_scale, now)
+        batt_w = 95 * base_scale
+        pill_w = 95 * base_scale
+
+        if is_charging_active and is_listening_active:
+            # Side-by-side balanced dual status pills at top center
+            charge_offset_x = 24 * base_scale + (batt_w * 0.5)
+            listen_offset_x = - (pill_w * 0.5) - 16 * base_scale
+        else:
+            charge_offset_x = 0.0
+            listen_offset_x = 0.0
+
+        # Draw Glowing Charging HUD Battery Indicator if charging
+        if is_charging_active:
+            self._draw_charging_hud(draw_main, w, h, base_scale, now, offset_x=charge_offset_x)
+
+        # Draw Sleek Glowing Listening HUD Indicator if active
+        if is_listening_active:
+            self._draw_listening_hud(draw_main, w, h, base_scale, now, offset_x=listen_offset_x)
 
         # Update Tkinter canvas image efficiently
         self._tk_img = ImageTk.PhotoImage(pil_img)
@@ -510,11 +526,12 @@ class RobotFacePage(ctk.CTkFrame):
         h: int,
         base_scale: float,
         now: float,
+        offset_x: float = 0.0,
     ) -> None:
         """Render sleek, animated OLED charging indicator with pulsing lightning bolt."""
         batt_w = 95 * base_scale
         batt_h = 28 * base_scale
-        bx = (w * 0.5) - (batt_w * 0.5)
+        bx = (w * 0.5) - (batt_w * 0.5) + offset_x
         by = 22 * base_scale
         rad = 7 * base_scale
 
@@ -593,6 +610,151 @@ class RobotFacePage(ctk.CTkFrame):
         ]
         draw.polygon(pts, fill=color)
 
+    def _draw_listening_hud(
+        self,
+        draw: ImageDraw.ImageDraw,
+        w: int,
+        h: int,
+        base_scale: float,
+        now: float,
+        offset_x: float = 0.0,
+    ) -> None:
+        """
+        Render sleek, animated production-grade OLED listening HUD with pulsing mic glyph
+        and dynamic audio-reactive equalizer bars.
+        Visualizes active listening state (wake word / Gemini live listening) modulated by mic audio level.
+        """
+        intensity = self.listening_intensity
+        if intensity <= 0.01:
+            return
+
+        pill_w = 95 * base_scale
+        pill_h = 28 * base_scale
+        bx = (w * 0.5) - (pill_w * 0.5) + offset_x
+        by = 22 * base_scale
+        rad = 7 * base_scale
+
+        # 1. Subtle glowing dark background pill
+        pulse = 0.85 + 0.15 * math.sin(now * 3.5)
+        border_col = (
+            int(0 * intensity),
+            int(240 * pulse * intensity),
+            int(255 * pulse * intensity),
+        )
+        bg_col = (
+            int(18 * intensity),
+            int(24 * intensity),
+            int(32 * intensity),
+        )
+
+        draw.rounded_rectangle(
+            [bx, by, bx + pill_w, by + pill_h],
+            radius=rad,
+            fill=bg_col,
+            outline=border_col,
+            width=int(max(1, 2 * base_scale)),
+        )
+
+        # 2. Pulsing Electric 🎙️ Microphone Glyph Icon
+        mic_x = bx - 20 * base_scale
+        mic_y = by + pill_h / 2.0
+        mic_size = 14 * base_scale
+        mic_col = (
+            int(0 * intensity),
+            int(240 * intensity),
+            int(255 * intensity),
+        )
+        self._draw_mic_glyph(draw, mic_x, mic_y, mic_size, mic_col, now)
+
+        # 3. Dynamic audio-reactive equalizer bars inside pill
+        num_bars = 5
+        pad_x = 12 * base_scale
+        inner_w = pill_w - (pad_x * 2)
+        bar_w = max(2.0, 4.5 * base_scale)
+        spacing = (inner_w - (num_bars * bar_w)) / max(1, num_bars - 1)
+        center_y = by + pill_h / 2.0
+        max_bar_h = pill_h - (8 * base_scale)
+        min_bar_h = 4 * base_scale
+
+        for i in range(num_bars):
+            bar_cx = bx + pad_x + (bar_w / 2.0) + (i * (bar_w + spacing))
+            norm_i = i / max(1, num_bars - 1)
+            # Symmetrical parabolic envelope (center bars taller)
+            env = math.sin(norm_i * math.pi)
+
+            # Idle ambient fluid wave (subtle wave pulse across bars)
+            idle_wave = math.sin((now * 4.5) + (i * 1.1)) * 0.5 + 0.5
+            idle_h = (3.5 * base_scale) * idle_wave
+
+            # Audio-reactive expansion from real microphone input
+            audio_pulse = math.sin((now * 9.0) + (i * 1.8)) * 0.35 + 0.65
+            audio_h = (max_bar_h - min_bar_h - idle_h) * self.current_mic_level * (0.35 + 0.65 * env) * audio_pulse
+
+            bar_h = min(max_bar_h, (min_bar_h + idle_h + audio_h) * intensity)
+            bar_h = max(2.0 * base_scale, bar_h)
+
+            # Color: Vibrant cyan to bright sky-blue highlight when speech is active
+            g_boost = int(40 * self.current_mic_level * intensity)
+            bar_col = (
+                int(0 * intensity),
+                min(255, int(215 * intensity) + g_boost),
+                int(255 * intensity),
+            )
+
+            half_h = bar_h / 2.0
+            half_w = bar_w / 2.0
+            draw.rounded_rectangle(
+                [bar_cx - half_w, center_y - half_h, bar_cx + half_w, center_y + half_h],
+                radius=max(1.0, half_w),
+                fill=bar_col,
+            )
+
+    def _draw_mic_glyph(
+        self,
+        draw: ImageDraw.ImageDraw,
+        cx: float,
+        cy: float,
+        size: float,
+        color: tuple,
+        now: float,
+    ) -> None:
+        """Draw a sleek, crisp vector 🎙️ microphone glyph."""
+        s = (size / 2.0) * (1.0 + 0.10 * math.sin(now * 4.5))
+
+        # 1. Microphone capsule body
+        cap_w = s * 0.62
+        cap_h = s * 1.05
+        cap_r = cap_w / 2.0
+        draw.rounded_rectangle(
+            [cx - cap_r, cy - s * 0.75, cx + cap_r, cy - s * 0.75 + cap_h],
+            radius=cap_r,
+            fill=color,
+        )
+
+        # 2. U-shaped cradle arc
+        th = max(1, int(s * 0.20))
+        draw.arc(
+            [cx - s * 0.58, cy - s * 0.40, cx + s * 0.58, cy + s * 0.55],
+            start=0,
+            end=180,
+            fill=color,
+            width=th,
+        )
+
+        # 3. Vertical stem
+        draw.line(
+            [(cx, cy + s * 0.55), (cx, cy + s * 0.90)],
+            fill=color,
+            width=th,
+        )
+
+        # 4. Horizontal base stand
+        draw.line(
+            [(cx - s * 0.42, cy + s * 0.90), (cx + s * 0.42, cy + s * 0.90)],
+            fill=color,
+            width=th,
+        )
+
     def _draw_listening_waves(
         self,
         draw: ImageDraw.ImageDraw,
@@ -601,70 +763,10 @@ class RobotFacePage(ctk.CTkFrame):
         base_scale: float,
         now: float,
     ) -> None:
-        """
-        Render dynamic, multi-harmonic glowing colored audio/frequency waves on left & right screen sides.
-        Visualizes active listening state (wake word / Gemini live listening) modulated by mic audio level.
-        """
-        intensity = self.listening_intensity
-        if intensity <= 0.01:
-            return
-
-        # Audio boost factor from real-time microphone level
-        mic_boost = 1.0 + (self.current_mic_level * 5.0)
-
-        # Harmonic layer definitions: (Color RGB, speed, freq, phase_offset, stroke_width, amp_scale)
-        wave_layers = [
-            ((0, 240, 255), 4.2, 3.0, 0.0, 2.5, 1.0),       # Electric Cyan
-            ((255, 110, 200), -3.5, 3.8, 1.5, 2.0, 0.75),   # Magenta / Violet
-        ]
-
-        cy = h * 0.5
-        wave_height = h * 0.65
-        half_h = wave_height / 2.0
-        steps = 18
-
-        # Base margin from edges
-        left_base_x = 36 * base_scale
-        right_base_x = w - (36 * base_scale)
-        max_amplitude = (18 * base_scale) * mic_boost * intensity
-
-        # Render Left & Right Waves
-        for base_x, direction in [(left_base_x, 1.0), (right_base_x, -1.0)]:
-            for rgb_color, speed, freq, phase_off, stroke_w, amp_scale in wave_layers:
-                col = tuple(max(0, min(255, int(c * intensity))) for c in rgb_color)
-                line_width = max(1, int(stroke_w * base_scale))
-
-                points = []
-                for i in range(steps + 1):
-                    t = i / steps
-                    y = (cy - half_h) + (t * wave_height)
-                    envelope = math.sin(t * math.pi)
-                    angle = (t * math.pi * freq) + (now * speed) + phase_off
-                    dx = math.sin(angle) * max_amplitude * amp_scale * envelope * direction
-                    points.append((base_x + dx, y))
-
-                if len(points) >= 2:
-                    draw.line(points, fill=col, width=line_width, joint="curve")
-
-            # Sleek center energy equalizer bars
-            num_bars = 5
-            bar_spacing = (wave_height * 0.40) / max(1, num_bars - 1)
-            bar_start_y = cy - (wave_height * 0.20)
-
-            for bi in range(num_bars):
-                by = bar_start_y + (bi * bar_spacing)
-                benv = math.sin((bi / max(1, num_bars - 1)) * math.pi)
-                pulse = math.sin((now * 5.0) + bi * 1.0) * 0.5 + 0.5
-                bar_len = ((6.0 + pulse * 12.0 * mic_boost) * base_scale * intensity) * benv
-                bx1 = base_x - (direction * 14 * base_scale)
-                bx2 = bx1 + (direction * bar_len)
-                b_color = (
-                    int(0 * intensity),
-                    int(240 * (0.6 + 0.4 * pulse) * intensity),
-                    int(255 * intensity),
-                )
-                draw.line([(bx1, by), (bx2, by)], fill=b_color, width=max(1, int(2 * base_scale)))
+        """Backwards-compatible alias forwarding to _draw_listening_hud."""
+        self._draw_listening_hud(draw, w, h, base_scale, now)
 
     def trigger_reaction(self, reaction_type: str) -> None:
         """Trigger an emotional eye reaction using EyeAnimationEngine."""
         self.animation_engine.trigger_reaction(reaction_type, self.after)
+

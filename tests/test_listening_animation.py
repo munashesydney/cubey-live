@@ -1,5 +1,5 @@
 """
-Unit tests for ListeningReaction, EyeAnimationEngine registration, and side wave visualizer.
+Unit tests for ListeningReaction, EyeAnimationEngine registration, and top HUD listening visualizer.
 """
 
 import math
@@ -59,25 +59,57 @@ class TestListeningAnimation(unittest.TestCase):
         self.assertEqual(self.engine.target_slant_l, 5.0)
         schedule_after_mock.assert_called_once()
 
-    def test_draw_listening_waves_renders_cleanly(self):
-        """Verify _draw_listening_waves renders onto PIL canvas without error."""
+    def test_draw_listening_hud_renders_cleanly(self):
+        """Verify _draw_listening_hud renders onto PIL canvas without error."""
         page = RobotFacePage.__new__(RobotFacePage)
         page.listening_intensity = 1.0
         page.current_mic_level = 0.5
+        page.is_charging = False
+        page.animation_engine = self.engine
         now = time.time()
 
         if HAS_PIL:
             img = Image.new("RGB", (1104, 631), (10, 10, 15))
             draw = ImageDraw.Draw(img)
-            page._draw_listening_waves(draw, 1104, 631, base_scale=1.0, now=now)
-            pixels = list(img.getdata())
+            page._draw_listening_hud(draw, 1104, 631, base_scale=1.0, now=now)
+            pixels = list(img.getdata()) if hasattr(img, "getdata") else []
             has_non_bg = any(p != (10, 10, 15) for p in pixels)
-            self.assertTrue(has_non_bg, "Listening waves should draw colored pixels onto canvas")
+            self.assertTrue(has_non_bg, "Listening HUD should draw colored pixels onto canvas")
         else:
             draw_mock = MagicMock()
-            page._draw_listening_waves(draw_mock, 1104, 631, base_scale=1.0, now=now)
-            self.assertGreater(draw_mock.line.call_count, 0)
+            page._draw_listening_hud(draw_mock, 1104, 631, base_scale=1.0, now=now)
+            self.assertGreater(draw_mock.rounded_rectangle.call_count, 0)
+
+    def test_draw_mic_glyph_renders_cleanly(self):
+        """Verify vector _draw_mic_glyph renders without error."""
+        page = RobotFacePage.__new__(RobotFacePage)
+        now = time.time()
+
+        if HAS_PIL:
+            img = Image.new("RGB", (200, 200), (10, 10, 15))
+            draw = ImageDraw.Draw(img)
+            page._draw_mic_glyph(draw, 100, 100, 24.0, (0, 240, 255), now)
+            pixels = list(img.getdata()) if hasattr(img, "getdata") else []
+            has_non_bg = any(p != (10, 10, 15) for p in pixels)
+            self.assertTrue(has_non_bg, "Microphone glyph should draw colored pixels")
+        else:
+            draw_mock = MagicMock()
+            page._draw_mic_glyph(draw_mock, 100, 100, 24.0, (0, 240, 255), now)
+            self.assertGreater(draw_mock.rounded_rectangle.call_count, 0)
+
+    def test_draw_listening_waves_alias(self):
+        """Verify _draw_listening_waves backwards-compatible alias forwards to _draw_listening_hud."""
+        page = RobotFacePage.__new__(RobotFacePage)
+        page.listening_intensity = 1.0
+        page.current_mic_level = 0.5
+        page._draw_listening_hud = MagicMock()
+        draw_mock = MagicMock()
+        now = time.time()
+
+        page._draw_listening_waves(draw_mock, 1104, 631, 1.0, now)
+        page._draw_listening_hud.assert_called_once_with(draw_mock, 1104, 631, 1.0, now)
 
 
 if __name__ == "__main__":
     unittest.main()
+
