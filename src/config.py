@@ -144,6 +144,14 @@ class AppConfig:
         "CAMERA_AUTO_START_WITH_LIVE", "false"
     ).strip().lower() not in {"0", "false", "no", "off"}
 
+    # Waveshare / Slamtec RPLIDAR C1 Parameters
+    lidar_port: str = os.getenv("LIDAR_PORT", "")
+    lidar_baudrate: int = int(os.getenv("LIDAR_BAUDRATE", "460800"))
+    lidar_safety_distance_mm: int = int(os.getenv("LIDAR_SAFETY_DISTANCE_MM", "300"))
+    lidar_auto_connect: bool = os.getenv(
+        "LIDAR_AUTO_CONNECT", "false"
+    ).strip().lower() not in {"0", "false", "no", "off"}
+
     def validate(self) -> None:
         """Validate critical configuration fields."""
         if not self.api_key:

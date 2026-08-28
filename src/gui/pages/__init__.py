@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .home_page import HomePage
+    from .lidar_page import LidarPage
     from .live_page import LivePage
     from .local_chat_page import LocalChatPage
     from .memory_page import MemoryPage
@@ -19,6 +20,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "HomePage",
+    "LidarPage",
     "LivePage",
     "LocalChatPage",
     "MemoryPage",
@@ -29,6 +31,7 @@ __all__ = [
 
 _PAGE_MODULES = {
     "HomePage": ".home_page",
+    "LidarPage": ".lidar_page",
     "LivePage": ".live_page",
     "LocalChatPage": ".local_chat_page",
     "MemoryPage": ".memory_page",

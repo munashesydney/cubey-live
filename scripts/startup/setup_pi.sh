@@ -63,6 +63,12 @@ sudo apt-get install -y \
     alsa-utils ffmpeg
 
 # ---------------------------------------------------------------------------
+# Serial & USB Hardware Permissions (ESP32 UART & RPLIDAR C1 USB Serial)
+# ---------------------------------------------------------------------------
+echo "==> Configuring serial permissions for ESP32 UART and RPLIDAR C1 (/dev/ttyUSB*)..."
+sudo usermod -a -G dialout,tty "${USER}" || true
+
+# ---------------------------------------------------------------------------
 # Python virtualenv + dependencies
 # ---------------------------------------------------------------------------
 VENV="${PROJECT_ROOT}/.venv"

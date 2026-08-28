@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 # (page key, card title, description, fg color, hover color)
 _PAGE_CARDS = [
     ("wheels", "🛞 Wheels", "Mecanum drive, motor testing & cliff sensors", "#FAB387", "#F5C2E7"),
+    ("lidar", "📡 LiDAR", "360° radar visualizer & collision detection", "#89DCEB", "#74C7EC"),
     ("live", "✨ Gemini Live", "Session controls, events, transcripts & logs", "#A6E3A1", "#94E2D5"),
     ("local", "🦙 Local Chat", "Chat with the on-device Qwen model", "#CBA6F7", "#B4BEFE"),
     ("memories", "🧠 Memories", "Cubey's durable long-term memory bank", "#74C7EC", "#89DCEB"),

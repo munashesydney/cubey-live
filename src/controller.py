@@ -32,6 +32,7 @@ from src.services.task_scheduler import TaskScheduler
 from src.services.transcript_persistence import TranscriptPersistenceService
 from src.services.wake_word import WakeWordService
 from src.services.wheels_service import get_wheels_service
+from src.services.lidar_service import get_lidar_service
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +136,10 @@ class ApplicationController:
                 self.recorder.stop()
             if self.player:
                 self.player.stop()
+            try:
+                get_lidar_service().disconnect()
+            except Exception:
+                pass
             self.transcript_persistence.set_realtime_active(False)
             self.transcript_persistence.stop()
             self.task_scheduler.stop()

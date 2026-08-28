@@ -15,6 +15,7 @@ import customtkinter as ctk
 from src.config import AppConfig
 from src.gui.pages import (
     HomePage,
+    LidarPage,
     LivePage,
     LocalChatPage,
     MemoryPage,
@@ -33,6 +34,7 @@ class DeveloperWindow(ctk.CTkToplevel):
     NAV_ITEMS = [
         ("home", "🏠 Home"),
         ("wheels", "🛞 Wheels"),
+        ("lidar", "📡 LiDAR"),
         ("live", "✨ Gemini Live"),
         ("local", "🦙 Local Chat"),
         ("memories", "🧠 Memories"),
@@ -134,6 +136,7 @@ class DeveloperWindow(ctk.CTkToplevel):
             self.page_container, config=self.config, on_navigate=self.show_page
         )
         self._pages["wheels"] = WheelsPage(self.page_container)
+        self._pages["lidar"] = LidarPage(self.page_container)
         self._pages["live"] = LivePage(
             self.page_container,
             config=self.config,
