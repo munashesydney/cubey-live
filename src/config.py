@@ -134,7 +134,8 @@ class AppConfig:
 
     # Real-Time Camera & Multimodal Vision Parameters
     camera_device_index: int = int(os.getenv("CAMERA_DEVICE_INDEX", "0"))
-    camera_fps: int = int(os.getenv("CAMERA_FPS", "30"))
+    camera_fps: int = int(os.getenv("CAMERA_FPS", "15"))
+    camera_preview_fps: int = int(os.getenv("CAMERA_PREVIEW_FPS", "10"))
     camera_live_fps: float = float(os.getenv("CAMERA_LIVE_FPS", "1.0"))
     camera_width: int = int(os.getenv("CAMERA_WIDTH", "640"))
     camera_height: int = int(os.getenv("CAMERA_HEIGHT", "480"))

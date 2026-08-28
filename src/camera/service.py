@@ -111,7 +111,7 @@ class CameraService:
             if callback in self._preview_listeners:
                 self._preview_listeners.remove(callback)
 
-    def start(self, wait_ready: bool = False, timeout: float = 1.0) -> bool:
+    def start(self, wait_ready: bool = False, timeout: float = 3.0) -> bool:
         """Start background camera capture thread."""
         with self._lock:
             if self._is_running:
@@ -213,12 +213,43 @@ class CameraService:
             self.stop()
             self.start(wait_ready=True)
 
-    def get_latest_frame_pil(self) -> Optional[Image.Image]:
-        """Return the latest frame as a PIL Image (RGB format)."""
+    def get_latest_frame_pil(
+        self, target_size: Optional[tuple[int, int]] = None
+    ) -> Optional[Image.Image]:
+        """
+        Return the latest frame as a PIL Image (RGB format).
+        If target_size is provided, performs fast SIMD resizing via OpenCV.
+        """
         with self._lock:
-            if not self._is_running or self._latest_rgb is None:
+            if not self._is_running or self._latest_bgr is None:
                 return None
-            rgb_copy = self._latest_rgb.copy()
+            bgr_copy = self._latest_bgr.copy()
+            rgb_copy = self._latest_rgb.copy() if (target_size is None and self._latest_rgb is not None) else None
+
+        if target_size is not None:
+            w, h = max(10, int(target_size[0])), max(10, int(target_size[1]))
+            if cv2 is not None:
+                try:
+                    resized_bgr = cv2.resize(bgr_copy, (w, h), interpolation=cv2.INTER_LINEAR)
+                    rgb_scaled = cv2.cvtColor(resized_bgr, cv2.COLOR_BGR2RGB)
+                    return Image.fromarray(rgb_scaled)
+                except Exception as e:
+                    logger.debug("OpenCV resize failed: %s", e)
+            # Fallback to Pillow scaling
+            try:
+                rgb = cv2.cvtColor(bgr_copy, cv2.COLOR_BGR2RGB) if cv2 is not None else bgr_copy[:, :, ::-1]
+                pil_raw = Image.fromarray(rgb)
+                return pil_raw.resize((w, h), Image.Resampling.BILINEAR)
+            except Exception as e:
+                logger.debug("Pillow resize fallback failed: %s", e)
+                return None
+
+        if rgb_copy is None:
+            rgb_copy = (
+                cv2.cvtColor(bgr_copy, cv2.COLOR_BGR2RGB)
+                if cv2 is not None
+                else bgr_copy[:, :, ::-1].copy()
+            )
         try:
             return Image.fromarray(rgb_copy)
         except Exception as e:
@@ -462,11 +493,17 @@ class CameraService:
                 sim_angle = (sim_angle + 0.05) % (2 * 3.14159)
                 bgr_frame = self._generate_test_pattern_bgr(sim_angle)
 
-            # Convert to RGB for Pillow / GUI
-            if cv2 is not None:
-                rgb_frame = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
-            else:
-                rgb_frame = bgr_frame[:, :, ::-1].copy()
+            # Convert to RGB for Pillow / GUI only when listeners exist
+            with self._listeners_lock:
+                has_listeners = len(self._preview_listeners) > 0
+                listeners = list(self._preview_listeners) if has_listeners else []
+
+            rgb_frame = None
+            if has_listeners:
+                if cv2 is not None:
+                    rgb_frame = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
+                else:
+                    rgb_frame = bgr_frame[:, :, ::-1].copy()
 
             # Store in thread-safe buffer
             now = time.monotonic()
@@ -477,11 +514,7 @@ class CameraService:
                 self._latest_timestamp = now
                 self._frame_count += 1
 
-            # Dispatch to preview listeners (GUI)
-            with self._listeners_lock:
-                listeners = list(self._preview_listeners)
-
-            if listeners:
+            if listeners and rgb_frame is not None:
                 try:
                     pil_img = Image.fromarray(rgb_frame)
                     for listener in listeners:

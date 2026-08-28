@@ -27,8 +27,15 @@ class TestCameraGUI(unittest.TestCase):
             camera_height=240,
         )
         self.camera_service = CameraService(self.config)
+        self.pages = []
 
     def tearDown(self):
+        for page in self.pages:
+            try:
+                page.destroy()
+            except Exception:
+                pass
+        self.pages.clear()
         if self.camera_service.is_running:
             self.camera_service.stop()
         try:
@@ -55,6 +62,7 @@ class TestCameraGUI(unittest.TestCase):
             on_set_camera_device=mock_set_dev,
             on_send_snapshot=mock_snapshot,
         )
+        self.pages.append(page)
 
         self.assertIsNotNone(page.camera_switch)
         self.assertIsNotNone(page.camera_btn)
@@ -81,6 +89,7 @@ class TestCameraGUI(unittest.TestCase):
             on_toggle_mute=MagicMock(),
             camera_service=self.camera_service,
         )
+        self.pages.append(page)
 
         page.set_vision_state(True)
         self.assertTrue(page.is_camera_active)
@@ -93,6 +102,31 @@ class TestCameraGUI(unittest.TestCase):
         page.set_vision_state(False)
         self.assertFalse(page.is_camera_active)
         self.assertIn("CAMERA OFF", page.vision_badge.cget("text"))
+
+    def test_preview_loop_tab_visibility(self):
+        """_render_preview_loop should skip rendering when camera tab is not active."""
+        page = LivePage(
+            self.root,
+            config=self.config,
+            on_start_session=MagicMock(),
+            on_stop_session=MagicMock(),
+            on_send_interruption=MagicMock(),
+            on_toggle_mute=MagicMock(),
+            camera_service=self.camera_service,
+        )
+        self.pages.append(page)
+        self.camera_service.start()
+        page.set_vision_state(True)
+
+        # Tab is on Camera Vision initially -> render loop should configure label
+        page.right_panel.set("👁️ Camera Vision")
+        page._render_preview_loop()
+        self.assertIsNotNone(page.video_label.cget("image"))
+
+        # Switch tab to Live Transcript -> render loop should skip updating
+        page.right_panel.set("💬 Live Transcript")
+        # Should not raise and should cleanly return
+        page._render_preview_loop()
 
 
 if __name__ == "__main__":

@@ -54,6 +54,11 @@ class TestCameraService(unittest.TestCase):
         self.assertIsInstance(pil_frame, Image.Image)
         self.assertEqual(pil_frame.size, (320, 240))
 
+        # Test fast SIMD target_size scaling
+        scaled_frame = self.service.get_latest_frame_pil(target_size=(160, 120))
+        self.assertIsNotNone(scaled_frame)
+        self.assertEqual(scaled_frame.size, (160, 120))
+
         jpeg_bytes = self.service.get_latest_frame_jpeg()
         self.assertIsNotNone(jpeg_bytes)
         self.assertTrue(len(jpeg_bytes) > 100)
@@ -113,9 +118,9 @@ class TestCameraService(unittest.TestCase):
         with patch("src.camera.service.Picamera2", return_value=mock_picam), \
              patch("platform.system", return_value="Linux"):
             service = CameraService(self.config)
-            started = service.start()
+            started = service.start(wait_ready=True, timeout=5.0)
             self.assertTrue(started)
-            time.sleep(0.1)
+            service.wait_until_ready(timeout=5.0)
 
             self.assertEqual(service.active_backend, "picamera2")
             mock_picam.create_preview_configuration.assert_called_once()

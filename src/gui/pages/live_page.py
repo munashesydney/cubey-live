@@ -74,7 +74,7 @@ class LivePage(ctk.CTkFrame):
             self.camera_service.add_preview_listener(self._on_camera_frame_captured)
 
         # Start preview render loop
-        self.after(50, self._render_preview_loop)
+        self._preview_after_id = self.after(50, self._render_preview_loop)
 
     def _create_layout(self) -> None:
         """Header controls and main live-console grid."""
@@ -401,9 +401,11 @@ class LivePage(ctk.CTkFrame):
         self.video_footer = ctk.CTkFrame(self.tab_video, height=28, fg_color="#1E1E2E", corner_radius=6)
         self.video_footer.pack(fill="x", padx=8, pady=(4, 0))
 
+        preview_fps = getattr(self.app_config, "camera_preview_fps", 10)
+        live_fps = getattr(self.app_config, "camera_live_fps", 1.0)
         self.video_info_label = ctk.CTkLabel(
             self.video_footer,
-            text="⚡ Stream Rate: 1.0 FPS to Gemini Live | Local Preview: ~30 FPS",
+            text=f"⚡ Stream Rate: {live_fps:.1f} FPS to Gemini Live | Local Preview: ~{preview_fps} FPS",
             font=ctk.CTkFont(size=11),
             text_color="#BAC2DE",
         )
@@ -432,44 +434,69 @@ class LivePage(ctk.CTkFrame):
             self._latest_pil_frame = pil_img
 
     def _render_preview_loop(self) -> None:
-        """Periodic Tk mainloop task refreshing the video preview widget."""
+        """
+        Periodic Tk mainloop task refreshing the video preview widget.
+        Optimized with tab-visibility gating and fast OpenCV hardware-accelerated scaling.
+        """
+        preview_fps = getattr(self.app_config, "camera_preview_fps", 10)
+        loop_interval_ms = max(40, int(1000.0 / max(1, preview_fps)))
+
         try:
             if self.winfo_exists():
                 is_active = (
                     self.camera_service.is_running if self.camera_service else False
                 )
-                if is_active:
-                    with self._preview_lock:
-                        frame = self._latest_pil_frame
 
-                    if frame is not None:
+                # Tab-visibility check: only render when Camera Vision tab is active
+                current_tab = ""
+                try:
+                    current_tab = self.right_panel.get()
+                except Exception:
+                    pass
+
+                tab_is_camera = (current_tab == "👁️ Camera Vision")
+
+                if is_active:
+                    if tab_is_camera:
                         # Determine viewport size dynamically
                         vp_w = max(160, self.video_viewport.winfo_width() - 20)
                         vp_h = max(120, self.video_viewport.winfo_height() - 20)
-                        
-                        # Preserve aspect ratio
-                        img_w, img_h = frame.size
-                        aspect = img_w / max(1, img_h)
-                        
+
+                        aspect = (
+                            self.app_config.camera_width
+                            / max(1, self.app_config.camera_height)
+                        )
                         target_w = vp_w
                         target_h = int(target_w / aspect)
                         if target_h > vp_h:
                             target_h = vp_h
                             target_w = int(target_h * aspect)
 
-                        resized = frame.resize(
-                            (max(10, target_w), max(10, target_h)),
-                            Image.Resampling.BILINEAR,
-                        )
-                        self._preview_ctk_img = ctk.CTkImage(
-                            light_image=resized,
-                            dark_image=resized,
-                            size=(max(10, target_w), max(10, target_h)),
-                        )
-                        self.video_label.configure(
-                            image=self._preview_ctk_img,
-                            text="",
-                        )
+                        # Fetch pre-scaled frame using fast OpenCV SIMD scaling
+                        frame = None
+                        if self.camera_service:
+                            frame = self.camera_service.get_latest_frame_pil(
+                                target_size=(max(10, target_w), max(10, target_h))
+                            )
+                        if frame is None:
+                            with self._preview_lock:
+                                frame = self._latest_pil_frame
+                            if frame is not None and frame.size != (target_w, target_h):
+                                frame = frame.resize(
+                                    (max(10, target_w), max(10, target_h)),
+                                    Image.Resampling.BILINEAR,
+                                )
+
+                        if frame is not None:
+                            self._preview_ctk_img = ctk.CTkImage(
+                                light_image=frame,
+                                dark_image=frame,
+                                size=(max(10, target_w), max(10, target_h)),
+                            )
+                            self.video_label.configure(
+                                image=self._preview_ctk_img,
+                                text="",
+                            )
                 else:
                     if self.video_label.cget("text") == "":
                         self.video_label.configure(
@@ -482,7 +509,9 @@ class LivePage(ctk.CTkFrame):
             if not getattr(self, "_is_destroyed", False):
                 try:
                     if self.winfo_exists():
-                        self._preview_after_id = self.after(33, self._render_preview_loop)
+                        self._preview_after_id = self.after(
+                            loop_interval_ms, self._render_preview_loop
+                        )
                 except Exception:
                     pass
 
