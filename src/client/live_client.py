@@ -7,7 +7,7 @@ text interruptions, and native server-side voice barge-in.
 import asyncio
 import logging
 import time
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 from google import genai
 from google.genai import types
 
@@ -34,6 +34,7 @@ class GeminiLiveClient:
         on_tool_reaction: Optional[Callable[[str], None]] = None,
         on_session_ended: Optional[Callable[[], None]] = None,
         embedding_service: Optional[EmbeddingService] = None,
+        wheels_service: Optional[Any] = None,
     ):
         self.config = config
         self.recorder = recorder
@@ -44,6 +45,7 @@ class GeminiLiveClient:
         self.on_tool_reaction = on_tool_reaction
         self.on_session_ended = on_session_ended
         self.embedding_service = embedding_service
+        self.wheels_service = wheels_service
 
         self.is_connected = False
         self._session = None
@@ -392,6 +394,7 @@ class GeminiLiveClient:
                                 ToolContext(
                                     embedding_service=self.embedding_service,
                                     on_react=self._dispatch_tool_reaction,
+                                    wheels_service=self.wheels_service,
                                 ),
                             )
                             self.log(

@@ -5,7 +5,7 @@ Owns:
   - TOOL_SCHEMAS:      the neutral, OpenAI-style definitions (name, description,
                        JSON-schema parameters) for every tool.
   - MODEL_TOOL_POLICY: which tools each model may call:
-                         live_model -> react, messages, memories, current_time, tasks
+                         live_model -> react, move, messages, memories, current_time, tasks
                          local_model -> messages, memories, current_time, tasks
                          local_task_runner -> messages, memories, current_time
   - builders:          render the neutral schemas into Gemini Live
@@ -50,6 +50,62 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 }
             },
             "required": ["reaction_type"],
+        },
+    },
+    "move": {
+        "name": "move",
+        "description": (
+            "Controls Cubey's physical 4-wheel mecanum drive base. "
+            "Call this tool to drive forward, backward, turn/rotate in place, "
+            "drive diagonally, or stop. (Note: sideways strafing is disabled). "
+            "Use duration_seconds to control how long Cubey moves before stopping automatically."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": [
+                        "forward",
+                        "backward",
+                        "rotate_left",
+                        "rotate_right",
+                        "forward_left",
+                        "forward_right",
+                        "backward_left",
+                        "backward_right",
+                        "stop",
+                    ],
+                    "description": (
+                        "The direction or motion to perform: "
+                        "'forward' (drive straight ahead), "
+                        "'backward' (drive in reverse), "
+                        "'rotate_left' (spin left in place), "
+                        "'rotate_right' (spin right in place), "
+                        "'forward_left' (diagonal forward-left), "
+                        "'forward_right' (diagonal forward-right), "
+                        "'backward_left' (diagonal backward-left), "
+                        "'backward_right' (diagonal backward-right), "
+                        "or 'stop' (halt all motors immediately)."
+                    ),
+                },
+                "duration_seconds": {
+                    "type": "number",
+                    "description": (
+                        "How long to move in seconds before stopping automatically "
+                        "(e.g. 0.5 for a quick tap/step, 1.0, 2.0). Defaults to 1.0 second. "
+                        "Ignored if action is 'stop'."
+                    ),
+                },
+                "speed": {
+                    "type": "integer",
+                    "description": (
+                        "Optional motor speed between 70 (slow) and 255 (maximum speed). "
+                        "Default is 180."
+                    ),
+                },
+            },
+            "required": ["action"],
         },
     },
     "messages": {
@@ -247,12 +303,11 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
 # ---------------------------------------------------------------------------
 
 MODEL_TOOL_POLICY: dict[str, list[str]] = {
-    # Gemini Live: full agent — physical reactions + memory + history + tasks.
-    "live_model": ["react", "messages", "memories", "current_time", "tasks"],
-    # Interactive local Qwen shares memory/history and can schedule tasks.
+    # Gemini Live: full robot agent with physical movement, reactions, memory, history, tasks.
+    "live_model": ["react", "move", "messages", "memories", "current_time", "tasks"],
+    # Interactive local Qwen (no physical movement tool per design).
     "local_model": ["messages", "memories", "current_time", "tasks"],
-    # Scheduled runs execute an existing task. They deliberately cannot create,
-    # update, or delete tasks, preventing recursive task creation.
+    # Scheduled runs execute an existing task.
     "local_task_runner": ["messages", "memories", "current_time"],
 }
 
@@ -274,6 +329,7 @@ def tool_schemas_for(model_key: str) -> list[dict[str, Any]]:
 _TYPE_MAP = {
     "string": types.Type.STRING,
     "integer": types.Type.INTEGER,
+    "number": types.Type.NUMBER,
     "object": types.Type.OBJECT,
     "array": types.Type.ARRAY,
 }
@@ -343,6 +399,7 @@ class ToolContext:
 
     embedding_service: Optional[Any] = None
     on_react: Optional[Callable[[str], None]] = None
+    wheels_service: Optional[Any] = None
 
 
 def validate_tool_call(name: str, args: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -453,6 +510,16 @@ def dispatch_tool_call(name: str, args: dict[str, Any], context: ToolContext) ->
             return execute_react_tool(
                 reaction_type=args.get("reaction_type", "hurt"),
                 on_trigger_reaction=context.on_react,
+            )
+
+        if name == "move":
+            from src.client.tools.move import execute_move_tool
+
+            return execute_move_tool(
+                action=args.get("action", "forward"),
+                duration_seconds=float(args.get("duration_seconds", 1.0)),
+                speed=int(args["speed"]) if args.get("speed") is not None else None,
+                wheels_service=context.wheels_service,
             )
 
         if name == "messages":

@@ -29,6 +29,7 @@ from src.db import (
 from src.services.embeddings import EmbeddingService
 from src.gui.windows.app_window import GeminiLiveApp
 from src.services.task_scheduler import TaskScheduler
+from src.services.wheels_service import get_wheels_service
 
 logger = logging.getLogger(__name__)
 
@@ -180,7 +181,8 @@ class ApplicationController:
             on_log=self._on_log_received,
             on_tool_reaction=self._on_tool_reaction_triggered,
             on_session_ended=self._on_session_ended,
-            embedding_service=self.embedding_service
+            embedding_service=self.embedding_service,
+            wheels_service=get_wheels_service(),
         )
 
         # 4. Create CustomTkinter GUI app

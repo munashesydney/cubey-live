@@ -463,3 +463,18 @@ class WheelsService:
                 self.on_connection_change(connected, info)
             except Exception as e:
                 logger.warning("Error in on_connection_change callback: %s", e)
+
+
+_SHARED_WHEELS_SERVICE: Optional[WheelsService] = None
+
+
+def get_wheels_service() -> WheelsService:
+    """Get or create the global shared WheelsService singleton."""
+    global _SHARED_WHEELS_SERVICE
+    if _SHARED_WHEELS_SERVICE is None:
+        _SHARED_WHEELS_SERVICE = WheelsService()
+        try:
+            _SHARED_WHEELS_SERVICE.connect()
+        except Exception as e:
+            logger.warning("Failed to auto-connect shared WheelsService: %s", e)
+    return _SHARED_WHEELS_SERVICE

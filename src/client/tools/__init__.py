@@ -7,6 +7,7 @@ that is the single source of truth. Executors live in the per-tool folders.
 
 from src.client.tools.memories import MEMORIES_TOOL_DECLARATION, execute_memories_tool
 from src.client.tools.messages import MESSAGES_TOOL_DECLARATION, execute_messages_tool
+from src.client.tools.move import MOVE_TOOL_DECLARATION, execute_move_tool
 from src.client.tools.react import REACT_TOOL_DECLARATION, execute_react_tool
 from src.client.tools.tasks import TASKS_TOOL_DECLARATION, execute_tasks_tool
 from src.client.tools.current_time import (
@@ -28,6 +29,7 @@ from src.client.tools.registry import (
 __all__ = [
     "MEMORIES_TOOL_DECLARATION",
     "MESSAGES_TOOL_DECLARATION",
+    "MOVE_TOOL_DECLARATION",
     "CURRENT_TIME_TOOL_DECLARATION",
     "MODEL_TOOL_POLICY",
     "REACT_TOOL_DECLARATION",
@@ -40,6 +42,7 @@ __all__ = [
     "dispatch_tool_call",
     "execute_memories_tool",
     "execute_messages_tool",
+    "execute_move_tool",
     "execute_current_time_tool",
     "execute_react_tool",
     "execute_tasks_tool",

@@ -11,7 +11,7 @@ from typing import Optional
 
 import customtkinter as ctk
 
-from src.services.wheels_service import TelemetryData, WheelsService
+from src.services.wheels_service import TelemetryData, WheelsService, get_wheels_service
 
 logger = logging.getLogger(__name__)
 
@@ -37,11 +37,7 @@ class WheelsPage(ctk.CTkFrame):
     def __init__(self, master, wheels_service: Optional[WheelsService] = None, **kwargs):
         super().__init__(master, fg_color="transparent", **kwargs)
 
-        self.service = wheels_service or WheelsService(
-            on_telemetry=self._on_telemetry_received,
-            on_log=self._on_log_received,
-            on_connection_change=self._on_connection_changed,
-        )
+        self.service = wheels_service or get_wheels_service()
 
         # Ensure service callbacks point here even if injected
         self.service.on_telemetry = self._on_telemetry_received
