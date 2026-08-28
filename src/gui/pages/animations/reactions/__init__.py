@@ -11,6 +11,7 @@ from .surprised import SurprisedReaction
 from .skeptical import SkepticalReaction
 from .charging import ChargingReaction
 from .sleeping import SleepingReaction
+from .listening import ListeningReaction
 
 __all__ = [
     "BaseReaction",
@@ -22,4 +23,5 @@ __all__ = [
     "SkepticalReaction",
     "ChargingReaction",
     "SleepingReaction",
+    "ListeningReaction",
 ]

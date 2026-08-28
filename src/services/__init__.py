@@ -12,6 +12,7 @@ On-device AI and robot hardware services:
 __all__ = [
     "EmbeddingService",
     "TelemetryData",
+    "WakeWordService",
     "WheelsService",
     "add_memory",
     "search_memories",
@@ -24,6 +25,9 @@ def __getattr__(name: str):
     if name in ("WheelsService", "TelemetryData"):
         from src.services.wheels_service import TelemetryData, WheelsService
         return WheelsService if name == "WheelsService" else TelemetryData
+    if name == "WakeWordService":
+        from src.services.wake_word import WakeWordService
+        return WakeWordService
     if name == "EmbeddingService":
         from src.services.embeddings import EmbeddingService
         return EmbeddingService

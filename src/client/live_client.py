@@ -168,7 +168,10 @@ class GeminiLiveClient:
             await asyncio.gather(lag_monitor, return_exceptions=True)
             self.is_connected = False
             self._session = None
-            self.recorder.stop()
+            if getattr(self.config, "enable_wake_word", False):
+                self.recorder.clear_queue()
+            else:
+                self.recorder.stop()
             self.player.stop()
             if fatal_error is not None:
                 self.set_status("Disconnected (Error) 🔴")

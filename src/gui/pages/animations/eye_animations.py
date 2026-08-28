@@ -1,4 +1,4 @@
-﻿"""
+"""
 Eye Animation Engine module.
 Coordinates time-correct organic random micro-gaze saccades, EMO-style spring physics,
 3D perspective tilt/shear, shape morphing, variable blink/wink patterns,
@@ -17,6 +17,7 @@ from .reactions import (
     ChargingReaction,
     HappyReaction,
     HurtReaction,
+    ListeningReaction,
     LowBatteryReaction,
     SkepticalReaction,
     SleepingReaction,
@@ -153,6 +154,8 @@ class EyeAnimationEngine:
             "shocked": HurtReaction(),
             "charging": ChargingReaction(),
             "sleeping": SleepingReaction(),
+            "listening": ListeningReaction(),
+            "wake_up": ListeningReaction(),
         }
 
         # Timers

@@ -26,6 +26,7 @@ from src.services.embeddings import EmbeddingService
 from src.gui.windows.app_window import GeminiLiveApp
 from src.services.task_scheduler import TaskScheduler
 from src.services.transcript_persistence import TranscriptPersistenceService
+from src.services.wake_word import WakeWordService
 from src.services.wheels_service import get_wheels_service
 
 logger = logging.getLogger(__name__)
@@ -58,6 +59,7 @@ class ApplicationController:
         self.player: Optional[AudioPlayer] = None
         self.client: Optional[GeminiLiveClient] = None
         self.gui: Optional[GeminiLiveApp] = None
+        self.wake_word_service: Optional[WakeWordService] = None
 
         # On-device embeddings (fastembed) for semantic memory over messages.
         self.embedding_service = EmbeddingService(model_name=config.embedding_model)
@@ -164,6 +166,7 @@ class ApplicationController:
             device_dtype=input_device.dtype,
             enable_denoise=self.config.enable_noise_suppression,
             on_level_change=self._on_mic_level_changed,
+            on_audio_chunk=self._on_audio_chunk_captured,
         )
 
         # 3. Create Gemini Live Client with Tool Reaction Callback
@@ -200,13 +203,36 @@ class ApplicationController:
         )
         self.gui.client = self.client
 
+        # 5. Initialize & start Wake Word Spotter if enabled
+        if self.config.enable_wake_word:
+            logger.info("Initializing offline open-vocabulary Wake Word Service (Sherpa-ONNX)...")
+            self.wake_word_service = WakeWordService(
+                model_dir=self.config.wake_word_model_dir,
+                wake_words=self.config.wake_words,
+                threshold=self.config.wake_word_threshold,
+                score=self.config.wake_word_score,
+                num_threads=self.config.wake_word_threads,
+                on_wake_word=self._on_wake_word_detected,
+            )
+            self.wake_word_service.start()
+            # Start background audio capture immediately for wake word listening
+            if not self.recorder.is_recording and self.async_loop:
+                self.recorder.start(self.async_loop)
+
         logger.info("Starting CustomTkinter GUI Main Loop...")
         try:
             self.gui.mainloop()
         finally:
+            if self.wake_word_service:
+                self.wake_word_service.stop()
+            if self.recorder:
+                self.recorder.stop()
+            if self.player:
+                self.player.stop()
             self.transcript_persistence.set_realtime_active(False)
             self.transcript_persistence.stop()
             self.task_scheduler.stop()
+
 
     def _run_async_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         """Worker thread entrypoint for asyncio event loop."""
@@ -222,6 +248,14 @@ class ApplicationController:
                 return
 
         if self.client and self.async_loop and self.async_loop.is_running():
+            # Pause offline wake word detector to save Pi 5 CPU during Gemini Live conversation
+            if self.wake_word_service:
+                self.wake_word_service.pause()
+
+            # Ensure glowing listening visual side waves are active on robot face
+            if self.gui:
+                self.gui.post_listening(True)
+
             # No local embedding inference may begin while real-time audio owns
             # the latency budget. Transcript rows are still queued immediately.
             self.transcript_persistence.set_realtime_active(True)
@@ -237,6 +271,27 @@ class ApplicationController:
         if self.client:
             logger.info("Stopping Live session...")
             self.client.stop_session()
+
+    def _on_audio_chunk_captured(self, chunk: bytes) -> None:
+        """Forward raw 16kHz PCM audio chunk to wake word spotter."""
+        if self.wake_word_service:
+            self.wake_word_service.process_audio_chunk(chunk)
+
+    def _on_wake_word_detected(self, keyword: str) -> None:
+        """
+        Callback from Sherpa-ONNX when a wake-up phrase is recognized.
+        Triggers listening eye animation, colored side waves, and auto-starts Gemini Live.
+        """
+        logger.info("🎯 Wake word recognized: '%s'! Waking up and starting Gemini Live...", keyword)
+        if self.gui:
+            self.gui.post_log(f"🎯 Wake Word Detected: '{keyword}'! Waking up...")
+            self.gui.post_reaction("listening")
+            self.gui.post_listening(True)
+            self.gui.post_status(f"Listening: {keyword} 🎤")
+
+        # Auto-start Gemini Live conversation session if not already connected
+        if self.client and not self.client.is_connected:
+            self.start_live_session()
 
     def send_interruption(self, text_payload: str) -> None:
         """
@@ -280,6 +335,7 @@ class ApplicationController:
         if self.gui:
             self.gui.post_transcript(role, text)
 
+
     def _on_log_received(self, message: str) -> None:
         """Callback for log messages."""
         if self.gui:
@@ -316,6 +372,16 @@ class ApplicationController:
         if conversation_id is not None:
             self.transcript_persistence.enqueue_end(conversation_id)
         self.transcript_persistence.set_realtime_active(False)
+
+        # Clear active listening visual state on robot face
+        if self.gui:
+            self.gui.post_listening(False)
+
+        # Ensure background audio capture is active and resume wake word detection
+        if self.recorder and not self.recorder.is_recording and self.async_loop:
+            self.recorder.start(self.async_loop)
+        if self.wake_word_service:
+            self.wake_word_service.resume()
 
     def _persist_message(self, role: str, text: str) -> None:
         """Persist a transcript line against the active conversation."""

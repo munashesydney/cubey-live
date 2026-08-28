@@ -104,6 +104,20 @@ class AppConfig:
         "LOCAL_MODEL_SYSTEM_PROMPT", _LOCAL_LLM_SYSTEM_PROMPT
     )
 
+    # Wake Word (sherpa-onnx keyword spotter) Parameters
+    enable_wake_word: bool = os.getenv(
+        "WAKE_WORD_ENABLED", "true"
+    ).strip().lower() not in {"0", "false", "no", "off"}
+    wake_words: str = os.getenv(
+        "WAKE_WORDS", "HEY CUBEY, OK CUBEY, HI CUBEY, CUBEY, WAKE UP"
+    )
+    wake_word_model_dir: Path = field(
+        default_factory=lambda: DEFAULT_DATA_DIR / "models" / "sherpa-onnx-kws"
+    )
+    wake_word_threshold: float = float(os.getenv("WAKE_WORD_THRESHOLD", "0.40"))
+    wake_word_score: float = float(os.getenv("WAKE_WORD_SCORE", "2.5"))
+    wake_word_threads: int = int(os.getenv("WAKE_WORD_THREADS", "2"))
+
     def validate(self) -> None:
         """Validate critical configuration fields."""
         if not self.api_key:

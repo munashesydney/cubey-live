@@ -111,6 +111,9 @@ class GeminiLiveApp(ctk.CTk):
     def post_reaction(self, reaction_type: str) -> None:
         self._event_bridge.post("reaction", reaction_type)
 
+    def post_listening(self, is_listening: bool) -> None:
+        self._event_bridge.post("listening", is_listening, latest=True)
+
     def post_battery(self, is_charging: bool, battery_pct: int) -> None:
         self._event_bridge.post("battery", is_charging, battery_pct, latest=True)
 
@@ -122,6 +125,7 @@ class GeminiLiveApp(ctk.CTk):
             "transcript": self.append_transcript,
             "log": self.append_log,
             "reaction": self.trigger_robot_reaction,
+            "listening": self.set_listening_state,
             "battery": self.update_battery_state,
         }
         log_messages: list[str] = []
@@ -168,9 +172,14 @@ class GeminiLiveApp(ctk.CTk):
             self.dev_window.set_status(status)
 
     def update_mic_level(self, level: float) -> None:
-        """Thread-safe update to mic volume meter."""
+        """Thread-safe update to mic volume meter and dynamic face wave visualizer."""
+        self.robot_face.set_mic_level(level)
         if self.dev_window and self.dev_window.winfo_exists():
             self.dev_window.update_mic_level(level)
+
+    def set_listening_state(self, is_listening: bool) -> None:
+        """Thread-safe update to face listening side waves."""
+        self.robot_face.set_listening(is_listening)
 
     def append_transcript(self, role: str, text: str) -> None:
         """Forward transcript to developer window if open."""

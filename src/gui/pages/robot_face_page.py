@@ -1,4 +1,4 @@
-﻿"""
+"""
 Cubeo Robot Face page.
 High-performance super-sampled PIL anti-aliased graphics engine rendering smooth,
 expressive EMO-style robot eyes, sleep breathing animations with floating Zzz snore particles,
@@ -56,6 +56,11 @@ class RobotFacePage(ctk.CTkFrame):
         self.battery_pct = 100
         self.is_sleeping = False
 
+        # Wake Word / Gemini Live Listening State & Side Waves
+        self.is_listening = False
+        self.listening_intensity = 0.0
+        self.current_mic_level = 0.0
+
         # Image cache reference for Tkinter Garbage Collector
         self._tk_img: Optional[ImageTk.PhotoImage] = None
         self._canvas_image_id: Optional[int] = None
@@ -102,6 +107,18 @@ class RobotFacePage(ctk.CTkFrame):
         self.is_sleeping = is_sleeping
         self.animation_engine.set_sleeping(is_sleeping)
 
+    def set_listening(self, is_listening: bool) -> None:
+        """Toggle listening state for glowing side wave visualizer."""
+        self.is_listening = is_listening
+        if is_listening:
+            # Wake up if sleeping when listening begins
+            if self.is_sleeping:
+                self.set_sleeping(False)
+
+    def set_mic_level(self, level: float) -> None:
+        """Update current audio input volume level for dynamic wave modulation."""
+        self.current_mic_level = max(0.0, min(1.0, float(level)))
+
     def _handle_dev_click(self) -> None:
         """Handler for corner developer button."""
         if self.on_open_developer_console:
@@ -131,12 +148,18 @@ class RobotFacePage(ctk.CTkFrame):
         self._last_frame_at = frame_started
         self.animation_engine.update_animation_frame(frame_scale=elapsed * 60.0)
 
+        # Smoothly interpolate listening intensity (side wave fade-in / fade-out)
+        target_intensity = 1.0 if self.is_listening else 0.0
+        self.listening_intensity += (target_intensity - self.listening_intensity) * min(1.0, elapsed * 8.0)
+        if abs(self.listening_intensity - target_intensity) < 0.01:
+            self.listening_intensity = target_intensity
+
         render_time = time.perf_counter() - frame_started
         delay_ms = max(1, round((self._frame_interval - render_time) * 1000))
         self.after(delay_ms, self._animation_loop)
 
     def _draw_face(self) -> None:
-        """Render ultra-fast, smooth PIL image of EMO eyes, sleep Zzz, and charging HUD onto canvas."""
+        """Render ultra-fast, smooth PIL image of EMO eyes, sleep Zzz, listening waves, and charging HUD onto canvas."""
         w = self.canvas.winfo_width()
         h = self.canvas.winfo_height()
 
@@ -235,6 +258,10 @@ class RobotFacePage(ctk.CTkFrame):
         # Draw Glowing Charging HUD Battery Indicator if charging
         if self.is_charging or self.animation_engine.is_charging:
             self._draw_charging_hud(draw_main, w, h, base_scale, now)
+
+        # Draw Glowing Colored Listening Side Waves if active
+        if self.listening_intensity > 0.01:
+            self._draw_listening_waves(draw_main, w, h, base_scale, now)
 
         # Update Tkinter canvas image efficiently
         self._tk_img = ImageTk.PhotoImage(pil_img)
@@ -561,6 +588,88 @@ class RobotFacePage(ctk.CTkFrame):
             (cx + s * 0.05, cy - s * 0.15),
         ]
         draw.polygon(pts, fill=color)
+
+    def _draw_listening_waves(
+        self,
+        draw: ImageDraw.ImageDraw,
+        w: int,
+        h: int,
+        base_scale: float,
+        now: float,
+    ) -> None:
+        """
+        Render dynamic, multi-harmonic glowing colored audio/frequency waves on left & right screen sides.
+        Visualizes active listening state (wake word / Gemini live listening) modulated by mic audio level.
+        """
+        intensity = self.listening_intensity
+        if intensity <= 0.01:
+            return
+
+        # Audio boost factor from real-time microphone level
+        mic_boost = 1.0 + (self.current_mic_level * 5.0)
+
+        # Harmonic layer definitions: (Color RGB, speed, freq, phase_offset, stroke_width, amp_scale)
+        # Vibrant gradient palette: Electric Cyan, Bright Violet, Hot Magenta, Neon Green
+        wave_layers = [
+            ((0, 240, 255), 4.5, 3.2, 0.0, 3.0, 1.0),       # Cyan
+            ((189, 147, 249), -3.8, 4.0, 1.2, 2.5, 0.85),    # Violet
+            ((255, 121, 198), 5.2, 5.1, 2.4, 2.0, 0.70),    # Magenta
+            ((80, 250, 123), -4.1, 2.8, 3.6, 2.0, 0.55),    # Neon Green
+        ]
+
+        cy = h * 0.5
+        wave_height = h * 0.70
+        half_h = wave_height / 2.0
+        steps = 36
+
+        # Base margin from edges
+        left_base_x = 42 * base_scale
+        right_base_x = w - (42 * base_scale)
+        max_amplitude = (22 * base_scale) * mic_boost * intensity
+
+        # Render Left & Right Waves
+        for base_x, direction in [(left_base_x, 1.0), (right_base_x, -1.0)]:
+            for rgb_color, speed, freq, phase_off, stroke_w, amp_scale in wave_layers:
+                # Modulate alpha/brightness by intensity
+                col = tuple(max(0, min(255, int(c * intensity))) for c in rgb_color)
+                line_width = max(1, int(stroke_w * base_scale))
+
+                points = []
+                for i in range(steps + 1):
+                    t = i / steps  # 0.0 to 1.0
+                    y = (cy - half_h) + (t * wave_height)
+
+                    # Bell-curve envelope to taper smoothly at ends (0 at top/bottom, 1 in center)
+                    envelope = math.sin(t * math.pi)
+
+                    # Multi-frequency sinusoidal displacement
+                    angle = (t * math.pi * freq) + (now * speed) + phase_off
+                    dx = math.sin(angle) * max_amplitude * amp_scale * envelope * direction
+
+                    points.append((base_x + dx, y))
+
+                # Draw continuous smooth wave ribbon
+                if len(points) >= 2:
+                    draw.line(points, fill=col, width=line_width, joint="curve")
+
+            # Draw sleek glowing center energy equalizer bars along the edge
+            num_bars = 7
+            bar_spacing = (wave_height * 0.45) / max(1, num_bars - 1)
+            bar_start_y = cy - (wave_height * 0.225)
+
+            for bi in range(num_bars):
+                by = bar_start_y + (bi * bar_spacing)
+                benv = math.sin((bi / max(1, num_bars - 1)) * math.pi)
+                pulse = math.sin((now * 6.0) + bi * 0.8) * 0.5 + 0.5
+                bar_len = ((8.0 + pulse * 14.0 * mic_boost) * base_scale * intensity) * benv
+                bx1 = base_x - (direction * 18 * base_scale)
+                bx2 = bx1 + (direction * bar_len)
+                b_color = (
+                    int(0 * intensity),
+                    int(240 * (0.6 + 0.4 * pulse) * intensity),
+                    int(255 * intensity),
+                )
+                draw.line([(bx1, by), (bx2, by)], fill=b_color, width=max(1, int(2 * base_scale)))
 
     def trigger_reaction(self, reaction_type: str) -> None:
         """Trigger an emotional eye reaction using EyeAnimationEngine."""
