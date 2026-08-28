@@ -21,14 +21,11 @@ from src.db import (
     ConversationSource,
     MessageRole,
     create_conversation,
-    create_message,
-    end_conversation,
-    save_message_embedding,
-    update_conversation,
 )
 from src.services.embeddings import EmbeddingService
 from src.gui.windows.app_window import GeminiLiveApp
 from src.services.task_scheduler import TaskScheduler
+from src.services.transcript_persistence import TranscriptPersistenceService
 from src.services.wheels_service import get_wheels_service
 
 logger = logging.getLogger(__name__)
@@ -48,6 +45,7 @@ def _map_message_role(role: str) -> MessageRole:
         return MessageRole.EVENT
     return MessageRole.SYSTEM
 
+
 class ApplicationController:
     """Coordinates asyncio worker thread, live client session with AI tool calls, and CustomTkinter GUI."""
 
@@ -63,6 +61,9 @@ class ApplicationController:
 
         # On-device embeddings (fastembed) for semantic memory over messages.
         self.embedding_service = EmbeddingService(model_name=config.embedding_model)
+        self.transcript_persistence = TranscriptPersistenceService(
+            self.embedding_service
+        )
 
         # Background scheduler for AI tasks (the 'tasks' tool).
         self.task_scheduler = TaskScheduler()
@@ -79,6 +80,7 @@ class ApplicationController:
 
         # 0. Start the background task scheduler
         self.task_scheduler.start()
+        self.transcript_persistence.start()
 
         # 1. Start dedicated background thread for asyncio event loop
         self.async_loop = asyncio.new_event_loop()
@@ -88,13 +90,6 @@ class ApplicationController:
             daemon=True
         )
         self.loop_thread.start()
-
-        # Start background prewarm of embedding model
-        threading.Thread(
-            target=self.embedding_service.prewarm,
-            name="embedding_prewarm",
-            daemon=True,
-        ).start()
 
         # 2. Create audio pipeline components
         input_device_name = self.config.input_device
@@ -197,7 +192,12 @@ class ApplicationController:
         self.gui.client = self.client
 
         logger.info("Starting CustomTkinter GUI Main Loop...")
-        self.gui.mainloop()
+        try:
+            self.gui.mainloop()
+        finally:
+            self.transcript_persistence.set_realtime_active(False)
+            self.transcript_persistence.stop()
+            self.task_scheduler.stop()
 
     def _run_async_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         """Worker thread entrypoint for asyncio event loop."""
@@ -213,6 +213,9 @@ class ApplicationController:
                 return
 
         if self.client and self.async_loop and self.async_loop.is_running():
+            # No local embedding inference may begin while real-time audio owns
+            # the latency budget. Transcript rows are still queued immediately.
+            self.transcript_persistence.set_realtime_active(True)
             self._begin_conversation()
             logger.info("Scheduling Live session start...")
             self._session_task = asyncio.run_coroutine_threadsafe(
@@ -259,8 +262,8 @@ class ApplicationController:
     def _on_transcript_received(self, role: str, text: str) -> None:
         """Callback when transcript text is received from Gemini or User event.
 
-        Runs on the asyncio worker thread. Persists the line against the active
-        conversation (if any), then forwards it to the GUI.
+        Runs on the asyncio worker thread. It only performs non-blocking queue
+        handoff before forwarding the line to the GUI.
         """
         self._persist_message(role, text)
         if self.gui and self.gui.winfo_exists():
@@ -294,18 +297,14 @@ class ApplicationController:
     def _on_session_ended(self) -> None:
         """Callback from the client when the live session fully terminates.
 
-        Runs on the asyncio worker thread. Marks the active conversation
-        COMPLETED with an ended_at timestamp.
+        Runs on the asyncio worker thread. Completion is queued behind all
+        transcript writes, then deferred embeddings are allowed to resume.
         """
         conversation_id = self._active_conversation_id
         self._active_conversation_id = None
-        if conversation_id is None:
-            return
-        try:
-            ended = end_conversation(conversation_id)
-            logger.info("Ended conversation #%s (%s)", conversation_id, ended.status if ended else "missing")
-        except Exception as e:
-            logger.error("Failed to end conversation #%s: %s", conversation_id, e)
+        if conversation_id is not None:
+            self.transcript_persistence.enqueue_end(conversation_id)
+        self.transcript_persistence.set_realtime_active(False)
 
     def _persist_message(self, role: str, text: str) -> None:
         """Persist a transcript line against the active conversation."""
@@ -313,32 +312,19 @@ class ApplicationController:
         if conversation_id is None or not text.strip():
             return
         message_role = _map_message_role(role)
-        try:
-            message = create_message(conversation_id, role=message_role, content=text)
-            # Semantic memory: embed conversation lines (not sensor events).
-            if message_role in (MessageRole.USER, MessageRole.MODEL):
-                self._embed_message(message)
-            # Auto-title the conversation from its first user/external input.
-            if (
-                not self._conversation_titled
-                and message_role in (MessageRole.USER, MessageRole.EVENT)
-            ):
-                title = text.strip()[:_TITLE_MAX_CHARS]
-                if title:
-                    update_conversation(conversation_id, title=title)
-                    self._conversation_titled = True
-        except Exception as e:
-            logger.warning("Failed to persist message: %s", e)
+        title = None
+        should_title = (
+            not self._conversation_titled
+            and message_role in (MessageRole.USER, MessageRole.EVENT)
+        )
+        if should_title:
+            title = text.strip()[:_TITLE_MAX_CHARS] or None
 
-    def _embed_message(self, message) -> None:
-        """Embed a message and store the vector (best-effort, never blocks the
-        transcript path on failure)."""
-        try:
-            vector = self.embedding_service.embed(message.content)
-            save_message_embedding(
-                message_id=message.id,
-                model_name=self.embedding_service.model_name,
-                embedding=vector,
-            )
-        except Exception as e:
-            logger.warning("Failed to embed message #%s: %s", message.id, e)
+        queued = self.transcript_persistence.enqueue_message(
+            conversation_id,
+            message_role,
+            text,
+            title=title,
+        )
+        if queued and title:
+            self._conversation_titled = True

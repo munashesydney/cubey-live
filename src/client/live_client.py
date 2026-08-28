@@ -20,6 +20,11 @@ from src.services.embeddings import EmbeddingService
 
 logger = logging.getLogger(__name__)
 
+_EVENT_LOOP_PROBE_INTERVAL_SECONDS = 0.1
+_EVENT_LOOP_LAG_WARNING_SECONDS = 0.25
+_EVENT_LOOP_LAG_REPORT_INTERVAL_SECONDS = 5.0
+
+
 class GeminiLiveClient:
     """Manages WebSocket connection to Gemini Multimodal Live API with Tool Calling."""
 
@@ -98,6 +103,7 @@ class GeminiLiveClient:
 
         fatal_error: Optional[Exception] = None
         retry_count = 0
+        lag_monitor = asyncio.create_task(self._monitor_event_loop_lag())
         try:
             while not self._stop_event.is_set():
                 try:
@@ -158,6 +164,8 @@ class GeminiLiveClient:
             self.set_status(f"Error: {err_msg[:60]}")
             logger.exception("Gemini Live session connection failed:")
         finally:
+            lag_monitor.cancel()
+            await asyncio.gather(lag_monitor, return_exceptions=True)
             self.is_connected = False
             self._session = None
             self.recorder.stop()
@@ -171,6 +179,26 @@ class GeminiLiveClient:
                     self.on_session_ended()
                 except Exception as e:
                     logger.exception("on_session_ended callback failed: %s", e)
+
+    async def _monitor_event_loop_lag(self) -> None:
+        """Report stalls in the loop that owns real-time audio transport."""
+        loop = asyncio.get_running_loop()
+        expected = loop.time() + _EVENT_LOOP_PROBE_INTERVAL_SECONDS
+        last_reported = 0.0
+        while True:
+            await asyncio.sleep(_EVENT_LOOP_PROBE_INTERVAL_SECONDS)
+            now = loop.time()
+            lag = max(0.0, now - expected)
+            expected = now + _EVENT_LOOP_PROBE_INTERVAL_SECONDS
+            if (
+                lag >= _EVENT_LOOP_LAG_WARNING_SECONDS
+                and now - last_reported >= _EVENT_LOOP_LAG_REPORT_INTERVAL_SECONDS
+            ):
+                last_reported = now
+                logger.warning(
+                    "Realtime event loop stalled for approximately %.0f ms",
+                    lag * 1000,
+                )
 
     def _build_live_config(self) -> types.LiveConnectConfig:
         """Create connection config with native server VAD, cloud transcription, and session resumption handle."""
@@ -388,7 +416,11 @@ class GeminiLiveClient:
                         for fn_call in tool_call.function_calls:
                             # Single dispatch through the tool registry — the
                             # live model is allowed everything the policy grants.
-                            result_dict = dispatch_tool_call(
+                            # Tool executors may touch SQLite, hardware, or the
+                            # local embedding model. Never run them on the event
+                            # loop that is continuously sending microphone PCM.
+                            result_dict = await asyncio.to_thread(
+                                dispatch_tool_call,
                                 fn_call.name or "",
                                 fn_call.args or {},
                                 ToolContext(

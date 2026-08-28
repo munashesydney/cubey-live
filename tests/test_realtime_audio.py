@@ -1,6 +1,7 @@
 """Deterministic tests for the latency-critical audio path (no hardware/API)."""
 
 import asyncio
+import time
 import unittest
 from unittest.mock import patch
 
@@ -30,6 +31,40 @@ class RecorderQueueTests(unittest.TestCase):
         self.assertEqual(recorder.audio_queue.qsize(), 2)
         self.assertEqual(recorder.audio_queue.get_nowait(), b"middle")
         self.assertEqual(recorder.audio_queue.get_nowait(), b"newest")
+
+    def test_cross_thread_handoff_coalesces_during_event_loop_stall(self) -> None:
+        class StalledLoop:
+            def __init__(self) -> None:
+                self.callbacks = []
+
+            def call_soon_threadsafe(self, callback, *args):
+                self.callbacks.append((callback, args))
+
+        recorder = AudioRecorder(
+            sample_rate=16_000,
+            chunk_size=320,
+            max_queue_ms=40,
+        )
+        loop = StalledLoop()
+        recorder._loop = loop
+        recorder.is_recording = True
+
+        packets = [index.to_bytes(2, "little") for index in range(100)]
+        for packet in packets:
+            recorder._dispatch_packet(packet)
+
+        # The PortAudio thread retains only the freshest bounded window and
+        # schedules exactly one event-loop callback, even during a long stall.
+        self.assertEqual(len(loop.callbacks), 1)
+        self.assertEqual(len(recorder._pending_packets), 2)
+
+        callback, args = loop.callbacks.pop()
+        callback(*args)
+
+        self.assertEqual(recorder.audio_queue.qsize(), 2)
+        self.assertEqual(recorder.audio_queue.get_nowait(), packets[-2])
+        self.assertEqual(recorder.audio_queue.get_nowait(), packets[-1])
+        self.assertEqual(recorder._dropped_chunks, 98)
 
     def test_native_48k_callbacks_aggregate_into_20ms_gemini_packets(self) -> None:
         class ImmediateLoop:
@@ -235,6 +270,46 @@ class LiveSendTests(unittest.IsolatedAsyncioTestCase):
         await client._receive_responses_loop()
 
         self.assertEqual(player.clear_count, 1)
+
+    async def test_blocking_tool_executor_does_not_stall_event_loop(self) -> None:
+        recorder = AudioRecorder()
+        player = _FakePlayer()
+        config = AppConfig(api_key="test")
+        with patch("src.client.live_client.genai.Client"):
+            client = GeminiLiveClient(config, recorder, player)
+
+        class ToolSession:
+            async def receive(self):
+                yield genai_types.LiveServerMessage(
+                    tool_call={
+                        "function_calls": [
+                            {"name": "current_time", "id": "call-1", "args": {}}
+                        ]
+                    }
+                )
+                client.is_connected = False
+
+            async def send_tool_response(self, *, function_responses):
+                return None
+
+        def slow_tool(*args, **kwargs):
+            time.sleep(0.15)
+            return {"status": "ok"}
+
+        ticks = 0
+
+        async def ticker() -> None:
+            nonlocal ticks
+            while client.is_connected:
+                await asyncio.sleep(0.01)
+                ticks += 1
+
+        client._session = ToolSession()
+        client.is_connected = True
+        with patch("src.client.live_client.dispatch_tool_call", side_effect=slow_tool):
+            await asyncio.gather(client._receive_responses_loop(), ticker())
+
+        self.assertGreaterEqual(ticks, 5)
 
 
 class LiveReconnectTests(unittest.IsolatedAsyncioTestCase):

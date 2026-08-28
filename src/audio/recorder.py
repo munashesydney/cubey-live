@@ -4,8 +4,10 @@ Optimized for low-latency capture across Windows and Linux (Raspberry Pi).
 """
 
 import asyncio
+from collections import deque
 import logging
 import math
+import threading
 import time
 import numpy as np
 import sounddevice as sd
@@ -66,7 +68,16 @@ class AudioRecorder:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._last_level_update = 0.0
         self._dropped_chunks = 0
+        self._last_reported_drops = 0
         self._packet_buffer = bytearray()
+        # Bound audio before crossing into asyncio. A call_soon_threadsafe per
+        # packet can otherwise build an unbounded callback backlog while the
+        # event loop is delayed, despite audio_queue itself being bounded.
+        self._pending_packets: deque[bytes] = deque()
+        self._pending_lock = threading.Lock()
+        self._drain_scheduled = False
+        self._pending_level: Optional[float] = None
+        self._level_update_scheduled = False
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
         """Start capturing audio from the default microphone with low-latency settings."""
@@ -76,6 +87,9 @@ class AudioRecorder:
         self._loop = loop
         self.clear_queue()
         self._packet_buffer.clear()
+        with self._pending_lock:
+            self._dropped_chunks = 0
+            self._last_reported_drops = 0
         self.is_recording = True
         
         try:
@@ -168,6 +182,9 @@ class AudioRecorder:
         """Discard stale captured audio between sessions."""
         if hasattr(self, 'denoiser') and self.denoiser:
             self.denoiser.reset()
+        with self._pending_lock:
+            self._pending_packets.clear()
+            self._pending_level = None
         while True:
             try:
                 self.audio_queue.get_nowait()
@@ -215,9 +232,20 @@ class AudioRecorder:
         if self._loop is None:
             return
 
-        # Keep the PortAudio callback non-blocking. The actual bounded enqueue
-        # happens on the asyncio thread, where asyncio.Queue is safe to mutate.
-        self._loop.call_soon_threadsafe(self._enqueue_latest, data)
+        # Coalesce the cross-thread notification as well as bounding the final
+        # asyncio queue. At most one drain callback can be pending, so an event
+        # loop delay cannot create thousands of stale scheduled callbacks.
+        schedule_drain = False
+        with self._pending_lock:
+            if len(self._pending_packets) >= self.max_queue_chunks:
+                self._pending_packets.popleft()
+                self._dropped_chunks += 1
+            self._pending_packets.append(data)
+            if not self._drain_scheduled:
+                self._drain_scheduled = True
+                schedule_drain = True
+        if schedule_drain:
+            self._loop.call_soon_threadsafe(self._drain_pending_packets)
 
         # Fan out to optional secondary consumers.
         # This runs on the sounddevice audio thread; sinks must be thread-safe.
@@ -242,9 +270,40 @@ class AudioRecorder:
                     rms = math.sqrt(mean_sq)
                     # Normalize RMS to 0.0 - 1.0 range
                     norm_level = min(1.0, rms / 32768.0 * 8.0)
-                    self._loop.call_soon_threadsafe(self.on_level_change, norm_level)
+                    self._schedule_level_update(norm_level)
             except Exception:
                 pass
+
+    def _drain_pending_packets(self) -> None:
+        """Move one fresh bounded snapshot onto the asyncio-owned queue."""
+        with self._pending_lock:
+            packets = tuple(self._pending_packets)
+            self._pending_packets.clear()
+            self._drain_scheduled = False
+        for packet in packets:
+            self._enqueue_latest(packet)
+        self._report_dropped_chunks()
+
+    def _schedule_level_update(self, level: float) -> None:
+        """Coalesce UI meter updates while the asyncio loop is busy."""
+        if self._loop is None:
+            return
+        schedule_update = False
+        with self._pending_lock:
+            self._pending_level = level
+            if not self._level_update_scheduled:
+                self._level_update_scheduled = True
+                schedule_update = True
+        if schedule_update:
+            self._loop.call_soon_threadsafe(self._deliver_level_update)
+
+    def _deliver_level_update(self) -> None:
+        with self._pending_lock:
+            level = self._pending_level
+            self._pending_level = None
+            self._level_update_scheduled = False
+        if level is not None and self.on_level_change:
+            self.on_level_change(level)
 
     def _enqueue_latest(self, data: bytes) -> None:
         """Enqueue a frame without ever allowing captured audio to go stale."""
@@ -254,12 +313,26 @@ class AudioRecorder:
             try:
                 self.audio_queue.get_nowait()
                 self.audio_queue.task_done()
-                self._dropped_chunks += 1
-                if self._dropped_chunks == 1 or self._dropped_chunks % 50 == 0:
-                    logger.warning(
-                        "Microphone transport fell behind; dropped %d stale chunk(s)",
-                        self._dropped_chunks,
-                    )
+                with self._pending_lock:
+                    self._dropped_chunks += 1
             except asyncio.QueueEmpty:
                 pass
         self.audio_queue.put_nowait(data)
+        self._report_dropped_chunks()
+
+    def _report_dropped_chunks(self) -> None:
+        """Rate-limit transport warnings while retaining the exact count."""
+        should_report = False
+        with self._pending_lock:
+            dropped = self._dropped_chunks
+            if dropped and (
+                self._last_reported_drops == 0
+                or dropped - self._last_reported_drops >= 50
+            ):
+                self._last_reported_drops = dropped
+                should_report = True
+        if should_report:
+            logger.warning(
+                "Microphone transport fell behind; dropped %d stale chunk(s)",
+                dropped,
+            )
