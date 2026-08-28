@@ -63,7 +63,7 @@ class WakeWordService:
         self._is_paused = False
         self._audio_queue: queue.Queue[bytes] = queue.Queue(maxsize=100)
         self._worker_thread: Optional[threading.Thread] = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._last_detection_time = 0.0
         self._cooldown_seconds = 2.0  # Prevent double triggers within 2s
         self._token_to_display_map: dict = {}
@@ -395,6 +395,7 @@ class WakeWordService:
                 if len(samples) == 0:
                     continue
 
+                display_to_dispatch: Optional[str] = None
                 with self._lock:
                     if self._is_paused or not self.spotter or not self.stream:
                         continue
@@ -420,9 +421,12 @@ class WakeWordService:
                             self._last_detection_time = now
                             logger.info("🎯 Wake Word Spotted: '%s' (raw: '%s')", display_keyword, detected_keyword)
                             self.spotter.reset_stream(self.stream)
-                            self._dispatch_detection(display_keyword)
+                            display_to_dispatch = display_keyword
                         else:
                             self.spotter.reset_stream(self.stream)
+
+                if display_to_dispatch:
+                    self._dispatch_detection(display_to_dispatch)
 
             except Exception as e:
                 logger.error("Error in WakeWordService processing loop: %s", e, exc_info=True)
