@@ -40,6 +40,7 @@ class GeminiLiveClient:
         on_log: Optional[Callable[[str], None]] = None,
         on_tool_reaction: Optional[Callable[[str], None]] = None,
         on_listening_state_change: Optional[Callable[[bool], None]] = None,
+        on_vision_state_change: Optional[Callable[[bool], None]] = None,
         on_session_ended: Optional[Callable[[], None]] = None,
         embedding_service: Optional[EmbeddingService] = None,
         wheels_service: Optional[Any] = None,
@@ -53,6 +54,7 @@ class GeminiLiveClient:
         self.on_log = on_log
         self.on_tool_reaction = on_tool_reaction
         self.on_listening_state_change = on_listening_state_change
+        self.on_vision_state_change = on_vision_state_change
         self.on_session_ended = on_session_ended
         self.embedding_service = embedding_service
         self.wheels_service = wheels_service
@@ -384,6 +386,22 @@ class GeminiLiveClient:
             else "DISABLED (Audio only)"
         )
         self.log(f"📷 Vision Streaming: {state_str}")
+        if self.on_vision_state_change:
+            try:
+                self.on_vision_state_change(enabled)
+            except Exception:
+                logger.exception("Vision state change callback failed")
+
+    def _handle_tool_camera_toggle(self, enabled: Optional[bool] = None) -> bool:
+        """Callback invoked when AI calls the 'camera' tool to turn camera on/off."""
+        target_state = not self._is_camera_streaming if enabled is None else enabled
+        if self.camera_service:
+            if target_state:
+                self.camera_service.start()
+            else:
+                self.camera_service.stop()
+        self.set_camera_streaming(target_state)
+        return target_state
 
     async def send_visual_snapshot(
         self, jpeg_bytes: bytes, prompt: Optional[str] = None
@@ -565,6 +583,9 @@ class GeminiLiveClient:
                                     embedding_service=self.embedding_service,
                                     on_react=self._dispatch_tool_reaction,
                                     wheels_service=self.wheels_service,
+                                    camera_service=self.camera_service,
+                                    on_toggle_camera=self._handle_tool_camera_toggle,
+                                    live_client=self,
                                 ),
                             )
                             self.log(

@@ -297,6 +297,37 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "required": ["action"],
         },
     },
+    "camera": {
+        "name": "camera",
+        "description": (
+            "Controls Cubey's camera and visual streaming feed. "
+            "Call this tool with action='turn_on' whenever the user asks you to look at something, "
+            "see what is around, describe an object or person, or whenever you need visual context. "
+            "The camera automatically turns off after 30 seconds to conserve battery and bandwidth. "
+            "If you need to see again after it turns off, call this tool again to re-enable vision."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["turn_on", "turn_off", "status"],
+                    "description": (
+                        "The camera action: 'turn_on' (activate camera streaming for 30s), "
+                        "'turn_off' (deactivate camera streaming), or 'status' (check if active). "
+                        "Defaults to 'turn_on'."
+                    ),
+                },
+                "duration_seconds": {
+                    "type": "integer",
+                    "description": (
+                        "Optional duration in seconds to keep camera active before auto-off "
+                        "(default is 30 seconds, maximum 30 seconds)."
+                    ),
+                },
+            },
+        },
+    },
 }
 
 # ---------------------------------------------------------------------------
@@ -304,9 +335,9 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
 # ---------------------------------------------------------------------------
 
 MODEL_TOOL_POLICY: dict[str, list[str]] = {
-    # Gemini Live: full robot agent with physical movement, reactions, memory, history, tasks.
-    "live_model": ["react", "move", "messages", "memories", "current_time", "tasks"],
-    # Interactive local Qwen (no physical movement tool per design).
+    # Gemini Live: full robot agent with physical movement, reactions, memory, history, tasks, camera.
+    "live_model": ["react", "move", "messages", "memories", "current_time", "tasks", "camera"],
+    # Interactive local Qwen (no physical movement or camera tool per design).
     "local_model": ["messages", "memories", "current_time", "tasks"],
     # Scheduled runs execute an existing task.
     "local_task_runner": ["messages", "memories", "current_time"],
@@ -401,6 +432,9 @@ class ToolContext:
     embedding_service: Optional[Any] = None
     on_react: Optional[Callable[[str], None]] = None
     wheels_service: Optional[Any] = None
+    camera_service: Optional[Any] = None
+    on_toggle_camera: Optional[Callable[[Optional[bool]], bool]] = None
+    live_client: Optional[Any] = None
 
 
 def validate_tool_call(name: str, args: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -565,6 +599,17 @@ def dispatch_tool_call(name: str, args: dict[str, Any], context: ToolContext) ->
                 cron_expr=args.get("cron_expr"),
                 task_id=args.get("task_id"),
                 status=args.get("status"),
+            )
+
+        if name == "camera":
+            from src.client.tools.camera import execute_camera_tool
+
+            return execute_camera_tool(
+                action=args.get("action", "turn_on"),
+                duration_seconds=args.get("duration_seconds"),
+                on_toggle_camera=context.on_toggle_camera,
+                camera_service=context.camera_service,
+                live_client=context.live_client,
             )
     except Exception as e:
         logger.exception("Tool dispatch failed for '%s': %s", name, e)

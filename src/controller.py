@@ -198,6 +198,7 @@ class ApplicationController:
             on_log=self._on_log_received,
             on_tool_reaction=self._on_tool_reaction_triggered,
             on_listening_state_change=self._on_listening_state_changed,
+            on_vision_state_change=self._on_vision_state_changed,
             on_session_ended=self._on_session_ended,
             embedding_service=self.embedding_service,
             wheels_service=get_wheels_service(),
@@ -430,6 +431,11 @@ class ApplicationController:
         """Callback invoked when Gemini Live calls the 'react' tool."""
         if self.gui:
             self.gui.post_reaction(reaction_type)
+
+    def _on_vision_state_changed(self, is_active: bool) -> None:
+        """Callback from Live client when vision streaming state changes."""
+        if self.gui:
+            self.gui.post_vision_state(is_active)
 
     def _on_telemetry_received(self, telemetry) -> None:
         """Callback when telemetry (battery/charging) is received from WheelsService."""
