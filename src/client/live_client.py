@@ -92,7 +92,6 @@ class GeminiLiveClient:
 
     async def start_session(self) -> None:
         """Run one logical Live session across retryable WebSocket connections."""
-        logger.info("[TEMPORAL_LOG:LIVE_CLIENT_START_SESSION] entered on event loop at t=%.3f", time.time())
         self._loop = asyncio.get_running_loop()
         self._stop_event.clear()
         self._model_turn_active = False
@@ -108,7 +107,6 @@ class GeminiLiveClient:
         try:
             while not self._stop_event.is_set():
                 try:
-                    logger.info("[TEMPORAL_LOG:CALLING_RUN_LIVE_CONNECTION] at t=%.3f (retry=%d)", time.time(), retry_count)
                     await self._run_live_connection()
                     if not self._stop_event.is_set():
                         raise ConnectionError("Gemini Live transport ended unexpectedly")
@@ -247,12 +245,6 @@ class GeminiLiveClient:
         """Run one WebSocket connection; raise if either transport task fails."""
         resuming = self._session_resumption_handle is not None
         action = "Resuming" if resuming else "Initiating"
-        logger.info(
-            "[TEMPORAL_LOG:LIVE_WS_CONNECTING] %s WebSocket connection (Model: %s) at t=%.3f...",
-            action,
-            self.config.model,
-            time.time(),
-        )
         self.log(
             f"{action} WebSocket connection with Tool Use "
             f"(Model: {self.config.model})..."
@@ -262,7 +254,6 @@ class GeminiLiveClient:
             model=self.config.model,
             config=self._build_live_config(),
         ) as session:
-            logger.info("[TEMPORAL_LOG:LIVE_WS_CONNECTED] Gemini Live WebSocket established at t=%.3f", time.time())
             self._session = session
             self.is_connected = True
             self._connection_started_at = time.monotonic()
