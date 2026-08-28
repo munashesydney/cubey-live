@@ -180,9 +180,14 @@ class ApplicationController:
             wheels_service=get_wheels_service(),
         )
 
-        # Connect WheelsService telemetry to GUI battery updates
+        # Connect WheelsService telemetry to GUI battery updates & auto-connect on boot
         wheels_service = get_wheels_service()
         wheels_service.on_telemetry = self._on_telemetry_received
+        threading.Thread(
+            target=wheels_service.connect,
+            daemon=True,
+            name="WheelsAutoConnect",
+        ).start()
 
         # 4. Create CustomTkinter GUI app
         self.gui = GeminiLiveApp(

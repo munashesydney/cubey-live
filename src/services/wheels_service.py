@@ -106,6 +106,10 @@ class WheelsService:
         # Telemetry state cache
         self.telemetry = TelemetryData()
 
+        # Background status polling thread
+        self._poller_thread: Optional[threading.Thread] = None
+        self._polling_interval_s: float = 1.0
+
         # Battery charging trend detection
         self._voltage_samples: List[tuple] = []
         self._is_charging: bool = False
@@ -206,6 +210,12 @@ class WheelsService:
             )
             self._reader_thread.start()
 
+            # Start background heartbeat status polling loop
+            self._poller_thread = threading.Thread(
+                target=self._status_poller_loop, daemon=True, name="WheelsStatusPoller"
+            )
+            self._poller_thread.start()
+
             self._emit_log(f"Connected to hardware UART: {self.port} @ {self.baudrate} baud")
             self._emit_connection_change(True, f"Connected ({self.port})")
 
@@ -231,6 +241,10 @@ class WheelsService:
             except Exception as e:
                 logger.warning("Error closing serial port: %s", e)
             self._serial = None
+
+        if self._poller_thread and self._poller_thread.is_alive():
+            self._poller_thread.join(timeout=0.5)
+        self._poller_thread = None
 
         if self._reader_thread and self._reader_thread.is_alive():
             self._reader_thread.join(timeout=0.5)
@@ -452,6 +466,16 @@ class WheelsService:
                     self._emit_log(f"[RX ERROR] {e}")
                     time.sleep(0.1)
                 break
+
+    def _status_poller_loop(self) -> None:
+        """Background thread sending heartbeat STATUS queries every second over serial."""
+        while self._running and self._is_connected and not self._is_mock:
+            time.sleep(self._polling_interval_s)
+            if self._running and self._is_connected and not self._is_mock:
+                try:
+                    self.request_status()
+                except Exception as e:
+                    logger.debug("Error in status poller: %s", e)
 
     def _mock_reader_loop(self) -> None:
         """Background thread simulating periodic telemetry for development."""
