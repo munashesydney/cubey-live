@@ -49,6 +49,10 @@ class DeveloperWindow(ctk.CTkToplevel):
         on_toggle_mute: Callable[[bool], None],
         embedding_service: EmbeddingService,
         is_session_active: bool = False,
+        camera_service: Optional[Any] = None,
+        on_toggle_camera: Optional[Callable[[Optional[bool]], bool]] = None,
+        on_set_camera_device: Optional[Callable[[int], None]] = None,
+        on_send_snapshot: Optional[Callable[[Optional[str]], None]] = None,
         **kwargs,
     ):
         super().__init__(master, **kwargs)
@@ -59,6 +63,10 @@ class DeveloperWindow(ctk.CTkToplevel):
         self.on_toggle_mute = on_toggle_mute
         self.embedding_service = embedding_service
         self.is_session_active = is_session_active
+        self.camera_service = camera_service
+        self.on_toggle_camera = on_toggle_camera
+        self.on_set_camera_device = on_set_camera_device
+        self.on_send_snapshot = on_send_snapshot
 
         # Heterogeneous page registry — navigation is duck-typed.
         self._pages: dict[str, Any] = {}
@@ -134,6 +142,10 @@ class DeveloperWindow(ctk.CTkToplevel):
             on_send_interruption=self.on_send_interruption,
             on_toggle_mute=self.on_toggle_mute,
             is_session_active=self.is_session_active,
+            camera_service=self.camera_service,
+            on_toggle_camera=self.on_toggle_camera,
+            on_set_camera_device=self.on_set_camera_device,
+            on_send_snapshot=self.on_send_snapshot,
         )
         self._pages["local"] = LocalChatPage(
             self.page_container,
@@ -173,6 +185,14 @@ class DeveloperWindow(ctk.CTkToplevel):
     # ------------------------------------------------------------------
     # Delegation from the main app (called from the async / controller side)
     # ------------------------------------------------------------------
+
+    def set_vision_state(self, is_active: bool) -> None:
+        """Forward camera vision state to Gemini Live page."""
+        try:
+            if self.winfo_exists() and "live" in self._pages:
+                self._pages["live"].set_vision_state(is_active)
+        except Exception:
+            pass
 
     def set_status(self, status: str) -> None:
         """Forward live-session status to the pages that show it."""

@@ -7,7 +7,7 @@ Opens dedicated Developer Control Window via corner button, right-click, or 'D' 
 import asyncio
 import logging
 import customtkinter as ctk
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from src.config import AppConfig
 from src.gui.event_bridge import GuiEventBridge
@@ -35,6 +35,10 @@ class GeminiLiveApp(ctk.CTk):
         on_stop_session: Callable[[], None],
         on_send_interruption: Callable[[str], None],
         embedding_service: EmbeddingService,
+        camera_service: Optional[Any] = None,
+        on_toggle_camera: Optional[Callable[[Optional[bool]], bool]] = None,
+        on_set_camera_device: Optional[Callable[[int], None]] = None,
+        on_send_snapshot: Optional[Callable[[Optional[str]], None]] = None,
     ):
         super().__init__()
         self.config = config
@@ -43,6 +47,10 @@ class GeminiLiveApp(ctk.CTk):
         self.on_stop_session = on_stop_session
         self.on_send_interruption = on_send_interruption
         self.embedding_service = embedding_service
+        self.camera_service = camera_service
+        self.on_toggle_camera = on_toggle_camera
+        self.on_set_camera_device = on_set_camera_device
+        self.on_send_snapshot = on_send_snapshot
 
         # Window title & initial resolution (110.4 : 63.1 ratio)
         self.title("🤖 Cubeo Robot Face")
@@ -58,6 +66,7 @@ class GeminiLiveApp(ctk.CTk):
         # Internal state
         self.is_session_active = False
         self.is_muted = False
+        self.is_vision_active = False
         self.dev_window: Optional[DeveloperWindow] = None
         self._is_fullscreen = False
         self._event_bridge = GuiEventBridge()
@@ -117,6 +126,9 @@ class GeminiLiveApp(ctk.CTk):
     def post_battery(self, is_charging: bool, battery_pct: int) -> None:
         self._event_bridge.post("battery", is_charging, battery_pct, latest=True)
 
+    def post_vision_state(self, is_vision_active: bool) -> None:
+        self._event_bridge.post("vision", is_vision_active, latest=True)
+
     def _drain_gui_events(self) -> None:
         """Apply queued updates from the Tk main thread in bounded batches."""
         handlers = {
@@ -127,6 +139,7 @@ class GeminiLiveApp(ctk.CTk):
             "reaction": self.trigger_robot_reaction,
             "listening": self.set_listening_state,
             "battery": self.update_battery_state,
+            "vision": self.set_vision_state,
         }
         log_messages: list[str] = []
         for event in self._event_bridge.drain(_GUI_EVENT_BATCH_SIZE):
@@ -156,10 +169,21 @@ class GeminiLiveApp(ctk.CTk):
                 on_toggle_mute=self._toggle_mute,
                 is_session_active=self.is_session_active,
                 embedding_service=self.embedding_service,
+                camera_service=self.camera_service,
+                on_toggle_camera=self.on_toggle_camera,
+                on_set_camera_device=self.on_set_camera_device,
+                on_send_snapshot=self.on_send_snapshot,
             )
         else:
             self.dev_window.lift()
             self.dev_window.focus()
+
+    def set_vision_state(self, is_vision_active: bool) -> None:
+        """Thread-safe update to camera vision state across windows and face HUD."""
+        self.is_vision_active = is_vision_active
+        self.robot_face.set_vision_active(is_vision_active)
+        if self.dev_window and self.dev_window.winfo_exists():
+            self.dev_window.set_vision_state(is_vision_active)
 
     def set_status(self, status: str) -> None:
         """Thread-safe update to status."""

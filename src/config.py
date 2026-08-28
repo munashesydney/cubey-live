@@ -132,6 +132,17 @@ class AppConfig:
     wake_word_gain: float = float(os.getenv("WAKE_WORD_GAIN", "2.0"))
     wake_word_threads: int = int(os.getenv("WAKE_WORD_THREADS", "2"))
 
+    # Real-Time Camera & Multimodal Vision Parameters
+    camera_device_index: int = int(os.getenv("CAMERA_DEVICE_INDEX", "0"))
+    camera_fps: int = int(os.getenv("CAMERA_FPS", "30"))
+    camera_live_fps: float = float(os.getenv("CAMERA_LIVE_FPS", "1.0"))
+    camera_width: int = int(os.getenv("CAMERA_WIDTH", "640"))
+    camera_height: int = int(os.getenv("CAMERA_HEIGHT", "480"))
+    camera_jpeg_quality: int = int(os.getenv("CAMERA_JPEG_QUALITY", "80"))
+    camera_auto_start_with_live: bool = os.getenv(
+        "CAMERA_AUTO_START_WITH_LIVE", "false"
+    ).strip().lower() not in {"0", "false", "no", "off"}
+
     def validate(self) -> None:
         """Validate critical configuration fields."""
         if not self.api_key:

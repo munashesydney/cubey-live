@@ -15,6 +15,7 @@ from src.ai.prompts.gemini_live import SYSTEM_PROMPT as ROBOT_SYSTEM_INSTRUCTION
 from src.config import AppConfig
 from src.audio.recorder import AudioRecorder
 from src.audio.player import AudioPlayer
+from src.camera.service import CameraService
 from src.client.tools import ToolContext, build_gemini_tools, dispatch_tool_call
 from src.services.embeddings import EmbeddingService
 
@@ -33,6 +34,7 @@ class GeminiLiveClient:
         config: AppConfig,
         recorder: AudioRecorder,
         player: AudioPlayer,
+        camera_service: Optional[CameraService] = None,
         on_status_change: Optional[Callable[[str], None]] = None,
         on_transcript: Optional[Callable[[str, str], None]] = None,
         on_log: Optional[Callable[[str], None]] = None,
@@ -45,6 +47,7 @@ class GeminiLiveClient:
         self.config = config
         self.recorder = recorder
         self.player = player
+        self.camera_service = camera_service
         self.on_status_change = on_status_change
         self.on_transcript = on_transcript
         self.on_log = on_log
@@ -55,6 +58,9 @@ class GeminiLiveClient:
         self.wheels_service = wheels_service
 
         self.is_connected = False
+        self._is_camera_streaming: bool = getattr(
+            self.config, "camera_auto_start_with_live", False
+        )
         self._session = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._tasks: list[asyncio.Task] = []
@@ -305,32 +311,33 @@ class GeminiLiveClient:
                 asyncio.create_task(self.interrupt_with_text(init_payload))
 
             send_task = asyncio.create_task(self._send_audio_loop())
+            video_task = asyncio.create_task(self._send_video_loop())
             receive_task = asyncio.create_task(self._receive_responses_loop())
             watchdog_task = asyncio.create_task(self._inactivity_watchdog_loop())
             stop_task = asyncio.create_task(self._stop_event.wait())
-            self._tasks = [send_task, receive_task, watchdog_task]
+            self._tasks = [send_task, video_task, receive_task, watchdog_task]
 
             try:
                 done, _ = await asyncio.wait(
-                    [send_task, receive_task, watchdog_task, stop_task],
+                    [send_task, video_task, receive_task, watchdog_task, stop_task],
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if stop_task in done:
                     return
 
-                for task in (send_task, receive_task, watchdog_task):
+                for task in (send_task, video_task, receive_task, watchdog_task):
                     if task not in done:
                         continue
                     error = task.exception()
                     if error is not None:
                         raise error
-                raise ConnectionError("Gemini Live audio task stopped unexpectedly")
+                raise ConnectionError("Gemini Live session task stopped unexpectedly")
             finally:
                 self.recorder.is_live_active = False
-                for task in (send_task, receive_task, watchdog_task, stop_task):
+                for task in (send_task, video_task, receive_task, watchdog_task, stop_task):
                     task.cancel()
                 await asyncio.gather(
-                    send_task, receive_task, watchdog_task, stop_task, return_exceptions=True
+                    send_task, video_task, receive_task, watchdog_task, stop_task, return_exceptions=True
                 )
                 self.is_connected = False
                 self._session = None
@@ -362,6 +369,61 @@ class GeminiLiveClient:
                 "websocket",
             )
         )
+
+    @property
+    def is_camera_streaming(self) -> bool:
+        """Return True if real-time camera streaming to Gemini Live is enabled."""
+        return self._is_camera_streaming
+
+    def set_camera_streaming(self, enabled: bool) -> None:
+        """Enable or disable streaming of camera video frames to Gemini Live."""
+        self._is_camera_streaming = enabled
+        state_str = (
+            f"ENABLED ({getattr(self.config, 'camera_live_fps', 1.0)} FPS to Gemini Live)"
+            if enabled
+            else "DISABLED (Audio only)"
+        )
+        self.log(f"📷 Vision Streaming: {state_str}")
+
+    async def send_visual_snapshot(
+        self, jpeg_bytes: bytes, prompt: Optional[str] = None
+    ) -> None:
+        """
+        Send an immediate visual frame + text prompt to Gemini Live for instant visual analysis.
+        """
+        if not self.is_connected or self._session is None:
+            self.log("⚠️ Cannot send visual snapshot: Live session is not connected.")
+            return
+
+        self.record_user_activity()
+        prompt_text = (
+            prompt
+            or "[CAMERA SNAPSHOT]: Look at this image from your camera feed and tell me what you see."
+        )
+        self.log(f"📸 [VISUAL SNAPSHOT SENT TO GEMINI LIVE]: '{prompt_text}'")
+
+        if self.on_transcript:
+            self.on_transcript("User Vision", f"📸 {prompt_text}")
+
+        try:
+            # Send the image frame
+            await self._session.send_realtime_input(
+                media=types.Blob(
+                    data=jpeg_bytes,
+                    mime_type="image/jpeg",
+                )
+            )
+            # Send prompt text turn
+            await self._session.send_client_content(
+                turns=types.Content(
+                    role="user",
+                    parts=[types.Part(text=prompt_text)],
+                ),
+                turn_complete=True,
+            )
+            self.log("✓ Dispatched visual snapshot payload to Gemini Live.")
+        except Exception as e:
+            self.log(f"❌ Failed to send visual snapshot: {e}")
 
     def stop_session(self) -> None:
         """Signal live session to shut down."""
@@ -400,6 +462,44 @@ class GeminiLiveClient:
             self.log("Sent client content payload to Gemini Live API.")
         except Exception as e:
             self.log(f"❌ Failed to send text payload: {e}")
+
+    async def _send_video_loop(self) -> None:
+        """Continuously stream JPEG camera frames to Gemini Live at configured rate (e.g. 1 FPS)."""
+        fps = getattr(self.config, "camera_live_fps", 1.0)
+        interval = 1.0 / max(0.1, fps)
+        last_logged = 0.0
+
+        try:
+            while self.is_connected and self._session is not None:
+                if (
+                    self._is_camera_streaming
+                    and self.camera_service is not None
+                    and self.camera_service.is_running
+                ):
+                    jpeg_bytes = self.camera_service.get_latest_frame_jpeg(
+                        quality=self.config.camera_jpeg_quality
+                    )
+                    if jpeg_bytes and self._session:
+                        try:
+                            await self._session.send_realtime_input(
+                                media=types.Blob(
+                                    data=jpeg_bytes,
+                                    mime_type="image/jpeg",
+                                )
+                            )
+                            now = time.monotonic()
+                            if now - last_logged >= 10.0:
+                                last_logged = now
+                                self.log("📷 [Gemini Live Vision]: Actively streaming camera frames.")
+                        except Exception as send_err:
+                            logger.warning("Failed sending camera frame to Gemini Live: %s", send_err)
+
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.log(f"Error in send video loop: {e}")
+            raise
 
     async def _send_audio_loop(self) -> None:
         """Task continuously reading mic PCM chunks and streaming directly to WebSocket."""

@@ -64,6 +64,7 @@ class RobotFacePage(ctk.CTkFrame):
         self.is_listening = False
         self.listening_intensity = 0.0
         self.current_mic_level = 0.0
+        self.is_vision_active = False
 
         # Image cache reference for Tkinter Garbage Collector
         self._tk_img: Optional[ImageTk.PhotoImage] = None
@@ -281,6 +282,10 @@ class RobotFacePage(ctk.CTkFrame):
         # Draw Sleek Glowing Listening HUD Indicator if active
         if is_listening_active:
             self._draw_listening_hud(draw_main, w, h, base_scale, now, offset_x=listen_offset_x)
+
+        # Draw Real-Time Vision HUD Indicator if camera is active
+        if self.is_vision_active:
+            self._draw_vision_hud(draw_main, w, h, base_scale, now)
 
         # Update Tkinter canvas image efficiently
         self._tk_img = ImageTk.PhotoImage(pil_img)
@@ -765,6 +770,72 @@ class RobotFacePage(ctk.CTkFrame):
     ) -> None:
         """Backwards-compatible alias forwarding to _draw_listening_hud."""
         self._draw_listening_hud(draw, w, h, base_scale, now)
+
+    def set_vision_active(self, is_active: bool) -> None:
+        """Update active camera vision indicator state."""
+        self.is_vision_active = is_active
+
+    def _draw_vision_hud(
+        self,
+        draw: ImageDraw.ImageDraw,
+        w: int,
+        h: int,
+        base_scale: float,
+        now: float,
+    ) -> None:
+        """Render sleek glowing vision indicator in top corner when camera is streaming."""
+        pill_w = 80 * base_scale
+        pill_h = 26 * base_scale
+        bx = 24 * base_scale
+        by = 22 * base_scale
+        rad = 6 * base_scale
+
+        pulse = 0.85 + 0.15 * math.sin(now * 4.0)
+        border_col = (int(137 * pulse), int(180 * pulse), int(250 * pulse))
+        bg_col = (18, 24, 38)
+
+        # Background pill
+        draw.rounded_rectangle(
+            [bx, by, bx + pill_w, by + pill_h],
+            radius=rad,
+            fill=bg_col,
+            outline=border_col,
+            width=int(max(1, 2 * base_scale)),
+        )
+
+        # Camera / Eye glyph
+        cam_cx = bx + 16 * base_scale
+        cam_cy = by + pill_h / 2.0
+        cam_s = 11 * base_scale
+
+        # Camera body
+        draw.rounded_rectangle(
+            [cam_cx - cam_s * 0.7, cam_cy - cam_s * 0.45, cam_cx + cam_s * 0.7, cam_cy + cam_s * 0.55],
+            radius=2 * base_scale,
+            fill=(137, 180, 250),
+        )
+        # Lens ring with pulsing iris
+        lens_r = cam_s * 0.32
+        draw.ellipse(
+            [cam_cx - lens_r, cam_cy + cam_s * 0.05 - lens_r, cam_cx + lens_r, cam_cy + cam_s * 0.05 + lens_r],
+            fill=(18, 24, 38),
+            outline=(250, 179, 137),
+            width=int(max(1, 1.5 * base_scale)),
+        )
+
+        # Vision wave dot indicators
+        dot_start_x = bx + 36 * base_scale
+        for i in range(3):
+            dot_phase = now * 5.0 - (i * 0.8)
+            dot_alpha = 0.3 + 0.7 * max(0.0, math.sin(dot_phase))
+            dot_r = (2.5 + 0.5 * math.sin(dot_phase)) * base_scale
+            dot_x = dot_start_x + i * 11 * base_scale
+            dot_y = by + pill_h / 2.0
+            dot_col = (int(166 * dot_alpha), int(227 * dot_alpha), int(161 * dot_alpha))
+            draw.ellipse(
+                [dot_x - dot_r, dot_y - dot_r, dot_x + dot_r, dot_y + dot_r],
+                fill=dot_col,
+            )
 
     def trigger_reaction(self, reaction_type: str) -> None:
         """Trigger an emotional eye reaction using EyeAnimationEngine."""

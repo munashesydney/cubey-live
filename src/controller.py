@@ -19,6 +19,7 @@ from src.audio.echo_cancel import (
     EchoCancellationUnavailable,
     prepare_pipewire_echo_cancellation,
 )
+from src.camera import CameraService, list_camera_devices
 from src.client.live_client import GeminiLiveClient
 from src.db import (
     ConversationSource,
@@ -60,6 +61,7 @@ class ApplicationController:
 
         self.recorder: Optional[AudioRecorder] = None
         self.player: Optional[AudioPlayer] = None
+        self.camera_service: Optional[CameraService] = None
         self.client: Optional[GeminiLiveClient] = None
         self.gui: Optional[GeminiLiveApp] = None
         self.wake_word_service: Optional[WakeWordService] = None
@@ -182,11 +184,15 @@ class ApplicationController:
             on_audio_chunk=self._on_audio_chunk_captured,
         )
 
-        # 3. Create Gemini Live Client with Tool Reaction Callback
+        # 2b. Create Camera video capture service
+        self.camera_service = CameraService(self.config)
+
+        # 3. Create Gemini Live Client with Tool Reaction Callback & Camera Service
         self.client = GeminiLiveClient(
             config=self.config,
             recorder=self.recorder,
             player=self.player,
+            camera_service=self.camera_service,
             on_status_change=self._on_status_changed,
             on_transcript=self._on_transcript_received,
             on_log=self._on_log_received,
@@ -210,9 +216,13 @@ class ApplicationController:
         self.gui = GeminiLiveApp(
             config=self.config,
             async_loop=self.async_loop,
+            camera_service=self.camera_service,
             on_start_session=self.start_live_session,
             on_stop_session=self.stop_live_session,
             on_send_interruption=self.send_interruption,
+            on_toggle_camera=self.toggle_camera,
+            on_set_camera_device=self.set_camera_device,
+            on_send_snapshot=self.send_visual_snapshot,
             embedding_service=self.embedding_service,
         )
         self.gui.client = self.client
@@ -240,6 +250,8 @@ class ApplicationController:
         finally:
             if self.wake_word_service:
                 self.wake_word_service.stop()
+            if self.camera_service:
+                self.camera_service.stop()
             if self.recorder:
                 self.recorder.stop()
             if self.player:
@@ -358,6 +370,56 @@ class ApplicationController:
                 self.client.interrupt_with_text(text_payload),
                 self.async_loop
             )
+
+    def toggle_camera(self, enabled: Optional[bool] = None) -> bool:
+        """Toggle or set camera capture and Gemini Live vision streaming state."""
+        if not self.camera_service:
+            return False
+
+        target_state = (not self.camera_service.is_running) if enabled is None else enabled
+        if target_state:
+            self.camera_service.start()
+            if self.client:
+                self.client.set_camera_streaming(True)
+            if self.gui:
+                self.gui.post_vision_state(True)
+                self.gui.post_log("📷 Camera stream activated.")
+        else:
+            self.camera_service.stop()
+            if self.client:
+                self.client.set_camera_streaming(False)
+            if self.gui:
+                self.gui.post_vision_state(False)
+                self.gui.post_log("📷 Camera stream stopped.")
+        return target_state
+
+    def set_camera_device(self, index: int) -> None:
+        """Change camera hardware device index."""
+        if self.camera_service:
+            self.camera_service.set_device(index)
+            if self.gui:
+                self.gui.post_log(f"📷 Switched to Camera device index {index}")
+
+    def send_visual_snapshot(self, prompt: Optional[str] = None) -> None:
+        """Capture an immediate camera snapshot and send to Gemini Live."""
+        if not self.camera_service:
+            return
+
+        if not self.camera_service.is_running:
+            self.camera_service.start()
+            time.sleep(0.1)
+
+        jpeg_bytes = self.camera_service.get_latest_frame_jpeg(
+            quality=self.config.camera_jpeg_quality
+        )
+        if jpeg_bytes and self.client and self.async_loop and self.async_loop.is_running():
+            asyncio.run_coroutine_threadsafe(
+                self.client.send_visual_snapshot(jpeg_bytes, prompt),
+                self.async_loop,
+            )
+        elif not jpeg_bytes:
+            if self.gui:
+                self.gui.post_log("⚠️ Snapshot failed: No camera frame available.")
 
     def _on_listening_state_changed(self, is_listening: bool) -> None:
         """Callback when Gemini Live client changes listening visibility (e.g. hidden while model speaks)."""
