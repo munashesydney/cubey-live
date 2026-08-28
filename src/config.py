@@ -50,6 +50,9 @@ class AppConfig:
     enable_noise_suppression: bool = os.getenv(
         "AUDIO_ENABLE_NOISE_SUPPRESSION", "true"
     ).strip().lower() not in {"0", "false", "no", "off"}
+    gui_fullscreen: bool = os.getenv(
+        "GUI_FULLSCREEN", "false"
+    ).strip().lower() not in {"0", "false", "no", "off"}
 
     # Full-duplex acoustic echo cancellation on Raspberry Pi. The setup
     # script creates these PipeWire/WebRTC virtual endpoints. Cubey connects

@@ -55,6 +55,7 @@ class GeminiLiveApp(ctk.CTk):
         self.is_session_active = False
         self.is_muted = False
         self.dev_window: Optional[DeveloperWindow] = None
+        self._is_fullscreen = False
 
         # Build 100% full-bleed Robot Face display
         self.robot_face = RobotFacePage(
@@ -67,6 +68,14 @@ class GeminiLiveApp(ctk.CTk):
         self.bind("<Key-d>", lambda e: self.toggle_developer_console())
         self.bind("<Key-D>", lambda e: self.toggle_developer_console())
         self.bind("<Button-3>", lambda e: self.toggle_developer_console())  # Right-click
+
+        # Bind Fullscreen Hotkeys (F11 to toggle, Escape to exit)
+        self.bind("<F11>", lambda e: self.toggle_fullscreen())
+        self.bind("<Escape>", lambda e: self.exit_fullscreen())
+
+        # Auto-enter fullscreen if configured
+        if getattr(self.config, "gui_fullscreen", False):
+            self.after(150, self.enter_fullscreen)
 
     def toggle_developer_console(self) -> None:
         """Open or focus the Developer Control Window."""
@@ -120,3 +129,28 @@ class GeminiLiveApp(ctk.CTk):
         if hasattr(self, 'client') and self.client and self.client.recorder:
             self.client.recorder.set_muted(is_muted)
         self.append_log(f"Microphone Mute: {'ON' if is_muted else 'OFF'}")
+
+    def toggle_fullscreen(self) -> None:
+        """Toggle true fullscreen kiosk mode."""
+        if self._is_fullscreen:
+            self.exit_fullscreen()
+        else:
+            self.enter_fullscreen()
+
+    def enter_fullscreen(self) -> None:
+        """Enter true fullscreen kiosk mode, covering OS taskbars and titlebars."""
+        self._is_fullscreen = True
+        try:
+            self.attributes("-fullscreen", True)
+            self.append_log("Entered Fullscreen Kiosk Mode (Press F11 or Esc to exit)")
+        except Exception as e:
+            logger.warning("Error entering fullscreen: %s", e)
+
+    def exit_fullscreen(self) -> None:
+        """Exit fullscreen back to windowed mode."""
+        self._is_fullscreen = False
+        try:
+            self.attributes("-fullscreen", False)
+            self.append_log("Exited Fullscreen Mode")
+        except Exception as e:
+            logger.warning("Error exiting fullscreen: %s", e)

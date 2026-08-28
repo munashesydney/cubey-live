@@ -70,6 +70,9 @@ class DeveloperWindow(ctk.CTkToplevel):
         self.geometry("1120x700")
         self.minsize(900, 560)
 
+        # Bind Escape to close Developer Console
+        self.bind("<Escape>", lambda e: self.destroy())
+
         self.after(100, self.lift)
 
         self._create_layout()
