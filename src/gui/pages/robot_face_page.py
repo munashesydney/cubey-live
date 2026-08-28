@@ -609,60 +609,50 @@ class RobotFacePage(ctk.CTkFrame):
         mic_boost = 1.0 + (self.current_mic_level * 5.0)
 
         # Harmonic layer definitions: (Color RGB, speed, freq, phase_offset, stroke_width, amp_scale)
-        # Vibrant gradient palette: Electric Cyan, Bright Violet, Hot Magenta, Neon Green
         wave_layers = [
-            ((0, 240, 255), 4.5, 3.2, 0.0, 3.0, 1.0),       # Cyan
-            ((189, 147, 249), -3.8, 4.0, 1.2, 2.5, 0.85),    # Violet
-            ((255, 121, 198), 5.2, 5.1, 2.4, 2.0, 0.70),    # Magenta
-            ((80, 250, 123), -4.1, 2.8, 3.6, 2.0, 0.55),    # Neon Green
+            ((0, 240, 255), 4.2, 3.0, 0.0, 2.5, 1.0),       # Electric Cyan
+            ((255, 110, 200), -3.5, 3.8, 1.5, 2.0, 0.75),   # Magenta / Violet
         ]
 
         cy = h * 0.5
-        wave_height = h * 0.70
+        wave_height = h * 0.65
         half_h = wave_height / 2.0
-        steps = 36
+        steps = 18
 
         # Base margin from edges
-        left_base_x = 42 * base_scale
-        right_base_x = w - (42 * base_scale)
-        max_amplitude = (22 * base_scale) * mic_boost * intensity
+        left_base_x = 36 * base_scale
+        right_base_x = w - (36 * base_scale)
+        max_amplitude = (18 * base_scale) * mic_boost * intensity
 
         # Render Left & Right Waves
         for base_x, direction in [(left_base_x, 1.0), (right_base_x, -1.0)]:
             for rgb_color, speed, freq, phase_off, stroke_w, amp_scale in wave_layers:
-                # Modulate alpha/brightness by intensity
                 col = tuple(max(0, min(255, int(c * intensity))) for c in rgb_color)
                 line_width = max(1, int(stroke_w * base_scale))
 
                 points = []
                 for i in range(steps + 1):
-                    t = i / steps  # 0.0 to 1.0
+                    t = i / steps
                     y = (cy - half_h) + (t * wave_height)
-
-                    # Bell-curve envelope to taper smoothly at ends (0 at top/bottom, 1 in center)
                     envelope = math.sin(t * math.pi)
-
-                    # Multi-frequency sinusoidal displacement
                     angle = (t * math.pi * freq) + (now * speed) + phase_off
                     dx = math.sin(angle) * max_amplitude * amp_scale * envelope * direction
-
                     points.append((base_x + dx, y))
 
-                # Draw continuous smooth wave ribbon
                 if len(points) >= 2:
                     draw.line(points, fill=col, width=line_width, joint="curve")
 
-            # Draw sleek glowing center energy equalizer bars along the edge
-            num_bars = 7
-            bar_spacing = (wave_height * 0.45) / max(1, num_bars - 1)
-            bar_start_y = cy - (wave_height * 0.225)
+            # Sleek center energy equalizer bars
+            num_bars = 5
+            bar_spacing = (wave_height * 0.40) / max(1, num_bars - 1)
+            bar_start_y = cy - (wave_height * 0.20)
 
             for bi in range(num_bars):
                 by = bar_start_y + (bi * bar_spacing)
                 benv = math.sin((bi / max(1, num_bars - 1)) * math.pi)
-                pulse = math.sin((now * 6.0) + bi * 0.8) * 0.5 + 0.5
-                bar_len = ((8.0 + pulse * 14.0 * mic_boost) * base_scale * intensity) * benv
-                bx1 = base_x - (direction * 18 * base_scale)
+                pulse = math.sin((now * 5.0) + bi * 1.0) * 0.5 + 0.5
+                bar_len = ((6.0 + pulse * 12.0 * mic_boost) * base_scale * intensity) * benv
+                bx1 = base_x - (direction * 14 * base_scale)
                 bx2 = bx1 + (direction * bar_len)
                 b_color = (
                     int(0 * intensity),

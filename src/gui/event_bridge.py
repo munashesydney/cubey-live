@@ -49,7 +49,7 @@ class GuiEventBridge:
                 dropped = self._dropped
             self._pending.append(event)
 
-        if dropped == 1 or dropped % 100 == 0:
+        if dropped > 0 and (dropped == 1 or dropped % 100 == 0):
             logger.warning("GUI event bridge dropped %d stale event(s)", dropped)
 
     def drain(self, max_events: int = 256) -> list[GuiEvent]:
