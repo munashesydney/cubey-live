@@ -3,8 +3,10 @@ Application Controller orchestrating asyncio worker threads, audio pipeline, Gem
 """
 
 import asyncio
+import concurrent.futures
 import logging
 import threading
+import time
 import uuid
 from typing import Optional
 
