@@ -40,9 +40,10 @@ class WakeWordService:
     def __init__(
         self,
         model_dir: Optional[Union[str, Path]] = None,
-        wake_words: Union[str, List[str]] = "HEY CUBEY, OK CUBEY, HI CUBEY, CUBEY, WAKE UP, HEY Q BEE, Q BEE, HEY CUBE Y, CUBE Y",
-        threshold: float = 0.22,
+        wake_words: Union[str, List[str]] = "HEY CUBEY, OK CUBEY, HI CUBEY, CUBEY, WAKE UP, HEY Q BEE, Q BEE, HEY CUBE Y, CUBE Y, HELLO CUBEY",
+        threshold: float = 0.15,
         score: float = 2.0,
+        gain: float = 2.0,
         num_threads: int = 2,
         on_wake_word: Optional[Callable[[str], None]] = None,
         auto_download: bool = True,
@@ -51,6 +52,7 @@ class WakeWordService:
         self.wake_words = self._parse_wake_words(wake_words)
         self.threshold = threshold
         self.score = score
+        self.gain = max(0.1, float(gain))
         self.num_threads = num_threads
         self.on_wake_word = on_wake_word
         self.auto_download = auto_download
@@ -388,6 +390,8 @@ class WakeWordService:
                     continue
                 # Convert int16 PCM bytes to float32 samples in [-1.0, 1.0]
                 samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
+                if self.gain != 1.0:
+                    samples = np.clip(samples * self.gain, -1.0, 1.0)
                 if len(samples) == 0:
                     continue
 

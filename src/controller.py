@@ -211,6 +211,7 @@ class ApplicationController:
                 wake_words=self.config.wake_words,
                 threshold=self.config.wake_word_threshold,
                 score=self.config.wake_word_score,
+                gain=self.config.wake_word_gain,
                 num_threads=self.config.wake_word_threads,
                 on_wake_word=self._on_wake_word_detected,
             )
@@ -241,30 +242,41 @@ class ApplicationController:
 
     def start_live_session(self) -> None:
         """Schedule start_session coroutine on background asyncio thread."""
-        if self.gui:
+        try:
             if not self.config.api_key:
-                self.gui.append_log("❌ Error: GEMINI_API_KEY is not set! Set it in your environment or .env file.")
-                self.gui.set_status("Error: Missing GEMINI_API_KEY")
+                logger.error("Cannot start Live session: GEMINI_API_KEY is not set!")
+                if self.gui:
+                    self.gui.post_log("❌ Error: GEMINI_API_KEY is not set! Set it in your environment or .env file.")
+                    self.gui.post_status("Error: Missing GEMINI_API_KEY")
                 return
 
-        if self.client and self.async_loop and self.async_loop.is_running():
-            # Pause offline wake word detector to save Pi 5 CPU during Gemini Live conversation
-            if self.wake_word_service:
-                self.wake_word_service.pause()
+            if self.client and self.async_loop and self.async_loop.is_running():
+                # Pause offline wake word detector to save Pi 5 CPU during Gemini Live conversation
+                if self.wake_word_service:
+                    self.wake_word_service.pause()
 
-            # Ensure glowing listening visual side waves are active on robot face
-            if self.gui:
-                self.gui.post_listening(True)
+                # Ensure glowing listening visual side waves are active on robot face
+                if self.gui:
+                    self.gui.post_listening(True)
 
-            # No local embedding inference may begin while real-time audio owns
-            # the latency budget. Transcript rows are still queued immediately.
-            self.transcript_persistence.set_realtime_active(True)
-            self._begin_conversation()
-            logger.info("Scheduling Live session start...")
-            self._session_task = asyncio.run_coroutine_threadsafe(
-                self.client.start_session(),
-                self.async_loop
-            )
+                # No local embedding inference may begin while real-time audio owns
+                # the latency budget. Transcript rows are still queued immediately.
+                self.transcript_persistence.set_realtime_active(True)
+                self._begin_conversation()
+                logger.info("Scheduling Gemini Live session start...")
+                self._session_task = asyncio.run_coroutine_threadsafe(
+                    self.client.start_session(),
+                    self.async_loop
+                )
+            else:
+                logger.warning(
+                    "Cannot start Live session: client=%s, async_loop=%s (running=%s)",
+                    bool(self.client),
+                    bool(self.async_loop),
+                    self.async_loop.is_running() if self.async_loop else False,
+                )
+        except Exception as e:
+            logger.error("Failed to start Live session: %s", e, exc_info=True)
 
     def stop_live_session(self) -> None:
         """Stop active live session."""
