@@ -24,3 +24,4 @@ pyrnnoise>=0.1.0
 
 # Open-vocabulary Wake Word / Keyword Spotting (Next-gen Kaldi / Sherpa-ONNX)
 sherpa-onnx>=1.10.0
+sentencepiece>=0.1.99

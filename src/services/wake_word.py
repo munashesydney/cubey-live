@@ -64,6 +64,7 @@ class WakeWordService:
         self._lock = threading.Lock()
         self._last_detection_time = 0.0
         self._cooldown_seconds = 2.0  # Prevent double triggers within 2s
+        self._token_to_display_map: dict = {}
 
     @staticmethod
     def _parse_wake_words(words: Union[str, List[str]]) -> List[str]:
@@ -74,6 +75,73 @@ class WakeWordService:
             items = list(words)
         cleaned = [w.strip().upper() for w in items if w.strip()]
         return cleaned or ["HEY CUBEY", "OK CUBEY", "HI CUBEY", "CUBEY", "WAKE UP"]
+
+    def _tokenize_phrase(self, phrase: str, tokens_path: Optional[str] = None) -> str:
+        """
+        Encodes a raw text phrase (e.g. 'HEY CUBEY') into the space-delimited BPE token string
+        required by Sherpa-ONNX (e.g. ' \u2581HE Y \u2581C U B E Y').
+        Uses sentencepiece if available, or greedy longest-prefix matching against tokens.txt.
+        """
+        # Try sentencepiece if bpe.model is present
+        bpe_path = self.model_dir / "bpe.model"
+        if not bpe_path.is_file():
+            for f in self.model_dir.rglob("*bpe*.model"):
+                if f.is_file():
+                    bpe_path = f
+                    break
+
+        if bpe_path.is_file():
+            try:
+                import sentencepiece as spm
+                sp = spm.SentencePieceProcessor()
+                sp.load(str(bpe_path))
+                pieces = sp.encode_as_pieces(phrase.strip().upper())
+                if pieces:
+                    return " ".join(pieces)
+            except Exception as e:
+                logger.debug("Sentencepiece encoding fallback: %s", e)
+
+        # Fallback: Vocabulary-based greedy longest-prefix tokenizer on tokens.txt
+        vocab = set()
+        t_path = Path(tokens_path) if tokens_path else (self.model_dir / "tokens.txt")
+        if not t_path.is_file():
+            for f in self.model_dir.rglob("*tokens*.txt"):
+                if f.is_file():
+                    t_path = f
+                    break
+
+        if t_path.is_file():
+            try:
+                with open(t_path, "r", encoding="utf-8") as fp:
+                    for line in fp:
+                        parts = line.strip().split()
+                        if len(parts) >= 2:
+                            vocab.add(parts[0])
+            except Exception as e:
+                logger.warning("Could not load tokens.txt for tokenization: %s", e)
+
+        if not vocab:
+            # If no vocab loaded, return raw phrase as fallback
+            return phrase
+
+        words = phrase.strip().upper().split()
+        all_pieces = []
+        for word in words:
+            target = "\u2581" + word
+            i = 0
+            while i < len(target):
+                matched = False
+                for j in range(len(target), i, -1):
+                    sub = target[i:j]
+                    if sub in vocab:
+                        all_pieces.append(sub)
+                        i = j
+                        matched = True
+                        break
+                if not matched:
+                    all_pieces.append(target[i])
+                    i += 1
+        return " ".join(all_pieces)
 
     def _ensure_model_files(self) -> dict:
         """
@@ -142,22 +210,54 @@ class WakeWordService:
             "joiner": str(joiner_path),
         }
 
-    def _generate_keywords_file(self) -> Path:
+    def _generate_keywords_file(self, tokens_path: Optional[str] = None) -> Path:
         """
-        Creates or updates keywords.txt for Sherpa-ONNX based on configured wake words,
-        boosting scores, and acoustic thresholds.
+        Creates or updates keywords.txt for Sherpa-ONNX by tokenizing configured wake words,
+        adding boosting scores and acoustic thresholds.
         """
         keywords_path = self.model_dir / "keywords.txt"
         lines = []
+        self._token_to_display_map.clear()
+
         for word in self.wake_words:
-            # Format: PHRASE :score #threshold
-            line = f"{word} :{self.score:.1f} #{self.threshold:.2f}"
+            tokenized = self._tokenize_phrase(word, tokens_path=tokens_path)
+            # Format: TOKEN1 TOKEN2 ... :score #threshold
+            line = f"{tokenized} :{self.score:.1f} #{self.threshold:.2f}"
             lines.append(line)
+            # Map raw tokens to human-readable phrase
+            self._token_to_display_map[tokenized] = word
+            self._token_to_display_map[tokenized.replace(" ", "")] = word
 
         content = "\n".join(lines) + "\n"
         keywords_path.write_text(content, encoding="utf-8")
-        logger.info("Generated KWS keywords file at %s with %d phrases: %s", keywords_path, len(lines), self.wake_words)
+        logger.info(
+            "Generated tokenized KWS keywords file at %s with %d phrases: %s",
+            keywords_path,
+            len(lines),
+            self.wake_words,
+        )
         return keywords_path
+
+    def _clean_detected_keyword(self, raw_kw: str) -> str:
+        """Translates raw tokenized spotter result into human-readable wake word string."""
+        if not raw_kw:
+            return ""
+        # Check direct token map
+        if raw_kw in self._token_to_display_map:
+            return self._token_to_display_map[raw_kw]
+        no_spaces = raw_kw.replace(" ", "")
+        if no_spaces in self._token_to_display_map:
+            return self._token_to_display_map[no_spaces]
+
+        # Clean \u2581 SentencePiece markers
+        cleaned = raw_kw.replace("\u2581", " ").strip()
+        cleaned_no_spaces = cleaned.replace(" ", "")
+
+        for w in self.wake_words:
+            if w.replace(" ", "").upper() == cleaned_no_spaces.upper():
+                return w
+
+        return cleaned or raw_kw
 
     def initialize(self) -> bool:
         """Initializes the Sherpa-ONNX KeywordSpotter engine."""
@@ -172,7 +272,7 @@ class WakeWordService:
 
         try:
             model_files = self._ensure_model_files()
-            keywords_file = self._generate_keywords_file()
+            keywords_file = self._generate_keywords_file(tokens_path=model_files.get("tokens"))
 
             logger.info("Initializing Sherpa-ONNX KeywordSpotter with %d threads...", self.num_threads)
             self.spotter = sherpa_onnx.KeywordSpotter(
@@ -304,12 +404,13 @@ class WakeWordService:
                     if result and getattr(result, "keyword", None):
                         detected_keyword = str(result.keyword).strip()
                         if detected_keyword:
+                            display_keyword = self._clean_detected_keyword(detected_keyword)
                             now = time.time()
                             if now - self._last_detection_time >= self._cooldown_seconds:
                                 self._last_detection_time = now
-                                logger.info("🎯 Wake Word Detected by Sherpa-ONNX: '%s'", detected_keyword)
+                                logger.info("🎯 Wake Word Detected by Sherpa-ONNX: '%s' (%s)", display_keyword, detected_keyword)
                                 self.spotter.reset_stream(self.stream)
-                                self._dispatch_detection(detected_keyword)
+                                self._dispatch_detection(display_keyword)
                             else:
                                 self.spotter.reset_stream(self.stream)
 
