@@ -5,6 +5,7 @@ Application Controller orchestrating asyncio worker threads, audio pipeline, Gem
 import asyncio
 import concurrent.futures
 import logging
+import platform
 import threading
 import time
 import uuid
@@ -102,7 +103,17 @@ class ApplicationController:
         explicit_channels = self.config.device_channels
         explicit_dtype = self.config.device_dtype
 
-        if self.config.enable_echo_cancellation:
+        is_linux = platform.system() == "Linux"
+        use_echo_cancellation = self.config.enable_echo_cancellation and is_linux
+
+        if self.config.enable_echo_cancellation and not is_linux:
+            logger.info(
+                "PipeWire echo cancellation is configured, but current OS is %s (Linux/Pi runtime only). "
+                "Using direct host audio devices.",
+                platform.system(),
+            )
+
+        if use_echo_cancellation:
             routing = prepare_pipewire_echo_cancellation(
                 source_name=self.config.echo_cancel_source,
                 sink_name=self.config.echo_cancel_sink,
@@ -138,7 +149,7 @@ class ApplicationController:
             explicit_channels=explicit_channels,
             explicit_dtype=explicit_dtype,
         )
-        if self.config.enable_echo_cancellation and (
+        if use_echo_cancellation and (
             input_device.device is None or output_device.device is None
         ):
             raise EchoCancellationUnavailable(
@@ -245,7 +256,11 @@ class ApplicationController:
 
     def start_live_session(
         self,
-        initial_interrupt: Optional[str] = "[WAKE UP - USER STARTED LIVE SESSION]",
+        initial_interrupt: Optional[str] = (
+            "[WAKE UP - USER STARTED LIVE SESSION] "
+            "The user just started a live conversation session with you! "
+            "Speak a brief, friendly greeting to the user now out loud."
+        ),
     ) -> None:
         """Schedule start_session coroutine on background asyncio thread."""
         try:
@@ -315,7 +330,11 @@ class ApplicationController:
         Triggers listening eye animation, HUD indicator, and auto-starts Gemini Live with wake-up interrupt.
         """
         logger.info("🎯 Wake word recognized: '%s'! Waking up and starting Gemini Live...", keyword)
-        wake_interrupt = f"[WAKE UP - USER SAID '{keyword.upper()}']"
+        wake_interrupt = (
+            f"[WAKE UP - USER SAID '{keyword.upper()}'] "
+            f"The user just said your wake phrase '{keyword.upper()}' to wake you up! "
+            f"Speak a brief, friendly greeting to the user now out loud."
+        )
         if self.gui:
             self.gui.post_log(f"🎯 Wake Word Detected: '{keyword}'! Waking up...")
             self.gui.post_reaction("listening")
