@@ -214,9 +214,6 @@ class AudioRecorder:
             source_dtype=self.device_dtype,
         )
 
-        if self.denoiser is not None and not self.is_muted:
-            converted = self.denoiser.process(converted)
-
         if self.is_muted:
             # Send silent PCM frame if muted
             converted = b'\x00' * len(converted)
@@ -229,27 +226,11 @@ class AudioRecorder:
             self._dispatch_packet(data)
 
     def _dispatch_packet(self, data: bytes) -> None:
-        """Fan out one correctly-sized Gemini microphone packet."""
+        """Fan out one correctly-sized microphone packet."""
         if self._loop is None:
             return
 
-        # Coalesce the cross-thread notification as well as bounding the final
-        # asyncio queue. At most one drain callback can be pending, so an event
-        # loop delay cannot create thousands of stale scheduled callbacks.
-        schedule_drain = False
-        with self._pending_lock:
-            if len(self._pending_packets) >= self.max_queue_chunks:
-                self._pending_packets.popleft()
-                if self.is_live_active:
-                    self._dropped_chunks += 1
-            self._pending_packets.append(data)
-            if not self._drain_scheduled:
-                self._drain_scheduled = True
-                schedule_drain = True
-        if schedule_drain:
-            self._loop.call_soon_threadsafe(self._drain_pending_packets)
-
-        # Fan out to optional secondary consumers.
+        # Fan out RAW (un-gated, un-denoised) audio to secondary consumers (wake word spotter).
         # This runs on the sounddevice audio thread; sinks must be thread-safe.
         if self.on_audio_chunk and not self.is_muted:
             try:
@@ -257,7 +238,7 @@ class AudioRecorder:
             except Exception:
                 pass
         
-        # Calculate RMS level for UI meter
+        # Calculate RMS level for UI meter using raw audio
         now = time.monotonic()
         if (
             self.on_level_change
@@ -275,6 +256,27 @@ class AudioRecorder:
                     self._schedule_level_update(norm_level)
             except Exception:
                 pass
+
+        # Apply noise suppression specifically for Gemini Live session streaming
+        gemini_data = data
+        if self.denoiser is not None and not self.is_muted:
+            gemini_data = self.denoiser.process(data)
+
+        # Coalesce the cross-thread notification as well as bounding the final
+        # asyncio queue. At most one drain callback can be pending, so an event
+        # loop delay cannot create thousands of stale scheduled callbacks.
+        schedule_drain = False
+        with self._pending_lock:
+            if len(self._pending_packets) >= self.max_queue_chunks:
+                self._pending_packets.popleft()
+                if self.is_live_active:
+                    self._dropped_chunks += 1
+            self._pending_packets.append(gemini_data)
+            if not self._drain_scheduled:
+                self._drain_scheduled = True
+                schedule_drain = True
+        if schedule_drain:
+            self._loop.call_soon_threadsafe(self._drain_pending_packets)
 
     def _drain_pending_packets(self) -> None:
         """Move one fresh bounded snapshot onto the asyncio-owned queue."""

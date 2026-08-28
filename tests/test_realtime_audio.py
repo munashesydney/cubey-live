@@ -87,18 +87,47 @@ class RecorderQueueTests(unittest.TestCase):
         self.assertEqual(recorder.audio_queue.qsize(), 1)
         self.assertEqual(len(recorder.audio_queue.get_nowait()), 320 * 2)
 
+    def test_raw_audio_dispatched_to_wake_word_while_denoised_for_queue(self) -> None:
+        """Wake word callback must receive raw un-gated audio; Gemini queue receives denoised."""
+        dispatched_chunks = []
+        class ImmediateLoop:
+            def call_soon_threadsafe(self, callback, *args):
+                callback(*args)
+
+        class MockDenoiser:
+            def process(self, pcm_bytes: bytes) -> bytes:
+                return b"\xAA" * len(pcm_bytes)
+
+        recorder = AudioRecorder(
+            sample_rate=16_000,
+            chunk_size=320,
+            on_audio_chunk=lambda chunk: dispatched_chunks.append(chunk),
+        )
+        recorder.denoiser = MockDenoiser()
+        recorder._loop = ImmediateLoop()
+        recorder.is_recording = True
+
+        raw_pcm = np.full(320, 1234, dtype=np.int16).tobytes()
+        recorder._audio_callback(raw_pcm, 320, {}, None)
+
+        # Wake word receives pristine raw PCM
+        self.assertEqual(len(dispatched_chunks), 1)
+        self.assertEqual(dispatched_chunks[0], raw_pcm)
+
+        # Gemini live queue receives denoised PCM
+        queue_item = recorder.audio_queue.get_nowait()
+        self.assertEqual(queue_item, b"\xAA" * len(raw_pcm))
+
 
 class ResamplerTests(unittest.TestCase):
     def test_downsamples_48k_device_frame_to_16k_packet(self) -> None:
         source = np.repeat(np.arange(320, dtype=np.int16), 3).tobytes()
         output = np.frombuffer(resample_pcm16(source, 48_000, 16_000), np.int16)
-
         np.testing.assert_array_equal(output, np.arange(320, dtype=np.int16))
 
     def test_upsamples_24k_output_to_48k_device_rate(self) -> None:
         source = np.array([-32768, 0, 32767], dtype=np.int16).tobytes()
         output = np.frombuffer(resample_pcm16(source, 24_000, 48_000), np.int16)
-
         self.assertEqual(len(output), 6)
         self.assertEqual(output[0], -32768)
         self.assertAlmostEqual(int(output[1]), -16384, delta=1)

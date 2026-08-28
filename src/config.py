@@ -109,7 +109,13 @@ class AppConfig:
         "WAKE_WORD_ENABLED", "true"
     ).strip().lower() not in {"0", "false", "no", "off"}
     wake_words: str = os.getenv(
-        "WAKE_WORDS", "HEY CUBEY, OK CUBEY, HI CUBEY, CUBEY, WAKE UP, HEY Q BEE, Q BEE, HEY CUBE Y, CUBE Y, HELLO CUBEY"
+        "WAKE_WORDS",
+        "HEY CUBEY, OK CUBEY, HI CUBEY, CUBEY, "
+        "YO CUBEY, SUP CUBEY, WHATS UP CUBEY, WHAT'S UP CUBEY, AYO CUBEY, WHAT'S GOOD CUBEY, WHATS GOOD CUBEY, "
+        "HELLO CUBEY, RISE AND SHINE, "
+        "HEY Q BEE, Q BEE, YO Q BEE, SUP Q BEE, HI Q BEE, AYO Q BEE, "
+        "HEY CUBE Y, CUBE Y, YO CUBE Y, "
+        "HEY CUBE EE, CUBE EE, YO CUBE EE, SUP CUBE EE",
     )
     wake_word_model_dir: Path = field(
         default_factory=lambda: DEFAULT_DATA_DIR / "models" / "sherpa-onnx-kws"

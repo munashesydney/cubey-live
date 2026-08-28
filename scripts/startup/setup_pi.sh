@@ -179,8 +179,11 @@ bash "${PROJECT_ROOT}/scripts/audio/setup_pipewire_aec.sh" \
     --env "${PROJECT_ROOT}/.env"
 
 # ---------------------------------------------------------------------------
-# Audio sanity check
+# Audio sanity check & microphone level boost
 # ---------------------------------------------------------------------------
+echo "==> Setting microphone hardware capture volume to 90%..."
+amixer sset 'Capture' 90% 2>/dev/null || amixer sset 'Mic' 90% 2>/dev/null || true
+
 echo "==> Detected audio devices (note the input/output indices):"
 "${VENV}/bin/python" -c "import sounddevice as sd; print(sd.query_devices())" || true
 
