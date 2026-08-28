@@ -30,11 +30,13 @@ class FrontierDetector:
 
     def __init__(
         self,
-        min_cluster_size: int = 4,      # Minimum boundary cells (~20cm open gap)
-        wall_clearance_cells: int = 2,  # Must be at least 2 cells away from solid walls
+        min_cluster_size: int = 4,        # Minimum boundary cells (~20cm open gap)
+        wall_clearance_cells: int = 2,    # Must be at least 2 cells away from solid walls
+        min_frontier_dist_m: float = 0.35, # Ignore frontiers directly under the robot's wheels
     ):
         self.min_cluster_size = min_cluster_size
         self.wall_clearance_cells = wall_clearance_cells
+        self.min_frontier_dist_m = min_frontier_dist_m
 
     def find_frontiers(
         self,
@@ -136,7 +138,9 @@ class FrontierDetector:
                 dist_m = math.hypot(world_x - robot_x_m, world_y - robot_y_m)
 
                 # Frontier scoring formula: reward large open boundaries, penalize travel distance
-                score = (len(cluster_cells) * 1.0) - (dist_m * 1.5)
+                # Penalize frontiers closer than min_frontier_dist_m to avoid hunting points under wheels
+                too_close_penalty = 100.0 if dist_m < self.min_frontier_dist_m else 0.0
+                score = (len(cluster_cells) * 1.0) - (dist_m * 1.5) - too_close_penalty
 
                 clusters.append(
                     FrontierCluster(

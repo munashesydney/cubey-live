@@ -45,8 +45,8 @@ class AutoNavigator:
         wheels_service: Optional[WheelsService] = None,
         lidar_service: Optional[LidarService] = None,
         drive_speed: int = 160,              # Exploration drive speed (100-255)
-        safety_stop_dist_mm: int = 260,       # Emergency obstacle brake distance
-        waypoint_reach_dist_m: float = 0.20,  # 20cm waypoint arrival threshold
+        safety_stop_dist_mm: int = 280,       # Emergency obstacle brake distance
+        waypoint_reach_dist_m: float = 0.12,  # 12cm waypoint arrival threshold
     ):
         self.mapping_service = mapping_service
         self.wheels_service = wheels_service or get_wheels_service()
@@ -56,13 +56,18 @@ class AutoNavigator:
         self.safety_stop_dist_mm = safety_stop_dist_mm
         self.waypoint_reach_dist_m = waypoint_reach_dist_m
 
-        self.frontier_detector = FrontierDetector(min_cluster_size=3, wall_clearance_cells=2)
-        self.path_planner = PathPlanner(robot_radius_m=0.20, safety_margin_m=0.05)
+        self.frontier_detector = FrontierDetector(
+            min_cluster_size=4,
+            wall_clearance_cells=2,
+            min_frontier_dist_m=0.35,
+        )
+        self.path_planner = PathPlanner(robot_radius_m=0.18, safety_margin_m=0.04)
 
         self.state = NavigationState.IDLE
         self.current_path: List[Tuple[float, float]] = []
         self.current_waypoint_idx: int = 0
         self.target_frontier: Optional[Tuple[float, float]] = None
+        self._visited_targets: List[Tuple[float, float, float]] = []  # (x, y, timestamp)
 
         self._running: bool = False
         self._thread: Optional[threading.Thread] = None
@@ -217,23 +222,38 @@ class AutoNavigator:
                     pass
             return
 
-        # Attempt A* route to top ranked frontiers
+        # Attempt A* route to top ranked frontiers (filtering out targets visited in last 15s)
+        now = time.time()
+        # Clean expired visited targets (> 15s old)
+        self._visited_targets = [v for v in self._visited_targets if (now - v[2]) < 15.0]
+
         planned_path = None
         chosen_target = None
 
-        for candidate in frontiers[:5]:
+        for candidate in frontiers[:8]:
+            cx, cy = candidate.centroid_world
+            # Skip if visited very recently
+            if any(math.hypot(cx - vx, cy - vy) < 0.30 for vx, vy, _ in self._visited_targets):
+                continue
+
             path = self.path_planner.plan_path(
                 grid=grid,
                 resolution_m=res_m,
                 origin_x_m=origin_x,
                 origin_y_m=origin_y,
                 start_world=(robot_pose.x_m, robot_pose.y_m),
-                goal_world=candidate.centroid_world,
+                goal_world=(cx, cy),
             )
+            # Require at least 2 steps and meaningful total distance >= 25cm
             if path and len(path) >= 2:
-                planned_path = path
-                chosen_target = candidate.centroid_world
-                break
+                total_dist = sum(
+                    math.hypot(path[i+1][0] - path[i][0], path[i+1][1] - path[i][1])
+                    for i in range(len(path) - 1)
+                )
+                if total_dist >= 0.25:
+                    planned_path = path
+                    chosen_target = (cx, cy)
+                    break
 
         if planned_path and chosen_target:
             with self._lock:
@@ -242,16 +262,17 @@ class AutoNavigator:
                 self.target_frontier = chosen_target
                 self.state = NavigationState.NAVIGATING
             logger.info(
-                "Planned autonomous route with %d waypoints towards target %s",
+                "Planned autonomous route with %d waypoints (dist=%.2fm) towards target %s",
                 len(planned_path),
+                total_dist,
                 chosen_target,
             )
         else:
-            # If path planner was blocked by narrow corridor, steer smoothly to clear view
-            logger.info("Frontier path blocked. Steering to open field of view.")
+            # If path planner was blocked, rotate slightly to scan into unexplored space
+            logger.info("No clear route to top frontiers. Rotating to discover open corridors.")
             self.wheels_service.set_speed(self.drive_speed)
-            self.wheels_service.pulse("rotateRight", 250)
-            time.sleep(0.3)
+            self.wheels_service.pulse("rotateRight", 300)
+            time.sleep(0.4)
 
     # ------------------------------------------------------------------
     # Pure-Pursuit Waypoint Following & Smooth Motion Controller
@@ -279,8 +300,14 @@ class AutoNavigator:
         final_x, final_y = self.current_path[-1]
         dist_to_final = math.hypot(final_x - robot_pose.x_m, final_y - robot_pose.y_m)
         if dist_to_final < self.waypoint_reach_dist_m:
-            logger.info("Reached frontier destination! Re-evaluating next room...")
+            logger.info("Reached frontier destination! Performing scan sweep...")
             self.wheels_service.stop()
+            # Record visited target
+            if self.target_frontier:
+                self._visited_targets.append((self.target_frontier[0], self.target_frontier[1], time.time()))
+            # Brief sweep rotation to clear LiDAR into the open room
+            self.wheels_service.pulse("rotateRight", 250)
+            time.sleep(0.3)
             self.state = NavigationState.PLANNING
             return
 
