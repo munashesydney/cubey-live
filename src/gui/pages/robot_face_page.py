@@ -28,13 +28,16 @@ class RobotFacePage(ctk.CTkFrame):
         master,
         on_open_developer_console: Optional[Callable[[], None]] = None,
         target_fps: int = 30,
-        supersampling: int = 2,
+        supersampling: Optional[int] = None,
         **kwargs,
     ):
         super().__init__(master, fg_color="#0A0A0F", corner_radius=0, **kwargs)
         self.on_open_developer_console = on_open_developer_console
         self.target_fps = max(15, min(int(target_fps), 60))
-        self.supersampling = max(1, min(int(supersampling), 3))
+        if supersampling is not None:
+            self.supersampling = max(1, min(int(supersampling), 3))
+        else:
+            self.supersampling = max(1, min(int(os.getenv("GUI_SUPERSAMPLING", "1")), 3))
         self._frame_interval = 1.0 / self.target_fps
         self._last_frame_at = time.perf_counter()
 
@@ -347,8 +350,9 @@ class RobotFacePage(ctk.CTkFrame):
                 fill=(0, 0, 0, 0),
             )
 
-        # Downscale for SSAA crisp anti-aliasing
-        eye_img = eye_img.resize((final_w, final_h), resample=Image.Resampling.LANCZOS)
+        # Downscale for SSAA crisp anti-aliasing if ssaa > 1
+        if ssaa > 1:
+            eye_img = eye_img.resize((final_w, final_h), resample=Image.Resampling.BILINEAR)
 
         ecx_unscaled = final_w / 2.0
         ecy_unscaled = final_h / 2.0
@@ -356,7 +360,7 @@ class RobotFacePage(ctk.CTkFrame):
         # Rotate transform for 3D perspective slant AFTER downscaling
         if abs(slant_deg) > 0.1:
             eye_img = eye_img.rotate(
-                -slant_deg, resample=Image.Resampling.BICUBIC, center=(ecx_unscaled, ecy_unscaled)
+                -slant_deg, resample=Image.Resampling.BILINEAR, center=(ecx_unscaled, ecy_unscaled)
             )
 
         # Paste rendered transformed eye onto main canvas

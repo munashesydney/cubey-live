@@ -242,9 +242,16 @@ class ApplicationController:
 
     def start_live_session(self) -> None:
         """Schedule start_session coroutine on background asyncio thread."""
+        t_now = time.time()
+        logger.info(
+            "[TEMPORAL_LOG:START_SESSION_ENTER] at t=%.3f (api_key_set=%s, async_loop_running=%s)",
+            t_now,
+            bool(self.config.api_key),
+            self.async_loop.is_running() if self.async_loop else False,
+        )
         try:
             if not self.config.api_key:
-                logger.error("Cannot start Live session: GEMINI_API_KEY is not set!")
+                logger.error("[TEMPORAL_LOG:MISSING_API_KEY] Cannot start Live session: GEMINI_API_KEY is not set!")
                 if self.gui:
                     self.gui.post_log("❌ Error: GEMINI_API_KEY is not set! Set it in your environment or .env file.")
                     self.gui.post_status("Error: Missing GEMINI_API_KEY")
@@ -259,24 +266,44 @@ class ApplicationController:
                 if self.gui:
                     self.gui.post_listening(True)
 
-                # No local embedding inference may begin while real-time audio owns
-                # the latency budget. Transcript rows are still queued immediately.
                 self.transcript_persistence.set_realtime_active(True)
                 self._begin_conversation()
-                logger.info("Scheduling Gemini Live session start...")
+                logger.info(
+                    "[TEMPORAL_LOG:SCHEDULING_TASK] Dispatching client.start_session() to asyncio loop at t=%.3f",
+                    time.time(),
+                )
                 self._session_task = asyncio.run_coroutine_threadsafe(
                     self.client.start_session(),
                     self.async_loop
                 )
+
+                def _on_session_task_done(fut) -> None:
+                    try:
+                        exc = fut.exception()
+                        if exc:
+                            logger.error(
+                                "[TEMPORAL_LOG:SESSION_TASK_ERROR] Gemini Live session raised exception: %s",
+                                exc,
+                                exc_info=exc,
+                            )
+                        else:
+                            logger.info(
+                                "[TEMPORAL_LOG:SESSION_TASK_DONE] Gemini Live session task completed at t=%.3f",
+                                time.time(),
+                            )
+                    except Exception as e:
+                        logger.error("Error inspecting session task future: %s", e)
+
+                self._session_task.add_done_callback(_on_session_task_done)
             else:
                 logger.warning(
-                    "Cannot start Live session: client=%s, async_loop=%s (running=%s)",
+                    "[TEMPORAL_LOG:CANNOT_START] client=%s, async_loop=%s (running=%s)",
                     bool(self.client),
                     bool(self.async_loop),
                     self.async_loop.is_running() if self.async_loop else False,
                 )
         except Exception as e:
-            logger.error("Failed to start Live session: %s", e, exc_info=True)
+            logger.error("[TEMPORAL_LOG:START_SESSION_EXCEPTION] Failed to start Live session: %s", e, exc_info=True)
 
     def stop_live_session(self) -> None:
         """Stop active live session."""
@@ -294,7 +321,13 @@ class ApplicationController:
         Callback from Sherpa-ONNX when a wake-up phrase is recognized.
         Triggers listening eye animation, colored side waves, and auto-starts Gemini Live.
         """
-        logger.info("🎯 Wake word recognized: '%s'! Waking up and starting Gemini Live...", keyword)
+        t_now = time.time()
+        logger.info(
+            "[TEMPORAL_LOG:WAKE_WORD_RECOGNIZED] phrase='%s' at t=%.3f, client_connected=%s",
+            keyword,
+            t_now,
+            self.client.is_connected if self.client else False,
+        )
         if self.gui:
             self.gui.post_log(f"🎯 Wake Word Detected: '{keyword}'! Waking up...")
             self.gui.post_reaction("listening")
@@ -303,7 +336,16 @@ class ApplicationController:
 
         # Auto-start Gemini Live conversation session if not already connected
         if self.client and not self.client.is_connected:
+            logger.info(
+                "[TEMPORAL_LOG:TRIGGERING_LIVE_START] Calling start_live_session() at t=%.3f",
+                time.time(),
+            )
             self.start_live_session()
+        else:
+            logger.info(
+                "[TEMPORAL_LOG:SKIP_LIVE_START] client connected or none (connected=%s)",
+                self.client.is_connected if self.client else None,
+            )
 
     def send_interruption(self, text_payload: str) -> None:
         """

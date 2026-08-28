@@ -431,6 +431,7 @@ class WakeWordService:
         """Trigger callback when wake word is spotted."""
         if self.on_wake_word:
             try:
+                logger.info("[TEMPORAL_LOG:KWS_DISPATCHING] Calling on_wake_word('%s') at t=%.3f", keyword, time.time())
                 self.on_wake_word(keyword)
             except Exception as e:
-                logger.error("Error in on_wake_word callback: %s", e, exc_info=True)
+                logger.error("[TEMPORAL_LOG:KWS_CALLBACK_ERROR] Error in on_wake_word callback: %s", e, exc_info=True)
