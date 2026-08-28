@@ -451,8 +451,20 @@ class WheelsPage(ctk.CTkFrame):
 
         ctk.CTkButton(
             footer,
+            text="⚡ Sim Charge",
+            width=85,
+            height=24,
+            font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color="#A6E3A1",
+            text_color="#11111B",
+            hover_color="#94E2D5",
+            command=self._toggle_sim_charge,
+        ).pack(side="right", padx=(4, 0))
+
+        ctk.CTkButton(
+            footer,
             text="Ping",
-            width=55,
+            width=50,
             height=24,
             font=ctk.CTkFont(size=10),
             fg_color=COLOR_SURFACE0,
@@ -463,7 +475,7 @@ class WheelsPage(ctk.CTkFrame):
         ctk.CTkButton(
             footer,
             text="Status",
-            width=55,
+            width=50,
             height=24,
             font=ctk.CTkFont(size=10),
             fg_color=COLOR_SURFACE0,
@@ -839,15 +851,28 @@ class WheelsPage(ctk.CTkFrame):
                 )
 
                 if data.battery_voltage > 0:
-                    batt_color = COLOR_SUCCESS if data.battery_pct >= 50 else (COLOR_WARNING if data.battery_pct >= 20 else COLOR_DANGER)
-                    self.battery_label.configure(
-                        text=f"🔋 Battery: {data.battery_pct}% ({data.battery_voltage:.2f}V)",
-                        text_color=batt_color
-                    )
+                    if data.is_charging:
+                        self.battery_label.configure(
+                            text=f"⚡ Charging: {data.battery_pct}% ({data.battery_voltage:.2f}V)",
+                            text_color="#A6E3A1"
+                        )
+                    else:
+                        batt_color = COLOR_SUCCESS if data.battery_pct >= 50 else (COLOR_WARNING if data.battery_pct >= 20 else COLOR_DANGER)
+                        self.battery_label.configure(
+                            text=f"🔋 Battery: {data.battery_pct}% ({data.battery_voltage:.2f}V)",
+                            text_color=batt_color
+                        )
             except Exception:
                 pass
 
         self.after_idle(_update)
+
+    def _toggle_sim_charge(self) -> None:
+        """Toggle simulated charging state on WheelsService for testing."""
+        curr = getattr(self.service, "_is_charging", False)
+        new_state = not curr
+        self.service.set_charging_simulation(new_state)
+        self.service._emit_log(f"⚡ [Sim] Charging state set to: {new_state}")
 
     def _on_log_received(self, text: str) -> None:
         """Buffer incoming log line and schedule batched UI flush to prevent GUI freezing."""

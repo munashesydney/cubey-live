@@ -45,7 +45,8 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                         "The visual reaction type to express on the display: "
                         "'hurt' (when kicked or damaged), 'alert' (when obstacle detected or moved), "
                         "'happy' (warm/friendly), 'surprised' (shocked/unexpected), "
-                        "'skeptical' (confused/questioning), 'low_battery' (power low), or 'normal'."
+                        "'skeptical' (confused/questioning), 'low_battery' (power low), "
+                        "'charging' (connected to power/charging), 'sleeping' (resting/peaceful), or 'normal'."
                     ),
                 }
             },

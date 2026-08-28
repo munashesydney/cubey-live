@@ -1,32 +1,36 @@
-"""
+﻿"""
 Eye Animation Engine module.
 Coordinates time-correct organic random micro-gaze saccades, EMO-style spring physics,
 3D perspective tilt/shear, shape morphing, variable blink/wink patterns,
-and dynamic EMO idle action sequences.
+dynamic EMO idle action sequences, and sleeping/charging breathing rhythms.
 """
 
+import logging
 import math
 import random
 import time
-import logging
-from typing import Callable, Optional, Dict
+from typing import Callable, Dict, Optional
 
 from .reactions import (
-    BaseReaction,
-    HurtReaction,
     AlertReaction,
+    BaseReaction,
+    ChargingReaction,
     HappyReaction,
+    HurtReaction,
     LowBatteryReaction,
-    SurprisedReaction,
     SkepticalReaction,
+    SleepingReaction,
+    SurprisedReaction,
 )
 
 logger = logging.getLogger(__name__)
+
 
 def ease_out_cubic(t: float) -> float:
     """Cubic ease-out interpolation for natural organic motion deceleration."""
     t = max(0.0, min(1.0, t))
     return 1.0 - math.pow(1.0 - t, 3)
+
 
 def ease_out_bounce(t: float) -> float:
     """Bounce ease-out physics for elastic landings."""
@@ -46,13 +50,15 @@ def ease_out_bounce(t: float) -> float:
         t -= 2.625 / d1
         return n1 * t * t + 0.984375
 
+
 def smoothstep(t: float) -> float:
     """Smoothstep S-curve interpolation."""
     t = max(0.0, min(1.0, t))
     return t * t * (3.0 - 2.0 * t)
 
+
 class EyeAnimationEngine:
-    """Manages full EMO-style eye animation state, multi-pattern blinks, spring physics, and idle behavior state machine."""
+    """Manages full EMO-style eye animation state, multi-pattern blinks, spring physics, and sleeping/charging cycles."""
 
     def __init__(self, redraw_callback: Callable[[], None]):
         self.redraw_callback = redraw_callback
@@ -98,25 +104,33 @@ class EyeAnimationEngine:
 
         self.eyelid_top_left = 0.0   # Top eyelid closure (0.0 open, 1.0 closed)
         self.eyelid_top_right = 0.0
-        self.eyelid_bottom_left = 0.0
-        self.eyelid_bottom_right = 0.0
-
         self.target_eyelid_top_l = 0.0
         self.target_eyelid_top_r = 0.0
 
-        self.shape_mode = "capsule"  # "capsule", "crescent_happy", "trapezoid_slant", "wide_oval"
-        self.pending_shape_mode = None
+        # Shape modes: "capsule", "crescent_happy", "crescent_sleep", "trapezoid_slant", "wide_oval"
+        self.shape_mode = "capsule"
+        self.pending_shape_mode: Optional[str] = None
 
         self.height_scale_mult = 1.0
         self.width_scale_mult = 1.0
+        self.squish_l_y_effective = 1.0
+        self.squish_r_y_effective = 1.0
 
         # Blinking state machine
         self.is_blinking = False
-        self.blink_mode = "NORMAL"   # "NORMAL", "DOUBLE", "SLEEPY", "WINK_LEFT", "WINK_RIGHT", "FLUTTER"
-        self.blink_step = 0
-        self.max_blink_steps = 10
+        self.blink_step = 0.0
+        self.max_blink_steps = 10.0
+        self.blink_mode = "NORMAL"
         self.blink_scale_l = 1.0
         self.blink_scale_r = 1.0
+
+        # Sleeping & Charging State
+        self.is_sleeping = False
+        self.is_charging = False
+        self.battery_pct = 100
+        self.breathing_phase = 0.0
+        self._last_sleep_action_time = time.time()
+        self._next_sleep_action_interval = random.uniform(10.0, 18.0)
 
         # Idle Action State Machine
         self.is_running_action = False
@@ -137,6 +151,8 @@ class EyeAnimationEngine:
             "surprised": SurprisedReaction(),
             "skeptical": SkepticalReaction(),
             "shocked": HurtReaction(),
+            "charging": ChargingReaction(),
+            "sleeping": SleepingReaction(),
         }
 
         # Timers
@@ -162,27 +178,83 @@ class EyeAnimationEngine:
     def slant_angle(self) -> float:
         return (self.slant_left + self.slant_right) / 2.0
 
+    def set_sleeping(self, sleeping: bool) -> None:
+        """Toggle sleeping mode with peaceful eye shapes and calming breathing."""
+        if self.is_sleeping == sleeping:
+            return
+        self.is_sleeping = sleeping
+        if sleeping:
+            self.emotion_name = "sleeping"
+            self.pending_shape_mode = "crescent_sleep"
+            self.target_squish_l_y = 0.65
+            self.target_squish_r_y = 0.65
+            self.target_gaze_x = 0.0
+            self.target_gaze_y = 5.0
+            self.start_blink("TRANSITION")
+        else:
+            self.emotion_name = "normal"
+            self.pending_shape_mode = "capsule"
+            self.target_squish_l_y = 1.0
+            self.target_squish_r_y = 1.0
+            self.start_blink("TRANSITION")
+        self.redraw_callback()
+
+    def set_charging(self, charging: bool, battery_pct: int = 0) -> None:
+        """Update charging state and battery percentage."""
+        self.is_charging = charging
+        if battery_pct > 0:
+            self.battery_pct = battery_pct
+        if charging and not self.is_sleeping:
+            # Auto-enter cozy sleep when plugged into charging station
+            self.set_sleeping(True)
+        elif not charging and self.is_sleeping:
+            self.set_sleeping(False)
+
     def update_animation_frame(self, frame_scale: float = 1.0) -> None:
         """Advance animation using 60 FPS-equivalent, time-scaled physics."""
         frame_scale = max(0.25, min(float(frame_scale), 6.0))
         now = time.time()
 
-        # 1. Active Custom EMO Action Sequence Update
-        if self.is_running_action:
-            self._update_current_action(now)
-        else:
-            # Periodic EMO Action Trigger (only during 'normal' emotion state)
-            if self.emotion_name == "normal" and (now - self._last_action_time >= self._next_action_interval):
-                if random.random() < 0.65:
-                    self._trigger_random_emo_action()
-                    self._last_action_time = now
-                    self._next_action_interval = random.uniform(4.0, 7.5)
+        # 1. Sleeping & Charging Behavior
+        if self.is_sleeping or self.is_charging:
+            # Peaceful, slow rhythmic breathing
+            self.breathing_phase += 0.035 * frame_scale
+            breathing = math.sin(self.breathing_phase) * 0.06
+            self.squish_l_y_effective = self.squish_l_y + breathing
+            self.squish_r_y_effective = self.squish_r_y + breathing
 
-            # 2. Organic Micro-Gaze Saccades (when not running custom action)
-            if not self.is_running_action and (now - self._last_saccade_time >= self._next_saccade_interval):
-                self._trigger_random_saccade()
-                self._last_saccade_time = now
-                self._next_saccade_interval = random.uniform(1.8, 3.8)
+            # Periodic subtle sleepy snuffle / micro-stretch
+            if now - self._last_sleep_action_time >= self._next_sleep_action_interval:
+                self._last_sleep_action_time = now
+                self._next_sleep_action_interval = random.uniform(12.0, 22.0)
+                if random.random() < 0.6:
+                    self.start_blink("SLEEPY")
+        else:
+            # Normal awake action sequence
+            if self.is_running_action:
+                self._update_current_action(now)
+            else:
+                # Periodic EMO Action Trigger (only during 'normal' emotion state)
+                if self.emotion_name == "normal" and (now - self._last_action_time >= self._next_action_interval):
+                    if random.random() < 0.65:
+                        self._trigger_random_emo_action()
+                        self._last_action_time = now
+                        self._next_action_interval = random.uniform(4.0, 7.5)
+
+                # Organic Micro-Gaze Saccades
+                if not self.is_running_action and (now - self._last_saccade_time >= self._next_saccade_interval):
+                    self._trigger_random_saccade()
+                    self._last_saccade_time = now
+                    self._next_saccade_interval = random.uniform(1.8, 3.8)
+
+            # Idle Awake Breathing Wave
+            if not self.is_running_action:
+                breathing = math.sin(now * 2.4) * 0.02
+                self.squish_l_y_effective = self.squish_l_y + breathing
+                self.squish_r_y_effective = self.squish_r_y + breathing
+            else:
+                self.squish_l_y_effective = self.squish_l_y
+                self.squish_r_y_effective = self.squish_r_y
 
         # Smooth Gaze Interpolation
         if self.saccade_t < 1.0:
@@ -206,7 +278,6 @@ class EyeAnimationEngine:
                 self.pending_shape_mode = None
 
         # 4. Spring Physics Lerp for Slants, Shear, Squish, and Eyelids
-        # Equivalent exponential convergence regardless of display FPS.
         lerp_speed = 1.0 - math.pow(1.0 - 0.18, frame_scale)
         self.slant_left += (self.target_slant_l - self.slant_left) * lerp_speed
         self.slant_right += (self.target_slant_r - self.slant_right) * lerp_speed
@@ -220,16 +291,7 @@ class EyeAnimationEngine:
         self.eyelid_top_left += (self.target_eyelid_top_l - self.eyelid_top_left) * lerp_speed
         self.eyelid_top_right += (self.target_eyelid_top_r - self.eyelid_top_right) * lerp_speed
 
-        # 5. Idle Breathing Wave (Subtle natural vertical scale pulse)
-        if not self.is_running_action:
-            breathing = math.sin(now * 2.4) * 0.02
-            self.squish_l_y_effective = self.squish_l_y + breathing
-            self.squish_r_y_effective = self.squish_r_y + breathing
-        else:
-            self.squish_l_y_effective = self.squish_l_y
-            self.squish_r_y_effective = self.squish_r_y
-
-        # 6. Pain / Jitter Shiver
+        # 5. Pain / Jitter Shiver
         if self._current_reaction and self._current_reaction.jitter:
             self.jitter_offset_x = random.uniform(-5.0, 5.0)
             self.jitter_offset_y = random.uniform(-5.0, 5.0)
@@ -258,36 +320,38 @@ class EyeAnimationEngine:
                     self.blink_mode = "DOUBLE"
                     self.max_blink_steps = 18
                 elif r < 0.90:
-                    self.blink_mode = "WINK_LEFT" if random.random() < 0.5 else "WINK_RIGHT"
+                    self.blink_mode = "WINK_LEFT"
+                    self.max_blink_steps = 12
+                elif r < 0.96:
+                    self.blink_mode = "WINK_RIGHT"
                     self.max_blink_steps = 12
                 else:
                     self.blink_mode = "SLEEPY"
                     self.max_blink_steps = 22
 
-    def _update_blink_cycle(self, frame_scale: float = 1.0) -> None:
-        """Process active blink or wink frame."""
+    def _update_blink_cycle(self, frame_scale: float) -> None:
+        """Update eye closure during active blink."""
         if not self.is_blinking:
             self.blink_scale_l = 1.0
             self.blink_scale_r = 1.0
             return
 
-        total = float(self.max_blink_steps)
-        half = total / 2.0
+        half = self.max_blink_steps / 2.0
 
         if self.blink_mode == "NORMAL":
             if self.blink_step <= half:
-                t = self.blink_step / half
-                val = max(0.04, 1.0 - smoothstep(t) * 0.96)
+                val = max(0.04, 1.0 - smoothstep(self.blink_step / half) * 0.96)
             else:
-                t = (self.blink_step - half) / half
-                val = min(1.0, 0.04 + smoothstep(t) * 0.96)
+                val = min(1.0, 0.04 + smoothstep((self.blink_step - half) / half) * 0.96)
             self.blink_scale_l = val
             self.blink_scale_r = val
 
         elif self.blink_mode == "DOUBLE":
-            # Double blink wave (two fast peaks)
-            cycle = (self.blink_step / total) * (2 * math.pi)
-            val = max(0.04, (math.cos(cycle) + 1.0) / 2.0)
+            sub_step = (self.blink_step % (half)) / (half / 2.0)
+            if sub_step <= 1.0:
+                val = max(0.08, 1.0 - smoothstep(sub_step) * 0.92)
+            else:
+                val = min(1.0, 0.08 + smoothstep(sub_step - 1.0) * 0.92)
             self.blink_scale_l = val
             self.blink_scale_r = val
 
@@ -308,7 +372,6 @@ class EyeAnimationEngine:
             self.blink_scale_r = val
 
         elif self.blink_mode == "SLEEPY":
-            # Slow sleepy blink
             if self.blink_step <= half:
                 val = max(0.1, 1.0 - (self.blink_step / half) * 0.9)
             else:
@@ -382,7 +445,6 @@ class EyeAnimationEngine:
             self.target_gaze_x = side_x
             self.target_gaze_y = side_y
             self.saccade_t = 0.0
-            # Squish against corner edge
             self.target_squish_l_x = 0.75
             self.target_squish_l_y = 1.25
             self.target_squish_r_x = 0.75
@@ -393,7 +455,7 @@ class EyeAnimationEngine:
             self.start_gaze_x = self.gaze_x
             self.start_gaze_y = self.gaze_y
             self.target_gaze_x = 0.0
-            self.target_gaze_y = -40.0  # Jump up
+            self.target_gaze_y = -40.0
             self.saccade_t = 0.0
             self.target_squish_l_y = 1.4
             self.target_squish_l_x = 0.8
@@ -438,7 +500,6 @@ class EyeAnimationEngine:
             self.gaze_y = math.sin(angle) * radius_y
 
         elif self.action_name == "BOUNCE_STRETCH" and elapsed > 0.5:
-            # Landing squish
             self.target_gaze_y = 0.0
             self.target_squish_l_y = 0.75
             self.target_squish_l_x = 1.3
@@ -446,7 +507,6 @@ class EyeAnimationEngine:
             self.target_squish_r_x = 1.3
 
         if elapsed >= self.action_duration:
-            # Reset action parameters back to normal
             self.is_running_action = False
             self.action_name = ""
             self.target_slant_l = 0.0
@@ -461,7 +521,6 @@ class EyeAnimationEngine:
             if self.shape_mode != "capsule":
                 self.pending_shape_mode = "capsule"
             
-            # Fix gaze snap back by starting interpolation from CURRENT gaze
             self.start_gaze_x = self.gaze_x
             self.start_gaze_y = self.gaze_y
             self.target_gaze_x = 0.0
@@ -496,8 +555,11 @@ class EyeAnimationEngine:
 
         self.redraw_callback()
 
-        # Auto-reset back to normal after duration
+        # Auto-reset back to normal after duration (unless in persistent sleeping/charging state)
         def reset_fn():
+            if self.is_sleeping:
+                self.set_sleeping(True)
+                return
             self._current_reaction = self.reactions["normal"]
             self.emotion_name = "normal"
             self.current_color = self.default_color

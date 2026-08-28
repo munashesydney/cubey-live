@@ -8,7 +8,18 @@ from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
-VALID_REACTION_TYPES = {"hurt", "alert", "happy", "shocked", "surprised", "skeptical", "low_battery", "normal"}
+VALID_REACTION_TYPES = {
+    "hurt",
+    "alert",
+    "happy",
+    "shocked",
+    "surprised",
+    "skeptical",
+    "low_battery",
+    "charging",
+    "sleeping",
+    "normal",
+}
 
 def execute_react_tool(
     reaction_type: str,

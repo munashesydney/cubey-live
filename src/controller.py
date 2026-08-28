@@ -180,6 +180,10 @@ class ApplicationController:
             wheels_service=get_wheels_service(),
         )
 
+        # Connect WheelsService telemetry to GUI battery updates
+        wheels_service = get_wheels_service()
+        wheels_service.on_telemetry = self._on_telemetry_received
+
         # 4. Create CustomTkinter GUI app
         self.gui = GeminiLiveApp(
             config=self.config,
@@ -245,6 +249,11 @@ class ApplicationController:
         """Callback invoked when Gemini Live calls the 'react' tool."""
         if self.gui:
             self.gui.post_reaction(reaction_type)
+
+    def _on_telemetry_received(self, telemetry) -> None:
+        """Callback when telemetry (battery/charging) is received from WheelsService."""
+        if self.gui and hasattr(telemetry, "is_charging"):
+            self.gui.post_battery(telemetry.is_charging, telemetry.battery_pct)
 
     def _on_mic_level_changed(self, level: float) -> None:
         """Callback from audio recorder (runs thread-safely)."""

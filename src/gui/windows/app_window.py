@@ -80,6 +80,10 @@ class GeminiLiveApp(ctk.CTk):
         self.bind("<F11>", lambda e: self.toggle_fullscreen())
         self.bind("<Escape>", lambda e: self.exit_fullscreen())
 
+        # Bind Charging / Sleep Animation Test Hotkey ('C')
+        self.bind("<Key-c>", lambda e: self.toggle_charging_test())
+        self.bind("<Key-C>", lambda e: self.toggle_charging_test())
+
         # Auto-enter fullscreen if configured
         if getattr(self.config, "gui_fullscreen", False):
             self.after(150, self.enter_fullscreen)
@@ -107,6 +111,9 @@ class GeminiLiveApp(ctk.CTk):
     def post_reaction(self, reaction_type: str) -> None:
         self._event_bridge.post("reaction", reaction_type)
 
+    def post_battery(self, is_charging: bool, battery_pct: int) -> None:
+        self._event_bridge.post("battery", is_charging, battery_pct, latest=True)
+
     def _drain_gui_events(self) -> None:
         """Apply queued updates from the Tk main thread in bounded batches."""
         handlers = {
@@ -115,6 +122,7 @@ class GeminiLiveApp(ctk.CTk):
             "transcript": self.append_transcript,
             "log": self.append_log,
             "reaction": self.trigger_robot_reaction,
+            "battery": self.update_battery_state,
         }
         log_messages: list[str] = []
         for event in self._event_bridge.drain(_GUI_EVENT_BATCH_SIZE):
@@ -214,3 +222,15 @@ class GeminiLiveApp(ctk.CTk):
             self.append_log("Exited Fullscreen Mode")
         except Exception as e:
             logger.warning("Error exiting fullscreen: %s", e)
+
+    def update_battery_state(self, is_charging: bool, battery_pct: int) -> None:
+        """Apply battery and charging state to robot face and dev window."""
+        self.robot_face.set_charging(is_charging, battery_pct)
+
+    def toggle_charging_test(self) -> None:
+        """Toggle charging & sleeping animation for live developer testing ('C' hotkey)."""
+        new_state = not self.robot_face.is_charging
+        test_pct = 85 if new_state else 100
+        self.robot_face.set_charging(new_state, test_pct)
+        state_str = "CHARGING & SLEEPING (85%)" if new_state else "NORMAL (AWAKE)"
+        self.post_log(f"⚡ [Dev Mode] Face animation set to: {state_str}")

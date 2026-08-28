@@ -37,6 +37,7 @@ class TelemetryData:
     speed: int = 180
     battery_voltage: float = 0.0
     battery_pct: int = 0
+    is_charging: bool = False
     timestamp: float = field(default_factory=time.time)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -49,6 +50,7 @@ class TelemetryData:
             "speed": self.speed,
             "battery_voltage": self.battery_voltage,
             "battery_pct": self.battery_pct,
+            "is_charging": self.is_charging,
             "timestamp": self.timestamp,
         }
 
@@ -103,6 +105,20 @@ class WheelsService:
 
         # Telemetry state cache
         self.telemetry = TelemetryData()
+
+        # Battery charging trend detection
+        self._voltage_samples: List[tuple] = []
+        self._is_charging: bool = False
+        self._charging_sim_override: Optional[bool] = None
+
+    def set_charging_simulation(self, charging: Optional[bool]) -> None:
+        """Override charging detection state for UI/animation simulation and testing."""
+        self._charging_sim_override = charging
+        if charging is not None:
+            self._is_charging = charging
+            self.telemetry.is_charging = charging
+            if self.on_telemetry:
+                self.on_telemetry(self.telemetry)
 
     @staticmethod
     def _get_default_port_for_platform() -> str:
@@ -373,16 +389,44 @@ class WheelsService:
                     k, v = part.split("=", 1)
                     kv[k.strip()] = v.strip()
 
+            batt_v = float(kv.get("batt_v", self.telemetry.battery_voltage))
+            batt_pct = int(kv.get("batt_pct", self.telemetry.battery_pct))
+            motion_state = kv.get("motion", self.telemetry.motion)
+            now = time.time()
+
+            # Charging detection
+            if "charging" in kv:
+                self._is_charging = kv.get("charging") in ("1", "true", "True")
+            elif self._charging_sim_override is not None:
+                self._is_charging = self._charging_sim_override
+            elif batt_v > 0.5:
+                # Add sample and discard samples older than 30 seconds
+                self._voltage_samples.append((now, batt_v))
+                self._voltage_samples = [s for s in self._voltage_samples if now - s[0] <= 30.0]
+
+                if batt_v >= 8.35:
+                    self._is_charging = True
+                elif len(self._voltage_samples) >= 4 and motion_state == "STOPPED":
+                    oldest_t, oldest_v = self._voltage_samples[0]
+                    delta_v = batt_v - oldest_v
+                    delta_t = now - oldest_t
+                    if delta_t >= 3.0:
+                        if delta_v >= 0.07:  # +70mV rise or step
+                            self._is_charging = True
+                        elif delta_v < -0.05 and batt_v < 8.20:
+                            self._is_charging = False
+
             self.telemetry = TelemetryData(
                 front_distance_mm=int(kv.get("front_dist", self.telemetry.front_distance_mm)),
                 back_distance_mm=int(kv.get("back_dist", self.telemetry.back_distance_mm)),
                 front_cliff=kv.get("front_cliff", "0") in ("1", "true", "True"),
                 back_cliff=kv.get("back_cliff", "0") in ("1", "true", "True"),
-                motion=kv.get("motion", self.telemetry.motion),
+                motion=motion_state,
                 speed=int(kv.get("speed", self.telemetry.speed)),
-                battery_voltage=float(kv.get("batt_v", self.telemetry.battery_voltage)),
-                battery_pct=int(kv.get("batt_pct", self.telemetry.battery_pct)),
-                timestamp=time.time(),
+                battery_voltage=batt_v,
+                battery_pct=batt_pct,
+                is_charging=self._is_charging,
+                timestamp=now,
             )
 
             if self.on_telemetry:

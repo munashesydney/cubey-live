@@ -1,21 +1,24 @@
-"""
+﻿"""
 Cubeo Robot Face page.
-High-performance 2x super-sampled PIL anti-aliased graphics engine rendering smooth,
-expressive EMO-style robot eyes with Bezier crescent arcs, slanted trapezoid morphs,
-and 3D perspective transformations.
+High-performance super-sampled PIL anti-aliased graphics engine rendering smooth,
+expressive EMO-style robot eyes, sleep breathing animations with floating Zzz snore particles,
+and sleek glowing charging HUD indicators.
 """
 
-import math
 import logging
+import math
+import random
 import time
 import tkinter as tk
+from typing import Callable, Optional
+
 import customtkinter as ctk
 from PIL import Image, ImageDraw, ImageTk
-from typing import Callable, Optional
 
 from src.gui.pages.animations import EyeAnimationEngine
 
 logger = logging.getLogger(__name__)
+
 
 class RobotFacePage(ctk.CTkFrame):
     """Page displaying Cubeo's animated OLED robot face with 2x SSAA anti-aliased Pillow rendering."""
@@ -34,6 +37,7 @@ class RobotFacePage(ctk.CTkFrame):
         self.supersampling = max(1, min(int(supersampling), 3))
         self._frame_interval = 1.0 / self.target_fps
         self._last_frame_at = time.perf_counter()
+
         logger.info(
             "Robot face renderer configured for %d FPS at %dx supersampling",
             self.target_fps,
@@ -47,6 +51,11 @@ class RobotFacePage(ctk.CTkFrame):
         # Instantiate Animation Engine
         self.animation_engine = EyeAnimationEngine(redraw_callback=self._draw_face)
 
+        # Charging & Battery State
+        self.is_charging = False
+        self.battery_pct = 100
+        self.is_sleeping = False
+
         # Image cache reference for Tkinter Garbage Collector
         self._tk_img: Optional[ImageTk.PhotoImage] = None
         self._canvas_image_id: Optional[int] = None
@@ -57,10 +66,9 @@ class RobotFacePage(ctk.CTkFrame):
             bg="#0A0A0F",
             bd=0,
             highlightthickness=0,
-            relief="ridge"
+            relief="ridge",
         )
         self.canvas.pack(fill="both", expand=True)
-
         self.canvas.bind("<Configure>", self._on_resize)
 
         # Developer Console button in bottom-right corner
@@ -74,13 +82,25 @@ class RobotFacePage(ctk.CTkFrame):
             width=65,
             height=26,
             corner_radius=6,
-            command=self._handle_dev_click
+            command=self._handle_dev_click,
         )
         self.dev_btn.place(relx=0.98, rely=0.96, anchor="se")
 
         # Start blink timer and the CPU-bounded animation loop.
         self._schedule_random_blink()
         self._animation_loop()
+
+    def set_charging(self, is_charging: bool, battery_pct: int = 0) -> None:
+        """Update charging state and battery percentage."""
+        self.is_charging = is_charging
+        if battery_pct > 0:
+            self.battery_pct = battery_pct
+        self.animation_engine.set_charging(is_charging, battery_pct)
+
+    def set_sleeping(self, is_sleeping: bool) -> None:
+        """Toggle sleeping mode."""
+        self.is_sleeping = is_sleeping
+        self.animation_engine.set_sleeping(is_sleeping)
 
     def _handle_dev_click(self) -> None:
         """Handler for corner developer button."""
@@ -93,8 +113,10 @@ class RobotFacePage(ctk.CTkFrame):
 
     def _schedule_random_blink(self) -> None:
         """Schedule random eye blink."""
-        import random
-        delay_ms = int(random.uniform(2500, 4800))
+        if self.animation_engine.is_sleeping:
+            delay_ms = int(random.uniform(8000, 15000))
+        else:
+            delay_ms = int(random.uniform(2500, 4800))
         self.after(delay_ms, self._trigger_blink)
 
     def _trigger_blink(self) -> None:
@@ -114,25 +136,26 @@ class RobotFacePage(ctk.CTkFrame):
         self.after(delay_ms, self._animation_loop)
 
     def _draw_face(self) -> None:
-        """Render ultra-fast, smooth PIL image of EMO eyes onto canvas at native resolution."""
+        """Render ultra-fast, smooth PIL image of EMO eyes, sleep Zzz, and charging HUD onto canvas."""
         w = self.canvas.winfo_width()
         h = self.canvas.winfo_height()
 
         if w <= 10 or h <= 10:
             return
 
+        now = time.time()
+
         # Create PIL native-resolution canvas with OLED pitch black background
-        # The full-screen background is opaque; RGB saves 25% of its memory
-        # bandwidth while the smaller eye layers remain RGBA for masking.
         pil_img = Image.new("RGB", (w, h), (10, 10, 15))
+        draw_main = ImageDraw.Draw(pil_img)
 
         # Calculate responsive eye base scale
         base_scale = min(w / 1104.0, h / 631.0)
         base_scale = max(0.5, base_scale)
 
         # Gaze and jitter offsets
-        gaze_x = (self.animation_engine.gaze_x + self.animation_engine.jitter_offset_x)
-        gaze_y = (self.animation_engine.gaze_y + self.animation_engine.jitter_offset_y)
+        gaze_x = self.animation_engine.gaze_x + self.animation_engine.jitter_offset_x
+        gaze_y = self.animation_engine.gaze_y + self.animation_engine.jitter_offset_y
 
         left_cx = (w * 0.35) + gaze_x
         right_cx = (w * 0.65) + gaze_x
@@ -205,6 +228,14 @@ class RobotFacePage(ctk.CTkFrame):
             core_color=core_color,
         )
 
+        # Draw Floating Zzz Snore Particles if sleeping
+        if self.animation_engine.is_sleeping or shape_mode == "crescent_sleep":
+            self._draw_zzz_particles(draw_main, right_cx, cy, base_scale, now)
+
+        # Draw Glowing Charging HUD Battery Indicator if charging
+        if self.is_charging or self.animation_engine.is_charging:
+            self._draw_charging_hud(draw_main, w, h, base_scale, now)
+
         # Update Tkinter canvas image efficiently
         self._tk_img = ImageTk.PhotoImage(pil_img)
         if self._canvas_image_id is None:
@@ -229,11 +260,11 @@ class RobotFacePage(ctk.CTkFrame):
         color: str,
         core_color: str,
     ) -> None:
-        """Render individual EMO eye on isolated canvas with 3x SSAA for ultra-crisp edges, then composite."""
+        """Render individual EMO eye on isolated canvas with SSAA for ultra-crisp edges, then composite."""
         pad = int(max(width, height) * 0.8) + 40
         final_w = int(width + pad)
         final_h = int(height + pad)
-        
+
         ssaa = self.supersampling
         canvas_w = final_w * ssaa
         canvas_h = final_h * ssaa
@@ -249,15 +280,21 @@ class RobotFacePage(ctk.CTkFrame):
         hh = h_s / 2.0
 
         if shape_mode == "crescent_happy":
-            # Image 2 style: Happy curved crescent arc eyes (^ ^)
+            # Happy curved crescent arc eyes (^ ^)
             self._draw_crescent_arc_eye(draw, ecx, ecy, w_s, h_s, is_left_eye, color)
 
+        elif shape_mode == "crescent_sleep":
+            # Sleeping curved crescent arc eyes (⌒ ⌒)
+            self._draw_sleeping_arc_eye(draw, ecx, ecy, w_s, h_s, is_left_eye, color)
+
         elif shape_mode == "trapezoid_slant":
-            # Image 1 style: Slanted angry / determined / hurt trapezoid eyes (\ /)
-            self._draw_trapezoid_slant_eye(draw, ecx, ecy, w_s, h_s, is_left_eye, slant_deg, color, core_color)
+            # Slanted angry / determined / hurt trapezoid eyes (\ /)
+            self._draw_trapezoid_slant_eye(
+                draw, ecx, ecy, w_s, h_s, is_left_eye, slant_deg, color, core_color
+            )
 
         elif shape_mode == "wide_oval":
-            # Image 3 style: Wide excited / surprised oval eyes (O O)
+            # Wide excited / surprised oval eyes (O O)
             draw.ellipse([ecx - hw, ecy - hh, ecx + hw, ecy + hh], fill=color)
             if height > width * 0.3:
                 pr = min(hw, hh) * 0.42
@@ -266,7 +303,9 @@ class RobotFacePage(ctk.CTkFrame):
         else:
             # Base EMO capsule squircle
             radius = min(hw, hh) * 0.65
-            draw.rounded_rectangle([ecx - hw, ecy - hh, ecx + hw, ecy + hh], radius=radius, fill=color)
+            draw.rounded_rectangle(
+                [ecx - hw, ecy - hh, ecx + hw, ecy + hh], radius=radius, fill=color
+            )
 
             # Circular black pupil accent
             if height > width * 0.35:
@@ -276,7 +315,10 @@ class RobotFacePage(ctk.CTkFrame):
         # Top eyelid clipping mask if applicable
         if eyelid_top > 0.01:
             lid_h = h_s * eyelid_top
-            draw.rectangle([ecx - hw - 20*ssaa, ecy - hh - 20*ssaa, ecx + hw + 20*ssaa, ecy - hh + lid_h], fill=(0, 0, 0, 0))
+            draw.rectangle(
+                [ecx - hw - 20 * ssaa, ecy - hh - 20 * ssaa, ecx + hw + 20 * ssaa, ecy - hh + lid_h],
+                fill=(0, 0, 0, 0),
+            )
 
         # Downscale for SSAA crisp anti-aliasing
         eye_img = eye_img.resize((final_w, final_h), resample=Image.Resampling.LANCZOS)
@@ -284,9 +326,11 @@ class RobotFacePage(ctk.CTkFrame):
         ecx_unscaled = final_w / 2.0
         ecy_unscaled = final_h / 2.0
 
-        # Rotate transform for 3D perspective slant AFTER downscaling (Fixes severe lag)
+        # Rotate transform for 3D perspective slant AFTER downscaling
         if abs(slant_deg) > 0.1:
-            eye_img = eye_img.rotate(-slant_deg, resample=Image.Resampling.BICUBIC, center=(ecx_unscaled, ecy_unscaled))
+            eye_img = eye_img.rotate(
+                -slant_deg, resample=Image.Resampling.BICUBIC, center=(ecx_unscaled, ecy_unscaled)
+            )
 
         # Paste rendered transformed eye onto main canvas
         px = int(cx - ecx_unscaled)
@@ -301,11 +345,10 @@ class RobotFacePage(ctk.CTkFrame):
         w: float,
         h: float,
         is_left: bool,
-        color: str
+        color: str,
     ) -> None:
         """Draw smooth, rounded horizontal crescent arc smile eye (^ ^)."""
         hw = w / 2.0
-        # Arch height and line thickness for authentic horizontal EMO crescent eye
         arch_height = max(15.0, h * 0.7)
         thickness = max(14.0, h * 0.42)
 
@@ -314,14 +357,39 @@ class RobotFacePage(ctk.CTkFrame):
         for i in range(steps + 1):
             t = i / steps
             x = cx - hw + (t * w)
-            # Smooth sine inverted smile arc
             y = (cy + arch_height * 0.35) - math.sin(t * math.pi) * arch_height
             points.append((x, y))
 
-        # Draw thick smooth stroke curve
         draw.line(points, fill=color, width=int(thickness), joint="curve")
+        r = thickness / 2.0
+        for px, py in points:
+            draw.ellipse([px - r, py - r, px + r, py + r], fill=color)
 
-        # Add rounded joints at EVERY point to patch Pillow's thick-line rendering cracks
+    def _draw_sleeping_arc_eye(
+        self,
+        draw: ImageDraw.ImageDraw,
+        cx: float,
+        cy: float,
+        w: float,
+        h: float,
+        is_left: bool,
+        color: str,
+    ) -> None:
+        """Draw smooth, cozy inverted crescent sleeping eye (⌒ ⌒)."""
+        hw = w / 2.0
+        arch_height = max(14.0, h * 0.65)
+        thickness = max(14.0, h * 0.38)
+
+        steps = 32
+        points = []
+        for i in range(steps + 1):
+            t = i / steps
+            x = cx - hw + (t * w)
+            # Inverted curve (curves up in center, down at sides)
+            y = (cy + arch_height * 0.4) - math.sin(t * math.pi) * arch_height
+            points.append((x, y))
+
+        draw.line(points, fill=color, width=int(thickness), joint="curve")
         r = thickness / 2.0
         for px, py in points:
             draw.ellipse([px - r, py - r, px + r, py + r], fill=color)
@@ -336,21 +404,18 @@ class RobotFacePage(ctk.CTkFrame):
         is_left: bool,
         slant_deg: float,
         color: str,
-        core_color: str
+        core_color: str,
     ) -> None:
         r"""Draw slanted rounded trapezoid wedge eye (\ /)."""
         hw = w / 2.0
         hh = h / 2.0
 
-        # Asymmetric wedge polygon points
         if is_left:
-            # Top-left higher, top-right lower
             p1 = (cx - hw, cy - hh * 0.75)
             p2 = (cx + hw, cy - hh * 0.15)
             p3 = (cx + hw * 0.85, cy + hh * 0.75)
             p4 = (cx - hw * 0.85, cy + hh * 0.75)
         else:
-            # Top-left lower, top-right higher
             p1 = (cx - hw, cy - hh * 0.15)
             p2 = (cx + hw, cy - hh * 0.75)
             p3 = (cx + hw * 0.85, cy + hh * 0.75)
@@ -358,15 +423,144 @@ class RobotFacePage(ctk.CTkFrame):
 
         draw.polygon([p1, p2, p3, p4], fill=color)
 
-        # Smooth rounded corner joints at vertices
         r_corner = min(w, h) * 0.15
         for px, py in [p1, p2, p3, p4]:
             draw.ellipse([px - r_corner, py - r_corner, px + r_corner, py + r_corner], fill=color)
 
-        # Center pupil accent
         if h > w * 0.4:
             pr = min(hw, hh) * 0.35
             draw.ellipse([cx - pr, cy - pr, cx + pr, cy + pr], fill=core_color)
+
+    def _draw_zzz_particles(
+        self,
+        draw: ImageDraw.ImageDraw,
+        right_cx: float,
+        cy: float,
+        base_scale: float,
+        now: float,
+    ) -> None:
+        """Render lightweight, smooth floating Zzz sleeping snore particles."""
+        for i in range(3):
+            phase = ((now * 0.30) + i * 0.33) % 1.0
+            # Curved gentle drift upward and to the right
+            x = (right_cx + 55 * base_scale) + (phase * 75 * base_scale) + math.sin(phase * 4.0) * (12 * base_scale)
+            y = (cy - 35 * base_scale) - (phase * 105 * base_scale)
+
+            # Bell-curve alpha fade (0 -> 1 -> 0)
+            alpha = math.sin(phase * math.pi)
+            if alpha <= 0.05:
+                continue
+
+            c_val = int(220 * alpha)
+            color = (c_val, c_val, int(255 * alpha))
+            z_size = (14 + i * 6) * base_scale
+
+            self._draw_vector_z(draw, x, y, z_size, color)
+
+    def _draw_vector_z(
+        self,
+        draw: ImageDraw.ImageDraw,
+        x: float,
+        y: float,
+        size: float,
+        color: tuple,
+    ) -> None:
+        """Draw clean vector 'Z' snore glyph."""
+        hs = size / 2.0
+        th = max(2, int(size * 0.18))
+        draw.line([(x - hs, y - hs), (x + hs, y - hs)], fill=color, width=th)
+        draw.line([(x + hs, y - hs), (x - hs, y + hs)], fill=color, width=th)
+        draw.line([(x - hs, y + hs), (x + hs, y + hs)], fill=color, width=th)
+
+    def _draw_charging_hud(
+        self,
+        draw: ImageDraw.ImageDraw,
+        w: int,
+        h: int,
+        base_scale: float,
+        now: float,
+    ) -> None:
+        """Render sleek, animated OLED charging indicator with pulsing lightning bolt."""
+        batt_w = 95 * base_scale
+        batt_h = 28 * base_scale
+        bx = (w * 0.5) - (batt_w * 0.5)
+        by = 22 * base_scale
+        rad = 7 * base_scale
+
+        # 1. Subtle glowing dark background pill
+        draw.rounded_rectangle(
+            [bx, by, bx + batt_w, by + batt_h],
+            radius=rad,
+            fill=(18, 24, 27),
+            outline=(80, 250, 123) if self.is_charging else (69, 71, 90),
+            width=int(max(1, 2 * base_scale)),
+        )
+
+        # 2. Positive battery terminal cap
+        cap_w = 4 * base_scale
+        cap_h = batt_h * 0.45
+        cap_y = by + (batt_h - cap_h) / 2.0
+        draw.rounded_rectangle(
+            [bx + batt_w, cap_y, bx + batt_w + cap_w, cap_y + cap_h],
+            radius=2 * base_scale,
+            fill=(80, 250, 123) if self.is_charging else (69, 71, 90),
+        )
+
+        # 3. Animated charging progress fill
+        pct = max(0, min(100, self.battery_pct if self.battery_pct > 0 else 75))
+        fill_margin = 3 * base_scale
+        max_fill_w = batt_w - (fill_margin * 2)
+        current_fill_w = max_fill_w * (pct / 100.0)
+
+        if current_fill_w > 2:
+            pulse = 0.85 + 0.15 * math.sin(now * 3.5)
+            g_val = int(250 * pulse)
+            fill_color = (0, g_val, int(170 * pulse)) if self.is_charging else (166, 227, 161)
+
+            draw.rounded_rectangle(
+                [bx + fill_margin, by + fill_margin, bx + fill_margin + current_fill_w, by + batt_h - fill_margin],
+                radius=max(2.0, rad - fill_margin),
+                fill=fill_color,
+            )
+
+            # Sweeping energy wave highlight
+            if self.is_charging:
+                wave_phase = (now * 1.3) % 1.0
+                wave_x = bx + fill_margin + (wave_phase * current_fill_w)
+                draw.line(
+                    [(wave_x, by + fill_margin + 2), (wave_x, by + batt_h - fill_margin - 2)],
+                    fill=(255, 255, 255),
+                    width=int(max(1, 3 * base_scale)),
+                )
+
+        # 4. Pulsing Electric ⚡ Lightning Bolt icon
+        bolt_x = bx - 20 * base_scale
+        bolt_y = by + batt_h / 2.0
+        bolt_size = 14 * base_scale
+        bolt_color = (255, 235, 59)
+        self._draw_lightning_bolt(draw, bolt_x, bolt_y, bolt_size, bolt_color, now)
+
+    def _draw_lightning_bolt(
+        self,
+        draw: ImageDraw.ImageDraw,
+        cx: float,
+        cy: float,
+        size: float,
+        color: tuple,
+        now: float,
+    ) -> None:
+        """Draw a vibrant ⚡ lightning bolt glyph."""
+        s = (size / 2.0) * (1.0 + 0.12 * math.sin(now * 4.0))
+
+        pts = [
+            (cx + s * 0.1, cy - s),
+            (cx - s * 0.6, cy + s * 0.1),
+            (cx - s * 0.05, cy + s * 0.1),
+            (cx - s * 0.25, cy + s),
+            (cx + s * 0.7, cy - s * 0.15),
+            (cx + s * 0.05, cy - s * 0.15),
+        ]
+        draw.polygon(pts, fill=color)
 
     def trigger_reaction(self, reaction_type: str) -> None:
         """Trigger an emotional eye reaction using EyeAnimationEngine."""

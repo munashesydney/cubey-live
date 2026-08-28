@@ -9,6 +9,8 @@ from .happy import HappyReaction
 from .low_battery import LowBatteryReaction
 from .surprised import SurprisedReaction
 from .skeptical import SkepticalReaction
+from .charging import ChargingReaction
+from .sleeping import SleepingReaction
 
 __all__ = [
     "BaseReaction",
@@ -18,4 +20,6 @@ __all__ = [
     "LowBatteryReaction",
     "SurprisedReaction",
     "SkepticalReaction",
+    "ChargingReaction",
+    "SleepingReaction",
 ]
