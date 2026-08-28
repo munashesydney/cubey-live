@@ -51,7 +51,7 @@ class AppConfig:
         "AUDIO_ENABLE_NOISE_SUPPRESSION", "true"
     ).strip().lower() not in {"0", "false", "no", "off"}
     gui_fullscreen: bool = os.getenv(
-        "GUI_FULLSCREEN", "false"
+        "GUI_FULLSCREEN", "true"
     ).strip().lower() not in {"0", "false", "no", "off"}
 
     # Full-duplex acoustic echo cancellation on Raspberry Pi. The setup
