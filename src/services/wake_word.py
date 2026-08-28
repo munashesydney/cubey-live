@@ -40,9 +40,9 @@ class WakeWordService:
     def __init__(
         self,
         model_dir: Optional[Union[str, Path]] = None,
-        wake_words: Union[str, List[str]] = "HEY CUBEY, OK CUBEY, HI CUBEY, CUBEY, WAKE UP",
-        threshold: float = 0.40,
-        score: float = 2.5,
+        wake_words: Union[str, List[str]] = "HEY CUBEY, OK CUBEY, HI CUBEY, CUBEY, WAKE UP, HEY Q BEE, Q BEE, HEY CUBE Y, CUBE Y",
+        threshold: float = 0.22,
+        score: float = 2.0,
         num_threads: int = 2,
         on_wake_word: Optional[Callable[[str], None]] = None,
         auto_download: bool = True,
@@ -401,18 +401,24 @@ class WakeWordService:
                         self.spotter.decode_stream(self.stream)
 
                     result = self.spotter.get_result(self.stream)
-                    if result and getattr(result, "keyword", None):
+                    detected_keyword = ""
+                    if isinstance(result, str):
+                        detected_keyword = result.strip()
+                    elif result and hasattr(result, "keyword"):
                         detected_keyword = str(result.keyword).strip()
-                        if detected_keyword:
-                            display_keyword = self._clean_detected_keyword(detected_keyword)
-                            now = time.time()
-                            if now - self._last_detection_time >= self._cooldown_seconds:
-                                self._last_detection_time = now
-                                logger.info("🎯 Wake Word Detected by Sherpa-ONNX: '%s' (%s)", display_keyword, detected_keyword)
-                                self.spotter.reset_stream(self.stream)
-                                self._dispatch_detection(display_keyword)
-                            else:
-                                self.spotter.reset_stream(self.stream)
+                    elif result:
+                        detected_keyword = str(result).strip()
+
+                    if detected_keyword:
+                        display_keyword = self._clean_detected_keyword(detected_keyword)
+                        now = time.time()
+                        if now - self._last_detection_time >= self._cooldown_seconds:
+                            self._last_detection_time = now
+                            logger.info("🎯 Wake Word Spotted: '%s' (raw: '%s')", display_keyword, detected_keyword)
+                            self.spotter.reset_stream(self.stream)
+                            self._dispatch_detection(display_keyword)
+                        else:
+                            self.spotter.reset_stream(self.stream)
 
             except Exception as e:
                 logger.error("Error in WakeWordService processing loop: %s", e, exc_info=True)

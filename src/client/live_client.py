@@ -172,6 +172,7 @@ class GeminiLiveClient:
                 self.recorder.clear_queue()
             else:
                 self.recorder.stop()
+            self.recorder.is_live_active = False
             self.player.stop()
             if fatal_error is not None:
                 self.set_status("Disconnected (Error) 🔴")
@@ -272,6 +273,7 @@ class GeminiLiveClient:
                 self.recorder.start(self._loop)
             else:
                 self.recorder.clear_queue()
+            self.recorder.is_live_active = True
 
             send_task = asyncio.create_task(self._send_audio_loop())
             receive_task = asyncio.create_task(self._receive_responses_loop())
@@ -294,6 +296,7 @@ class GeminiLiveClient:
                         raise error
                 raise ConnectionError("Gemini Live audio task stopped unexpectedly")
             finally:
+                self.recorder.is_live_active = False
                 for task in (send_task, receive_task, stop_task):
                     task.cancel()
                 await asyncio.gather(
@@ -534,4 +537,3 @@ class GeminiLiveClient:
                 self.on_tool_reaction(reaction_type)
             except Exception:
                 logger.exception("Live reaction callback failed")
-

@@ -59,6 +59,7 @@ class AudioRecorder:
         
         self.is_recording = False
         self.is_muted = False
+        self.is_live_active = False
         self.stream: Optional[sd.RawInputStream] = None
         chunk_ms = max(1.0, self.chunk_size / self.sample_rate * 1000.0)
         self.max_queue_chunks = max(2, math.ceil(self.max_queue_ms / chunk_ms))
@@ -239,7 +240,8 @@ class AudioRecorder:
         with self._pending_lock:
             if len(self._pending_packets) >= self.max_queue_chunks:
                 self._pending_packets.popleft()
-                self._dropped_chunks += 1
+                if self.is_live_active:
+                    self._dropped_chunks += 1
             self._pending_packets.append(data)
             if not self._drain_scheduled:
                 self._drain_scheduled = True
@@ -282,7 +284,8 @@ class AudioRecorder:
             self._drain_scheduled = False
         for packet in packets:
             self._enqueue_latest(packet)
-        self._report_dropped_chunks()
+        if self.is_live_active:
+            self._report_dropped_chunks()
 
     def _schedule_level_update(self, level: float) -> None:
         """Coalesce UI meter updates while the asyncio loop is busy."""
@@ -313,15 +316,19 @@ class AudioRecorder:
             try:
                 self.audio_queue.get_nowait()
                 self.audio_queue.task_done()
-                with self._pending_lock:
-                    self._dropped_chunks += 1
+                if self.is_live_active:
+                    with self._pending_lock:
+                        self._dropped_chunks += 1
             except asyncio.QueueEmpty:
                 pass
         self.audio_queue.put_nowait(data)
-        self._report_dropped_chunks()
+        if self.is_live_active:
+            self._report_dropped_chunks()
 
     def _report_dropped_chunks(self) -> None:
         """Rate-limit transport warnings while retaining the exact count."""
+        if not self.is_live_active:
+            return
         should_report = False
         with self._pending_lock:
             dropped = self._dropped_chunks

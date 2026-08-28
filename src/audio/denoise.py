@@ -174,12 +174,20 @@ class AudioDenoiser:
     def _init_backend(self) -> None:
         if PYRNNOISE_AVAILABLE and PyRNNoise is not None:
             try:
-                self._rnnoise_py = PyRNNoise(sample_rate=self.sample_rate)
+                try:
+                    obj = PyRNNoise(sample_rate=self.sample_rate)
+                except TypeError:
+                    obj = PyRNNoise()
+                if np is not None:
+                    # Warm up with dummy chunk to ensure graph initialization succeeds
+                    list(obj.denoise_chunk(np.zeros((1, 320), dtype=np.int16)))
+                self._rnnoise_py = obj
                 self.backend_name = 'pyrnnoise (Neural)'
                 logger.info('Initialized pyrnnoise neural noise suppressor at %d Hz', self.sample_rate)
                 return
             except Exception as e:
-                logger.warning('Failed to initialize pyrnnoise (%s); trying ctypes', e)
+                logger.warning('Failed to initialize pyrnnoise (%s); trying fallback', e)
+                self._rnnoise_py = None
 
         # The raw C API only accepts native 48 kHz / 480-sample frames. The
         # pyrnnoise wrapper above performs its own resampling for our normal
