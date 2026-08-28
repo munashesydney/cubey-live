@@ -104,6 +104,31 @@ class TestCameraService(unittest.TestCase):
         devices = list_camera_devices(max_devices=2)
         self.assertIsInstance(devices, list)
 
+    def test_picamera2_backend_initialization_and_capture(self):
+        """Picamera2 backend should configure and stream BGR frames directly."""
+        mock_picam = MagicMock()
+        fake_bgr = np.zeros((240, 320, 3), dtype=np.uint8)
+        mock_picam.capture_array.return_value = fake_bgr
+
+        with patch("src.camera.service.Picamera2", return_value=mock_picam), \
+             patch("platform.system", return_value="Linux"):
+            service = CameraService(self.config)
+            started = service.start()
+            self.assertTrue(started)
+            time.sleep(0.1)
+
+            self.assertEqual(service.active_backend, "picamera2")
+            mock_picam.create_preview_configuration.assert_called_once()
+            mock_picam.start.assert_called_once()
+
+            pil_frame = service.get_latest_frame_pil()
+            self.assertIsNotNone(pil_frame)
+            self.assertEqual(pil_frame.size, (320, 240))
+
+            service.stop()
+            mock_picam.stop.assert_called_once()
+            mock_picam.close.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

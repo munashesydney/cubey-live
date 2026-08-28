@@ -1,9 +1,11 @@
 """
 High-performance, non-blocking camera video capture service.
-Provides smooth RGB frames for GUI preview and compressed JPEG frames for Gemini Live streaming.
+Supports native Raspberry Pi 5 libcamera/PiSP via Picamera2, standard OpenCV (USB/Windows),
+and synthetic test-pattern fallback.
 """
 
 import logging
+import platform
 import threading
 import time
 from typing import Any, Callable, Optional
@@ -14,6 +16,11 @@ try:
     import cv2
 except ImportError:
     cv2 = None
+
+try:
+    from picamera2 import Picamera2
+except ImportError:
+    Picamera2 = None
 
 from src.config import AppConfig
 
@@ -35,6 +42,8 @@ class CameraService:
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
         self._cap: Optional[Any] = None
+        self._picam: Optional[Any] = None
+        self._active_backend: str = "none"
         self._using_test_pattern = False
         self._ready_event = threading.Event()
 
@@ -68,6 +77,11 @@ class CameraService:
     def is_using_test_pattern(self) -> bool:
         """Return True if fallback test pattern is active due to no camera hardware."""
         return self._using_test_pattern
+
+    @property
+    def active_backend(self) -> str:
+        """Return the active camera backend: 'picamera2', 'opencv', or 'synthetic'."""
+        return self._active_backend
 
     def add_preview_listener(self, callback: Callable[[Image.Image], None]) -> None:
         """Register a callback that receives every newly captured PIL frame."""
@@ -138,15 +152,25 @@ class CameraService:
         self._thread = None
 
         with self._lock:
+            if self._picam is not None:
+                try:
+                    self._picam.stop()
+                    self._picam.close()
+                except Exception as e:
+                    logger.debug("Error releasing Picamera2: %s", e)
+                self._picam = None
+
             if self._cap is not None:
                 try:
                     self._cap.release()
                 except Exception as e:
-                    logger.warning("Error releasing camera: %s", e)
+                    logger.debug("Error releasing OpenCV camera: %s", e)
                 self._cap = None
+
             self._latest_bgr = None
             self._latest_rgb = None
             self._latest_jpeg = None
+            self._active_backend = "none"
             self._using_test_pattern = False
 
         logger.info("Camera service stopped cleanly.")
@@ -213,10 +237,38 @@ class CameraService:
             return pil_img, jpeg_bytes
         return None
 
-    def _open_camera(self) -> bool:
-        """Attempt to open hardware camera with OpenCV."""
+    def _open_picamera2(self) -> bool:
+        """Attempt to open hardware camera using native Raspberry Pi Picamera2 libcamera pipeline."""
+        if Picamera2 is None:
+            return False
+
+        try:
+            logger.info("Attempting to initialize native Picamera2 libcamera/PiSP backend...")
+            picam = Picamera2(camera_num=self.device_index)
+            # Configure hardware preview stream in BGR888 format
+            camera_config = picam.create_preview_configuration(
+                main={"format": "BGR888", "size": (self.width, self.height)},
+                controls={"FrameRate": self.target_fps},
+            )
+            picam.configure(camera_config)
+            picam.start()
+            self._picam = picam
+            self._active_backend = "picamera2"
+            self._using_test_pattern = False
+            logger.info(
+                "✓ Opened native Picamera2 device %d (%dx%d @ %d FPS) with hardware PiSP acceleration.",
+                self.device_index, self.width, self.height, self.target_fps
+            )
+            return True
+        except Exception as e:
+            logger.info("Picamera2 backend not available: %s", e)
+            self._picam = None
+
+        return False
+
+    def _open_opencv(self) -> bool:
+        """Attempt to open camera using standard OpenCV V4L2/DirectShow backend."""
         if cv2 is None:
-            logger.warning("OpenCV not installed; using synthetic test pattern.")
             return False
 
         try:
@@ -228,16 +280,30 @@ class CameraService:
                     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
                     cap.set(cv2.CAP_PROP_FPS, self.target_fps)
                     self._cap = cap
+                    self._active_backend = "opencv"
                     self._using_test_pattern = False
                     logger.info(
-                        "Opened camera index %d (%dx%d @ %d FPS)",
+                        "✓ Opened OpenCV camera index %d (%dx%d @ %d FPS)",
                         self.device_index, self.width, self.height, self.target_fps
                     )
                     return True
                 else:
                     cap.release()
         except Exception as e:
-            logger.debug("Failed opening camera index %d: %s", self.device_index, e)
+            logger.debug("Failed opening OpenCV camera index %d: %s", self.device_index, e)
+
+        return False
+
+    def _open_camera(self) -> bool:
+        """Attempt to open hardware camera: Picamera2 first (Pi 5 / CSI), then OpenCV (USB/Windows)."""
+        # 1. Try native Picamera2 on Linux / Raspberry Pi
+        if platform.system() == "Linux" and Picamera2 is not None:
+            if self._open_picamera2():
+                return True
+
+        # 2. Try OpenCV (USB webcam or Windows DirectShow)
+        if self._open_opencv():
+            return True
 
         return False
 
@@ -246,6 +312,7 @@ class CameraService:
         has_camera = self._open_camera()
         if not has_camera:
             self._using_test_pattern = True
+            self._active_backend = "synthetic"
             logger.info("Using simulated camera test pattern for video streaming.")
 
         self._ready_event.set()
@@ -256,7 +323,17 @@ class CameraService:
             loop_start = time.perf_counter()
             bgr_frame: Optional[np.ndarray] = None
 
-            if has_camera and self._cap is not None:
+            # 1. Read frame from Picamera2 if active
+            if self._picam is not None:
+                try:
+                    bgr_frame = self._picam.capture_array("main")
+                except Exception as e:
+                    logger.warning("Picamera2 frame capture error: %s", e)
+                    has_camera = False
+                    self._using_test_pattern = True
+
+            # 2. Read frame from OpenCV if active
+            elif has_camera and self._cap is not None:
                 try:
                     ret, frame = self._cap.read()
                     if ret and frame is not None:
@@ -270,8 +347,8 @@ class CameraService:
                     has_camera = False
                     self._using_test_pattern = True
 
+            # 3. Fallback synthetic pattern if hardware frame is unavailable
             if bgr_frame is None:
-                # Generate synthetic animated test pattern
                 sim_angle = (sim_angle + 0.05) % (2 * 3.14159)
                 bgr_frame = self._generate_test_pattern_bgr(sim_angle)
 
@@ -308,6 +385,15 @@ class CameraService:
             elapsed = time.perf_counter() - loop_start
             sleep_time = max(0.001, frame_interval - elapsed)
             time.sleep(sleep_time)
+
+        # Cleanup backends upon worker exit
+        if self._picam is not None:
+            try:
+                self._picam.stop()
+                self._picam.close()
+            except Exception:
+                pass
+            self._picam = None
 
         if self._cap is not None:
             try:
