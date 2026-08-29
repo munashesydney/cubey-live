@@ -116,6 +116,7 @@ class AutoNavigator:
         self._stop_event = threading.Event()
         self._teleop_override_until = 0.0
         self._healthy_scan_streak = 0
+        self._unhealthy_sensors_since = 0.0
         self._start_deadline = 0.0
         self._recovery_attempts = 0
         self._replan_after = 0.0
@@ -193,6 +194,7 @@ class AutoNavigator:
             self.current_waypoint_idx = 0
             self.target_frontier = None
             self._healthy_scan_streak = 0
+            self._unhealthy_sensors_since = 0.0
             self._recovery_attempts = 0
             self._last_command = "stop"
             self.last_planning_rejection = ""
@@ -322,7 +324,7 @@ class AutoNavigator:
         return self.lidar_service.scan_health(
             max_age_s=self.max_scan_age_s,
             min_points=self.min_scan_points,
-            min_scan_rate_hz=2.0,
+            min_scan_rate_hz=1.0,
         )
 
     def _navigation_loop(self) -> None:
@@ -337,19 +339,22 @@ class AutoNavigator:
                 healthy, health_reason = self._sensor_health()
                 if not healthy:
                     self._healthy_scan_streak = 0
-                    if self.state in {
-                        NavigationState.NAVIGATING,
-                        NavigationState.BACKTRACKING,
-                        NavigationState.RECOVERY,
-                        NavigationState.TELEOP_OVERRIDE,
-                    }:
-                        self.emergency_stop(health_reason)
-                        break
                     self.wheels_service.stop()
                     self._last_command = "stop"
-                    self.state = NavigationState.WAITING_FOR_SENSORS
-                    if now >= self._start_deadline:
+                    if self.state != NavigationState.WAITING_FOR_SENSORS:
+                        self._unhealthy_sensors_since = now
+                        self.state = NavigationState.WAITING_FOR_SENSORS
+                        logger.warning(
+                            "Sensors transiently unhealthy (%s); holding motion and waiting to recover...",
+                            health_reason,
+                        )
+                    elif now >= self._start_deadline:
                         self._set_fault(health_reason)
+                        break
+                    elif self._unhealthy_sensors_since > 0.0 and (
+                        now - self._unhealthy_sensors_since > self.sensor_start_timeout_s
+                    ):
+                        self._set_fault(f"sensor_timeout:{health_reason}")
                         break
                     self._stop_event.wait(0.05)
                     continue
@@ -357,7 +362,12 @@ class AutoNavigator:
                 self._healthy_scan_streak += 1
                 if self.state == NavigationState.WAITING_FOR_SENSORS:
                     if self._healthy_scan_streak >= 3:
+                        logger.info(
+                            "Sensors recovered healthy stream (streak=%d); resuming navigation.",
+                            self._healthy_scan_streak,
+                        )
                         self.state = NavigationState.PLANNING
+                        self._replan_after = now + 0.1
                     else:
                         self._stop_event.wait(0.05)
                         continue
@@ -745,7 +755,8 @@ class AutoNavigator:
         while self._running and not self._stop_event.is_set() and time.monotonic() < deadline:
             healthy, reason = self._sensor_health()
             if not healthy:
-                self.emergency_stop(reason)
+                self.wheels_service.stop()
+                self._last_command = "stop"
                 return
             collision = self._collision_reason(direction)
             if collision:

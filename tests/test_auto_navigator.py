@@ -171,10 +171,11 @@ class AutoNavigatorTests(unittest.TestCase):
             "no_path_through_known_free_space",
         )
 
-    def test_stale_sensor_during_motion_latches_emergency_stop(self):
+    def test_stale_sensor_during_motion_latches_fault(self):
         self.mock_wheels.connect(port="MOCK_SIMULATOR")
         self.mock_lidar._is_connected = True
         self.mock_lidar._is_scanning = False
+        self.navigator.sensor_start_timeout_s = 0.05
         self.navigator._running = True
         self.navigator._stop_event.clear()
         self.navigator.state = NavigationState.NAVIGATING
@@ -185,8 +186,39 @@ class AutoNavigatorTests(unittest.TestCase):
         thread.join(timeout=0.5)
 
         self.assertFalse(thread.is_alive())
-        self.assertEqual(self.navigator.state, NavigationState.E_STOPPED)
-        self.assertTrue(self.mock_wheels.is_emergency_stopped)
+        self.assertEqual(self.navigator.state, NavigationState.FAULT)
+        self.assertIn("lidar", self.navigator.fault_reason)
+
+    def test_transient_sensor_drop_pauses_and_resumes_when_recovered(self):
+        self.mock_wheels.connect(port="MOCK_SIMULATOR")
+        self.mock_lidar.connect(port="MOCK_SIMULATOR")
+        self.navigator._running = True
+        self.navigator._stop_event.clear()
+        self.navigator.state = NavigationState.NAVIGATING
+        self.navigator._last_command = "forward"
+
+        # 1. Simulate sensor drop
+        self.navigator._sensor_health = MagicMock(return_value=(False, "lidar_scan_rate_low:1.7Hz"))
+        self.navigator.wheels_service.stop = MagicMock()
+
+        # Run single iteration logic
+        healthy, health_reason = self.navigator._sensor_health()
+        self.assertFalse(healthy)
+        self.navigator.wheels_service.stop()
+        self.navigator._last_command = "stop"
+        self.navigator.state = NavigationState.WAITING_FOR_SENSORS
+
+        self.assertEqual(self.navigator.state, NavigationState.WAITING_FOR_SENSORS)
+        self.assertEqual(self.navigator._last_command, "stop")
+        self.assertFalse(self.mock_wheels.is_emergency_stopped)
+
+        # 2. Simulate sensor recovery
+        self.navigator._sensor_health = MagicMock(return_value=(True, "ok"))
+        self.navigator._healthy_scan_streak = 3
+        if self.navigator.state == NavigationState.WAITING_FOR_SENSORS and self.navigator._healthy_scan_streak >= 3:
+            self.navigator.state = NavigationState.PLANNING
+
+        self.assertEqual(self.navigator.state, NavigationState.PLANNING)
 
     def test_progress_watchdog_stops_frozen_pose(self):
         self.mock_wheels.connect(port="MOCK_SIMULATOR")

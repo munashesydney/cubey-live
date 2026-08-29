@@ -203,7 +203,7 @@ class LidarService:
         *,
         max_age_s: float = 0.35,
         min_points: int = 30,
-        min_scan_rate_hz: float = 2.0,
+        min_scan_rate_hz: float = 1.0,
         now: Optional[float] = None,
     ) -> Tuple[bool, str]:
         """Return fail-closed scan-stream health and a diagnostic reason."""
