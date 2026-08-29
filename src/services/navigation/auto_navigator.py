@@ -110,6 +110,8 @@ class AutoNavigator:
         self._last_progress_pose: Optional[Tuple[float, float, float]] = None
         self._last_progress_time = 0.0
         self._heading_turn_started = 0.0
+        self.last_safety_rejection = ""
+        self.last_safety_rejection_at = 0.0
 
         self.on_exploration_complete: Optional[Callable[[], None]] = None
 
@@ -133,6 +135,8 @@ class AutoNavigator:
             "sensor_healthy": healthy,
             "sensor_health_reason": health_reason,
             "recovery_attempts": self._recovery_attempts,
+            "last_safety_rejection": self.last_safety_rejection,
+            "last_safety_rejection_at": self.last_safety_rejection_at,
         }
 
     # ------------------------------------------------------------------
@@ -246,17 +250,25 @@ class AutoNavigator:
         if self.wheels_service.is_emergency_stopped:
             return False, self.wheels_service.emergency_stop_reason
         if not self.wheels_service.is_connected:
+            self._record_manual_rejection(command, "wheels_disconnected")
             return False, "wheels_disconnected"
         lidar_healthy, lidar_reason = self._lidar_health()
         if not lidar_healthy:
+            self._record_manual_rejection(command, lidar_reason)
             return False, lidar_reason
         collision = self._collision_reason(command)
         if collision:
             # Reject this direction and cancel any prior continuous command,
             # while leaving the operator able to steer away from the obstacle.
             self.wheels_service.stop()
+            self._record_manual_rejection(command, collision)
             return False, collision
         return True, "ok"
+
+    def _record_manual_rejection(self, command: str, reason: str) -> None:
+        self.last_safety_rejection = f"{command}:{reason}"
+        self.last_safety_rejection_at = time.time()
+        logger.warning("Manual motion rejected: command=%s reason=%s", command, reason)
 
     def _set_fault(self, reason: str) -> None:
         with self._lock:

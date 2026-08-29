@@ -133,6 +133,9 @@
         const msg = JSON.parse(event.data);
         if (msg.type === "map_update") {
           handleMapUpdate(msg);
+        } else if (msg.type === "command_rejected") {
+          lblMappingState.textContent = `Drive blocked: ${msg.reason || "safety gate"}`;
+          console.warn("Drive command rejected:", msg.reason);
         }
       } catch (err) {
         console.error("Error parsing WebSocket message:", err);

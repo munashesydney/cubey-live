@@ -93,6 +93,7 @@ class WheelsService:
         self.on_connection_change = on_connection_change
 
         self._serial: Optional[Any] = None
+        self._connection_lock = threading.RLock()
         self._write_lock = threading.Lock()
         self._is_connected: bool = False
         self._is_mock: bool = False
@@ -215,6 +216,21 @@ class WheelsService:
         return True, "ok"
 
     def connect(self, port: Optional[str] = None, baudrate: Optional[int] = None) -> bool:
+        """Serialize connection attempts and preserve an already healthy link."""
+        with self._connection_lock:
+            requested_port = port or self.port
+            requested_baudrate = baudrate or self.baudrate
+            same_endpoint = (
+                requested_port == self.port and requested_baudrate == self.baudrate
+            )
+            healthy, _ = self.telemetry_health(max_age_s=2.0)
+            if same_endpoint and healthy:
+                return True
+            return self._connect_locked(port=port, baudrate=baudrate)
+
+    def _connect_locked(
+        self, port: Optional[str] = None, baudrate: Optional[int] = None
+    ) -> bool:
         """
         Open serial connection to ESP32 on specified port and baudrate.
         If port fails or is not explicitly set, probes available candidate ports.
@@ -681,7 +697,7 @@ _SHARED_WHEELS_SERVICE: Optional[WheelsService] = None
 
 
 def get_wheels_service() -> WheelsService:
-    """Get or create the global shared WheelsService singleton."""
+    """Get or create the shared service without performing connection I/O."""
     global _SHARED_WHEELS_SERVICE
     if _SHARED_WHEELS_SERVICE is None:
         from src.config import config
@@ -690,8 +706,4 @@ def get_wheels_service() -> WheelsService:
             default_port=config.wheels_port or None,
             default_baudrate=config.wheels_baudrate,
         )
-        try:
-            _SHARED_WHEELS_SERVICE.connect()
-        except Exception as e:
-            logger.warning("Failed to auto-connect shared WheelsService: %s", e)
     return _SHARED_WHEELS_SERVICE

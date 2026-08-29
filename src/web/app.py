@@ -420,6 +420,13 @@ async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(
                     wheels_svc.connect()
                 safe, safety_reason = mapping_svc.navigator.authorize_manual_motion(action)
                 if not safe:
+                    logger.warning(
+                        "WS Drive CMD rejected: %s reason=%s (wheels_connected=%s on %s)",
+                        action,
+                        safety_reason,
+                        wheels_svc.is_connected,
+                        wheels_svc.port,
+                    )
                     await websocket.send_json({"type": "command_rejected", "reason": safety_reason})
                     continue
                 wheels_svc.set_speed(speed)
