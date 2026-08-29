@@ -93,6 +93,29 @@ class MappingServiceTests(unittest.TestCase):
         self.assertEqual(hits, [])
         self.assertEqual(int(np.count_nonzero(self.mapping_svc._grid == 100)), 0)
 
+    def test_no_return_ray_marks_a_short_open_corridor_free(self):
+        hits = self.mapping_svc._raycast_update(
+            0.0, 0.0, [], clear_ray_angles_deg=[0.0]
+        )
+
+        gx_near, gy_near = self.mapping_svc.world_to_grid(0.0, 0.5)
+        gx_far, gy_far = self.mapping_svc.world_to_grid(0.0, 1.0)
+        self.assertEqual(hits, [])
+        self.assertEqual(self.mapping_svc._grid[gy_near, gx_near], 0)
+        self.assertEqual(self.mapping_svc._grid[gy_far, gx_far], -1)
+        self.assertEqual(int(np.count_nonzero(self.mapping_svc._grid == 100)), 0)
+
+    def test_no_return_ray_does_not_erase_an_observed_wall(self):
+        gx_wall, gy_wall = self.mapping_svc.world_to_grid(0.0, 0.5)
+        self.mapping_svc._log_odds[gy_wall, gx_wall] = 2.0
+        self.mapping_svc._grid[gy_wall, gx_wall] = 100
+
+        self.mapping_svc._raycast_update(
+            0.0, 0.0, [], clear_ray_angles_deg=[0.0]
+        )
+
+        self.assertEqual(self.mapping_svc._grid[gy_wall, gx_wall], 100)
+
     def test_compression_and_persistence(self):
         compressed = self.mapping_svc.get_compressed_grid()
         self.assertIsInstance(compressed, bytes)

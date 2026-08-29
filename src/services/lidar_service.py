@@ -78,10 +78,16 @@ class LidarScanData:
     min_back_dist_mm: int = 99999     # Rear arc (150° to 210°)
     closest_point: Optional[LidarPoint] = None
     health_status: str = "OK"
+    # Valid protocol samples with a zero distance.  The C1 emits these when no
+    # obstacle return was received at that angle.  They are kept separately so
+    # mapping can clear a short, conservative ray without presenting a fake
+    # obstacle point to collision monitoring or the UI.
+    clear_ray_angles_deg: List[float] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "point_count": self.point_count,
+            "clear_ray_count": len(self.clear_ray_angles_deg),
             "scan_rate_hz": self.scan_rate_hz,
             "sample_rate_hz": self.sample_rate_hz,
             "min_front_dist_mm": self.min_front_dist_mm,
@@ -522,6 +528,7 @@ class LidarService:
         scan_rate_hz: float,
         sample_rate_hz: float,
         min_valid_distance_mm: int = 30,
+        clear_ray_angles_deg: Optional[List[float]] = None,
     ) -> LidarScanData:
         """
         Calculates cardinal 4-sector proximity distances and locates the closest obstacle.
@@ -569,12 +576,17 @@ class LidarService:
                 min_overall = dist
                 closest_pt = pt
 
+        clear_rays = list(clear_ray_angles_deg or [])
         return LidarScanData(
             points=points,
+            clear_ray_angles_deg=clear_rays,
             timestamp=time.time(),
             scan_rate_hz=round(scan_rate_hz, 1),
             sample_rate_hz=round(sample_rate_hz, 0),
-            point_count=len(points),
+            # Stream health is based on valid samples, not only reflected
+            # hits.  An open room can legitimately contain many no-return
+            # samples and must not look like a dead LiDAR stream.
+            point_count=len(points) + len(clear_rays),
             min_front_dist_mm=min_front if min_front < 99999 else 0,
             min_left_dist_mm=min_left if min_left < 99999 else 0,
             min_right_dist_mm=min_right if min_right < 99999 else 0,
@@ -598,6 +610,7 @@ class LidarService:
           byte 4: [Dist_q2_high (8-bit)]
         """
         accumulated_points: List[LidarPoint] = []
+        accumulated_clear_ray_angles: List[float] = []
         last_scan_time = time.time()
         sample_count_window = 0
         window_start_time = time.time()
@@ -637,7 +650,9 @@ class LidarService:
                 sample_count_window += 1
 
                 # Start of a new 360-degree rotation (sync_bit == 1)
-                if sync_bit == 1 and len(accumulated_points) > 15:
+                if sync_bit == 1 and (
+                    len(accumulated_points) + len(accumulated_clear_ray_angles) > 15
+                ):
                     now = time.time()
                     dt = now - last_scan_time
                     if dt > 0.01:
@@ -656,6 +671,7 @@ class LidarService:
                         scan_rate_hz,
                         sample_rate_hz,
                         self.min_valid_distance_mm,
+                        accumulated_clear_ray_angles,
                     )
                     self.latest_scan = scan_data
 
@@ -666,6 +682,7 @@ class LidarService:
                             logger.warning("Error in on_scan_data callback: %s", e)
 
                     accumulated_points = []
+                    accumulated_clear_ray_angles = []
 
                 if distance_mm > 0:
                     accumulated_points.append(
@@ -674,6 +691,10 @@ class LidarService:
                             distance_mm=distance_mm,
                             quality=quality,
                         )
+                    )
+                else:
+                    accumulated_clear_ray_angles.append(
+                        round((angle_deg + self.mount_yaw_deg) % 360.0, 2)
                     )
 
             except Exception as e:

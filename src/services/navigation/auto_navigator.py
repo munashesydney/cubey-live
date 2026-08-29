@@ -120,6 +120,7 @@ class AutoNavigator:
         self._heading_turn_started = 0.0
         self.last_safety_rejection = ""
         self.last_safety_rejection_at = 0.0
+        self.last_planning_rejection = ""
 
         self.on_exploration_complete: Optional[Callable[[], None]] = None
 
@@ -145,6 +146,7 @@ class AutoNavigator:
             "recovery_attempts": self._recovery_attempts,
             "last_safety_rejection": self.last_safety_rejection,
             "last_safety_rejection_at": self.last_safety_rejection_at,
+            "last_planning_rejection": self.last_planning_rejection,
             "self_masked_lidar_points": sum(
                 1
                 for point in self.lidar_service.latest_scan.points
@@ -185,6 +187,7 @@ class AutoNavigator:
             self._healthy_scan_streak = 0
             self._recovery_attempts = 0
             self._last_command = "stop"
+            self.last_planning_rejection = ""
             self._last_progress_pose = None
             self._last_progress_time = time.monotonic()
             self._start_deadline = time.monotonic() + self.sensor_start_timeout_s
@@ -531,12 +534,11 @@ class AutoNavigator:
                     logger.exception("Exploration completion callback failed")
             return
 
-        attempted_targets: List[Tuple[float, float]] = []
+        planning_rejections: List[str] = []
         for candidate in frontiers[:12]:
             target = candidate.centroid_world
             if self._target_is_blocked(target):
                 continue
-            attempted_targets.append(target)
             path = self.path_planner.plan_path(
                 grid=grid,
                 resolution_m=self.mapping_service.resolution_m,
@@ -546,12 +548,16 @@ class AutoNavigator:
                 goal_world=target,
             )
             if not path or len(path) < 2:
+                planning_rejections.append(
+                    self.path_planner.last_failure_reason or "empty_path"
+                )
                 continue
             total_dist = sum(
                 math.hypot(path[i + 1][0] - path[i][0], path[i + 1][1] - path[i][1])
                 for i in range(len(path) - 1)
             )
             if total_dist < 0.25:
+                planning_rejections.append("frontier_route_too_short")
                 continue
 
             self.current_path = path
@@ -561,14 +567,30 @@ class AutoNavigator:
             self._last_progress_pose = (pose.x_m, pose.y_m, pose.theta_deg)
             self._last_progress_time = time.monotonic()
             self._heading_turn_started = 0.0
+            self.last_planning_rejection = ""
             logger.info("Planned %d-waypoint route to %s", len(path), target)
             return
 
-        for target in attempted_targets:
-            self._block_target(target)
+        if planning_rejections:
+            # Expose the real planner decision in status/logs instead of only
+            # reporting the eventual bounded-recovery wrapper.
+            self.last_planning_rejection = max(
+                set(planning_rejections), key=planning_rejections.count
+            )
+            logger.warning(
+                "Rejected %d frontier routes: primary_reason=%s all_reasons=%s",
+                len(planning_rejections),
+                self.last_planning_rejection,
+                sorted(set(planning_rejections)),
+            )
+        else:
+            self.last_planning_rejection = "all_frontier_targets_temporarily_blocked"
 
         if self._recovery_attempts >= self.max_recovery_attempts:
-            self._set_fault("no_reachable_frontier_after_bounded_recovery")
+            self._set_fault(
+                "no_reachable_frontier_after_bounded_recovery:"
+                f"{self.last_planning_rejection}"
+            )
             return
 
         self._recovery_attempts += 1

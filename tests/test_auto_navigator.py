@@ -151,6 +151,26 @@ class AutoNavigatorTests(unittest.TestCase):
         self.assertEqual(self.navigator.state, NavigationState.FAULT)
         self.assertIn("no_reachable_frontier", self.navigator.fault_reason)
 
+    def test_planning_rejection_does_not_blacklist_frontier_before_rescan(self):
+        target = (0.8, 0.8)
+        self.navigator._running = True
+        self.navigator.frontier_detector.find_frontiers = MagicMock(
+            return_value=[SimpleNamespace(centroid_world=target)]
+        )
+        self.navigator.path_planner.plan_path = MagicMock(return_value=None)
+        self.navigator.path_planner.last_failure_reason = (
+            "no_path_through_known_free_space"
+        )
+        self.navigator._bounded_rotation = MagicMock()
+
+        self.navigator._plan_next_frontier()
+
+        self.assertFalse(self.navigator._target_is_blocked(target))
+        self.assertEqual(
+            self.navigator.last_planning_rejection,
+            "no_path_through_known_free_space",
+        )
+
     def test_stale_sensor_during_motion_latches_emergency_stop(self):
         self.mock_wheels.connect(port="MOCK_SIMULATOR")
         self.mock_lidar._is_connected = True

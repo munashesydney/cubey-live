@@ -21,6 +21,7 @@ class PathPlanner:
         safety_margin_m: float = 0.05,      # 5cm additional clearance buffer
     ):
         self.total_inflation_m = robot_radius_m + safety_margin_m
+        self.last_failure_reason = ""
 
     def inflate_obstacles(self, grid: np.ndarray, resolution_m: float) -> np.ndarray:
         """
@@ -28,6 +29,7 @@ class PathPlanner:
         the robot's inflation safety radius.
         """
         inflation_cells = max(1, int(math.ceil(self.total_inflation_m / resolution_m)))
+        inflation_radius_sq_m = self.total_inflation_m ** 2
         height, width = grid.shape
         is_occupied = (grid == 100)
 
@@ -44,10 +46,16 @@ class PathPlanner:
             x_min = max(0, x - inflation_cells)
             x_max = min(width, x + inflation_cells + 1)
 
-            # Circular mask check
+            # Keep the bounding box cell-aligned, but test the actual metric
+            # radius.  Comparing against ``ceil(radius / resolution)`` here
+            # used to turn Cubey's 26cm clearance into 30cm on a 5cm grid.
+            # Two walls 60cm apart were therefore inflated into each other and
+            # a physically traversable opening disappeared from the planner.
             for cy in range(y_min, y_max):
                 for cx in range(x_min, x_max):
-                    if (cx - x) ** 2 + (cy - y) ** 2 <= inflation_cells ** 2:
+                    dx_m = (cx - x) * resolution_m
+                    dy_m = (cy - y) * resolution_m
+                    if dx_m ** 2 + dy_m ** 2 <= inflation_radius_sq_m:
                         inflated[cy, cx] = True
 
         return inflated
@@ -65,6 +73,7 @@ class PathPlanner:
         Compute smoothed collision-free world waypoints from start_world to goal_world.
         Returns list of (x, y) coordinates in meters, or None if unreachable.
         """
+        self.last_failure_reason = ""
         height, width = grid.shape
 
         # Convert world coordinates to grid indices
@@ -88,13 +97,18 @@ class PathPlanner:
 
         # A path from an unknown/occupied start is not safe to execute.  Do not
         # silently clamp or tunnel out of a bad localization estimate.
-        if blocked_mask[start_gy, start_gx]:
+        if grid[start_gy, start_gx] != 0:
+            self.last_failure_reason = "start_not_known_free"
+            return None
+        if inflated_mask[start_gy, start_gx]:
+            self.last_failure_reason = "start_inside_obstacle_inflation"
             return None
 
         # If goal is inside an inflated obstacle, find closest free cell
         if blocked_mask[goal_gy, goal_gx]:
             closest_free = self._find_nearest_free_cell(blocked_mask, goal_gx, goal_gy)
             if not closest_free:
+                self.last_failure_reason = "goal_has_no_nearby_traversable_cell"
                 return None
             goal_gx, goal_gy = closest_free
 
@@ -156,6 +170,7 @@ class PathPlanner:
                     heapq.heappush(open_set, (f_score, tentative_g, neighbor))
 
         if not found:
+            self.last_failure_reason = "no_path_through_known_free_space"
             return None
 
         # Reconstruct path

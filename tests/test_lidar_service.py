@@ -97,6 +97,18 @@ class LidarServiceTests(unittest.TestCase):
 
         self.assertEqual(metrics.min_front_dist_mm, 100)
 
+    def test_no_return_samples_count_as_live_scan_samples(self):
+        metrics = LidarService._compute_scan_metrics(
+            [LidarPoint(angle_deg=90.0, distance_mm=1000.0, quality=60)],
+            scan_rate_hz=10.0,
+            sample_rate_hz=1000.0,
+            clear_ray_angles_deg=[0.0, 1.0, 2.0],
+        )
+
+        self.assertEqual(metrics.point_count, 4)
+        self.assertEqual(metrics.clear_ray_angles_deg, [0.0, 1.0, 2.0])
+        self.assertEqual(metrics.to_dict()["clear_ray_count"], 3)
+
     def test_scan_health_fails_closed_for_stale_or_empty_data(self):
         service = LidarService(default_port="MOCK_SIMULATOR")
         service._is_connected = True

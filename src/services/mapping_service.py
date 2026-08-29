@@ -84,6 +84,7 @@ class MappingService:
         autonomy_enabled: Optional[bool] = None,
         robot_length_m: Optional[float] = None,
         robot_width_m: Optional[float] = None,
+        no_return_clear_range_m: float = 0.75,
     ):
         from src.config import config
 
@@ -107,6 +108,14 @@ class MappingService:
             if robot_width_m is not None
             else config.robot_width_m
         ) / 2.0
+        # A zero-distance C1 sample means no reflected obstacle return.  Clear
+        # only a short local corridor so frontier exploration can advance into
+        # an open doorway while every movement remains protected by the fresh
+        # live-scan collision gate.  This is intentionally far below the C1's
+        # advertised maximum range.
+        self.no_return_clear_range_m = max(
+            0.40, min(1.50, float(no_return_clear_range_m))
+        )
 
         # Log-odds probability grid (-5.0 = free, +5.0 = occupied, 0.0 = unknown)
         self._log_odds = np.zeros((self.height, self.width), dtype=np.float32)
@@ -318,7 +327,13 @@ class MappingService:
     # Raycasting (Bresenham's Line Algorithm)
     # ------------------------------------------------------------------
 
-    def _raycast_update(self, robot_x: float, robot_y: float, scan_points: List[LidarPoint]) -> List[Tuple[float, float]]:
+    def _raycast_update(
+        self,
+        robot_x: float,
+        robot_y: float,
+        scan_points: List[LidarPoint],
+        clear_ray_angles_deg: Optional[List[float]] = None,
+    ) -> List[Tuple[float, float]]:
         """
         Clears free cells along laser rays and marks solid obstacle endpoints in the grid.
         Returns list of global world (x, y) hit points.
@@ -386,6 +401,45 @@ class MappingService:
                     MAX_LOG_ODDS, self._log_odds[gy1, gx1] + L_OCC
                 )
 
+        # Preserve no-return samples as conservative free-space evidence. The
+        # old parser discarded them completely, leaving open doorways black
+        # (unknown); the frontier planner then had nowhere legal to drive even
+        # though the live scan correctly showed a clear direction.
+        for angle_deg in clear_ray_angles_deg or []:
+            angle_rad = math.radians(angle_deg)
+            lx = self.no_return_clear_range_m * math.sin(angle_rad)
+            ly = self.no_return_clear_range_m * math.cos(angle_rad)
+            wx = robot_x + lx * cos_p + ly * sin_p
+            wy = robot_y - lx * sin_p + ly * cos_p
+            gx1, gy1 = self.world_to_grid(wx, wy)
+
+            dx = abs(gx1 - gx0)
+            dy = abs(gy1 - gy0)
+            sx = 1 if gx0 < gx1 else -1
+            sy = 1 if gy0 < gy1 else -1
+            err = dx - dy
+            curr_x, curr_y = gx0, gy0
+
+            while True:
+                if not self.is_inside_grid(curr_x, curr_y):
+                    break
+                # A no-return ray may confirm unknown/free cells, but it must
+                # never erase a wall already observed by a reflected hit.
+                if (curr_x, curr_y) != (gx0, gy0) and self._log_odds[curr_y, curr_x] > 0.6:
+                    break
+                self._log_odds[curr_y, curr_x] = max(
+                    MIN_LOG_ODDS, self._log_odds[curr_y, curr_x] + L_FREE
+                )
+                if curr_x == gx1 and curr_y == gy1:
+                    break
+                e2 = 2 * err
+                if e2 > -dy:
+                    err -= dy
+                    curr_x += sx
+                if e2 < dx:
+                    err += dx
+                    curr_y += sy
+
         # Update display grid matrix from log-odds values
         # -1 = unknown (|log_odds| < 0.25)
         # 0 = free (log_odds < -0.25)
@@ -413,7 +467,9 @@ class MappingService:
             except Exception:
                 pass
 
-        if not self.is_mapping or not scan_data.points:
+        if not self.is_mapping or not (
+            scan_data.points or scan_data.clear_ray_angles_deg
+        ):
             return
 
         with self._lock:
@@ -430,7 +486,12 @@ class MappingService:
                     self.trajectory.pop(0)
 
             # 2. Raycast laser rays into occupancy grid
-            hits = self._raycast_update(new_pose.x_m, new_pose.y_m, scan_data.points)
+            hits = self._raycast_update(
+                new_pose.x_m,
+                new_pose.y_m,
+                scan_data.points,
+                scan_data.clear_ray_angles_deg,
+            )
             self._latest_hits = hits
 
             explored_cells = int(np.count_nonzero(self._grid != -1))

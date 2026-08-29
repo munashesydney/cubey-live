@@ -103,6 +103,39 @@ class PathPlannerTests(unittest.TestCase):
         )
 
         self.assertIsNone(path)
+        self.assertEqual(self.planner.last_failure_reason, "start_not_known_free")
+
+    def test_inflation_uses_metric_radius_without_cell_rounding_overreach(self):
+        grid = np.zeros((25, 25), dtype=np.int8)
+        grid[12, 12] = 100
+        planner = PathPlanner(robot_radius_m=0.18, safety_margin_m=0.08)
+
+        inflated = planner.inflate_obstacles(grid, resolution_m=0.05)
+
+        self.assertTrue(inflated[12, 17])   # 25cm from obstacle
+        self.assertFalse(inflated[12, 18])  # 30cm exceeds the true 26cm radius
+
+    def test_plans_through_open_sixty_centimeter_corridor(self):
+        # A 36cm robot with an 8cm margin on either side requires 52cm.
+        # The old cell-rounded inflation incorrectly closed this 60cm corridor.
+        grid = np.full((40, 40), -1, dtype=np.int8)
+        grid[5:31, 15:26] = 0
+        grid[8:31, 14] = 100
+        grid[8:31, 26] = 100
+        grid[30, 14:27] = 100
+        planner = PathPlanner(robot_radius_m=0.18, safety_margin_m=0.08)
+
+        path = planner.plan_path(
+            grid=grid,
+            resolution_m=0.05,
+            origin_x_m=0.0,
+            origin_y_m=0.0,
+            start_world=(1.025, 1.225),  # grid cell (20, 24)
+            goal_world=(1.025, 0.425),   # grid cell (20, 8), toward opening
+        )
+
+        self.assertIsNotNone(path, planner.last_failure_reason)
+        self.assertGreaterEqual(len(path), 2)
 
 
 if __name__ == "__main__":
