@@ -193,6 +193,7 @@ class AutoNavigator:
             self.current_path.clear()
             self.current_waypoint_idx = 0
             self.target_frontier = None
+            self.is_backtracking = False
             self._healthy_scan_streak = 0
             self._unhealthy_sensors_since = 0.0
             self._recovery_attempts = 0
@@ -217,6 +218,7 @@ class AutoNavigator:
             self._stop_event.set()
             self.current_path.clear()
             self.target_frontier = None
+            self.is_backtracking = False
             self._last_command = "stop"
             self.state = (
                 NavigationState.E_STOPPED
@@ -241,6 +243,7 @@ class AutoNavigator:
             self._stop_event.set()
             self.current_path.clear()
             self.target_frontier = None
+            self.is_backtracking = False
             self._last_command = "stop"
         self.wheels_service.emergency_stop(reason)
         logger.error("Autonomous emergency stop latched: %s", reason)
@@ -324,7 +327,9 @@ class AutoNavigator:
         return self.lidar_service.scan_health(
             max_age_s=self.max_scan_age_s,
             min_points=self.min_scan_points,
-            min_scan_rate_hz=1.0,
+            # With a 0.35s freshness window, accepting a 1Hz stream was
+            # internally inconsistent: it was stale for most of every sweep.
+            min_scan_rate_hz=3.0,
         )
 
     def _navigation_loop(self) -> None:
@@ -342,19 +347,25 @@ class AutoNavigator:
                     self.wheels_service.stop()
                     self._last_command = "stop"
                     if self.state != NavigationState.WAITING_FOR_SENSORS:
+                        self.current_path.clear()
+                        self.current_waypoint_idx = 0
+                        self.target_frontier = None
+                        self.is_backtracking = False
                         self._unhealthy_sensors_since = now
                         self.state = NavigationState.WAITING_FOR_SENSORS
                         logger.warning(
                             "Sensors transiently unhealthy (%s); holding motion and waiting to recover...",
                             health_reason,
                         )
+                    elif self._unhealthy_sensors_since > 0.0:
+                        if (
+                            now - self._unhealthy_sensors_since
+                            > self.sensor_start_timeout_s
+                        ):
+                            self._set_fault(f"sensor_timeout:{health_reason}")
+                            break
                     elif now >= self._start_deadline:
                         self._set_fault(health_reason)
-                        break
-                    elif self._unhealthy_sensors_since > 0.0 and (
-                        now - self._unhealthy_sensors_since > self.sensor_start_timeout_s
-                    ):
-                        self._set_fault(f"sensor_timeout:{health_reason}")
                         break
                     self._stop_event.wait(0.05)
                     continue
@@ -367,6 +378,7 @@ class AutoNavigator:
                             self._healthy_scan_streak,
                         )
                         self.state = NavigationState.PLANNING
+                        self._unhealthy_sensors_since = 0.0
                         self._replan_after = now + 0.1
                     else:
                         self._stop_event.wait(0.05)
@@ -498,6 +510,7 @@ class AutoNavigator:
     def _handle_obstacle(self, reason: str) -> None:
         self.wheels_service.stop()
         self._last_command = "stop"
+        was_backtracking = self.is_backtracking
         if self.target_frontier:
             self._block_target(self.target_frontier, duration_s=30.0)
         self.current_path.clear()
@@ -509,9 +522,14 @@ class AutoNavigator:
         self._heading_turn_started = 0.0
         logger.warning("Collision monitor stopped autonomous motion: %s", reason)
         if self._recovery_attempts > self.max_recovery_attempts:
-            if self._attempt_backtrack(f"recovery_limit_exceeded:{reason}"):
+            if not was_backtracking and self._attempt_backtrack(
+                f"recovery_limit_exceeded:{reason}"
+            ):
                 return
-            self._set_fault(f"recovery_limit_exceeded:{reason}")
+            fault_prefix = (
+                "backtrack_collision" if was_backtracking else "recovery_limit_exceeded"
+            )
+            self._set_fault(f"{fault_prefix}:{reason}")
 
     # ------------------------------------------------------------------
     # Frontier selection and bounded recovery
@@ -551,18 +569,24 @@ class AutoNavigator:
         min_retreat_m = max(0.20, self.backtrack_distance_m * 0.4)
         max_retreat_m = max(0.80, self.backtrack_distance_m * 2.5)
 
-        # Search recent trajectory points backwards
+        safe_candidates: List[
+            Tuple[float, Tuple[float, float], List[Tuple[float, float]]]
+        ] = []
+
+        # Search recent trajectory points backwards. Prefer a validated pose
+        # near the requested retreat distance instead of merely choosing the
+        # first breadcrumb that is far enough away.
         for tx, ty in reversed(trajectory[:-1]):
             dist = math.hypot(tx - pose.x_m, ty - pose.y_m)
             if dist < min_retreat_m:
                 continue
             if dist > max_retreat_m:
-                break
+                continue
 
             gx, gy = self.mapping_service.world_to_grid(tx, ty)
             if not self.mapping_service.is_inside_grid(gx, gy):
                 continue
-            if grid[gy, gx] != 0:
+            if grid[gy, gx] != 0 or inflated_mask[gy, gx]:
                 continue
 
             path = self.path_planner.plan_path(
@@ -574,26 +598,17 @@ class AutoNavigator:
                 goal_world=(tx, ty),
             )
             if path and len(path) >= 2:
-                return (tx, ty), path
-
-        # Fallback: extract downsampled breadcrumbs directly from trajectory
-        breadcrumb_path: List[Tuple[float, float]] = []
-        for tx, ty in reversed(trajectory):
-            dist = math.hypot(tx - pose.x_m, ty - pose.y_m)
-            if (
-                not breadcrumb_path
-                or math.hypot(
-                    tx - breadcrumb_path[-1][0], ty - breadcrumb_path[-1][1]
+                safe_candidates.append(
+                    (
+                        abs(dist - self.backtrack_distance_m),
+                        (tx, ty),
+                        path,
+                    )
                 )
-                >= 0.08
-            ):
-                breadcrumb_path.append((tx, ty))
-            if dist >= self.backtrack_distance_m:
-                break
 
-        if len(breadcrumb_path) >= 2:
-            target = breadcrumb_path[-1]
-            return target, breadcrumb_path
+        if safe_candidates:
+            _, target, path = min(safe_candidates, key=lambda item: item[0])
+            return target, path
 
         return None
 

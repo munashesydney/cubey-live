@@ -7,7 +7,8 @@ dilating walls and obstacles by the robot's physical radius to prevent collision
 
 import heapq
 import math
-from typing import List, Optional, Set, Tuple
+from collections import deque
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -90,19 +91,42 @@ class PathPlanner:
         goal_gy = max(0, min(height - 1, goal_gy))
 
         inflated_mask = self.inflate_obstacles(grid, resolution_m)
-        # Hard blocked: strictly occupied (100) or unknown (-1) space.
-        # Known free cells (0) are traversable, with a cost penalty when inside
-        # the obstacle inflation buffer.
-        hard_blocked = (grid != 0)
+        # Unknown space and the complete inflated footprint are hard safety
+        # constraints.  Treating inflation as a cost allowed path smoothing to
+        # produce routes only a few centimeters from a wall.
+        blocked_mask = inflated_mask | (grid != 0)
 
         # A path from an unknown/occupied start is not safe to execute.
-        if hard_blocked[start_gy, start_gx]:
+        if grid[start_gy, start_gx] != 0:
             self.last_failure_reason = "start_not_known_free"
             return None
 
+        # Localization and grid quantization can put the robot's *current*
+        # center inside inflation even though it is physically already there.
+        # Clear only one short, known-free escape chain from the current cell
+        # to normal traversable space.  The rest of inflation stays hard, and
+        # the live footprint monitor still authorizes every motion command.
+        planning_mask = blocked_mask
+        if inflated_mask[start_gy, start_gx]:
+            escape_path = self._find_start_escape_path(
+                grid=grid,
+                inflated_mask=inflated_mask,
+                start=(start_gx, start_gy),
+                goal=(goal_gx, goal_gy),
+                resolution_m=resolution_m,
+            )
+            if not escape_path:
+                self.last_failure_reason = "start_has_no_bounded_inflation_escape"
+                return None
+            planning_mask = blocked_mask.copy()
+            for escape_gx, escape_gy in escape_path:
+                planning_mask[escape_gy, escape_gx] = False
+
         # If goal is inside an obstacle or unknown space, find closest free cell
-        if hard_blocked[goal_gy, goal_gx]:
-            closest_free = self._find_nearest_free_cell(hard_blocked, goal_gx, goal_gy)
+        if planning_mask[goal_gy, goal_gx]:
+            closest_free = self._find_nearest_free_cell(
+                planning_mask, goal_gx, goal_gy
+            )
             if not closest_free:
                 self.last_failure_reason = "goal_has_no_nearby_traversable_cell"
                 return None
@@ -147,22 +171,16 @@ class PathPlanner:
                 if not (0 <= nx < width and 0 <= ny < height):
                     continue
 
-                # Hard collision check: cannot pass through obstacles or unknown cells
-                if hard_blocked[ny, nx]:
+                # Collision / unexplored / inflated-footprint check.
+                if planning_mask[ny, nx]:
                     continue
 
                 # Diagonal corner-cutting check
                 if dx != 0 and dy != 0:
-                    if hard_blocked[cy, nx] or hard_blocked[ny, cx]:
+                    if planning_mask[cy, nx] or planning_mask[ny, cx]:
                         continue
 
-                # Soft inflation penalty: Prefer wide-open paths, but allow passing through
-                # narrow openings and exiting tight enclosures
-                step_cost = move_cost
-                if inflated_mask[ny, nx]:
-                    step_cost += 10.0
-
-                tentative_g = current_g + step_cost
+                tentative_g = current_g + move_cost
                 neighbor = (nx, ny)
 
                 if tentative_g < g_score.get(neighbor, float("inf")):
@@ -184,8 +202,8 @@ class PathPlanner:
         grid_path.append((start_gx, start_gy))
         grid_path.reverse()
 
-        # Smooth path using Line-of-Sight simplification (never cutting through hard obstacles)
-        smoothed_grid_path = self._smooth_path(grid_path, hard_blocked)
+        # Smoothing uses exactly the same footprint-safe traversability mask.
+        smoothed_grid_path = self._smooth_path(grid_path, planning_mask)
 
         # Convert to real-world metric coordinates
         world_path = [
@@ -198,16 +216,81 @@ class PathPlanner:
 
         return world_path
 
+    def _find_start_escape_path(
+        self,
+        grid: np.ndarray,
+        inflated_mask: np.ndarray,
+        start: Tuple[int, int],
+        goal: Tuple[int, int],
+        resolution_m: float,
+    ) -> Optional[List[Tuple[int, int]]]:
+        """Find one short known-free chain out of start-pose inflation."""
+        height, width = grid.shape
+        max_steps = max(
+            2,
+            int(math.ceil(self.total_inflation_m / resolution_m)) + 2,
+        )
+        queue = deque([(start, 0)])
+        came_from: Dict[Tuple[int, int], Optional[Tuple[int, int]]] = {
+            start: None
+        }
+        exits: List[Tuple[Tuple[int, int], int]] = []
+
+        while queue:
+            current, depth = queue.popleft()
+            cx, cy = current
+            if current != start and not inflated_mask[cy, cx]:
+                exits.append((current, depth))
+                continue
+            if depth >= max_steps:
+                continue
+
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                neighbor = (cx + dx, cy + dy)
+                nx, ny = neighbor
+                if not (0 <= nx < width and 0 <= ny < height):
+                    continue
+                if neighbor in came_from or grid[ny, nx] != 0:
+                    continue
+                came_from[neighbor] = current
+                queue.append((neighbor, depth + 1))
+
+        if not exits:
+            return None
+
+        goal_x, goal_y = goal
+        exit_cell, _ = min(
+            exits,
+            key=lambda item: (
+                item[1],
+                math.hypot(item[0][0] - goal_x, item[0][1] - goal_y),
+            ),
+        )
+        path: List[Tuple[int, int]] = []
+        current: Optional[Tuple[int, int]] = exit_cell
+        while current is not None:
+            path.append(current)
+            current = came_from[current]
+        path.reverse()
+        return path
+
     def _find_nearest_free_cell(self, mask: np.ndarray, gx: int, gy: int) -> Optional[Tuple[int, int]]:
         """Find the closest un-inflated cell to a target."""
         height, width = mask.shape
         for r in range(1, 15):
+            candidates: List[Tuple[int, int]] = []
             for dy in range(-r, r + 1):
                 for dx in range(-r, r + 1):
+                    if max(abs(dx), abs(dy)) != r:
+                        continue
                     nx, ny = gx + dx, gy + dy
-                    if 0 <= nx < width and 0 <= ny < height:
-                        if not mask[ny, nx]:
-                            return nx, ny
+                    if 0 <= nx < width and 0 <= ny < height and not mask[ny, nx]:
+                        candidates.append((nx, ny))
+            if candidates:
+                return min(
+                    candidates,
+                    key=lambda cell: (cell[0] - gx) ** 2 + (cell[1] - gy) ** 2,
+                )
         return None
 
     def _has_line_of_sight(self, p1: Tuple[int, int], p2: Tuple[int, int], mask: np.ndarray) -> bool:

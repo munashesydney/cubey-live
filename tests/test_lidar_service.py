@@ -120,6 +120,21 @@ class LidarServiceTests(unittest.TestCase):
         self.assertFalse(healthy)
         self.assertIn("stale", reason)
 
+    def test_scan_health_rejects_rate_incompatible_with_freshness_window(self):
+        service = LidarService(default_port="MOCK_SIMULATOR")
+        service._is_connected = True
+        service._is_scanning = True
+        service.latest_scan = LidarScanData(
+            timestamp=time.time(),
+            scan_rate_hz=2.5,
+            point_count=100,
+        )
+
+        healthy, reason = service.scan_health(max_age_s=0.35)
+
+        self.assertFalse(healthy)
+        self.assertIn("scan_rate_low", reason)
+
     def test_mock_radar_stream_emission(self):
         received_scans = []
         self.service.on_scan_data = lambda scan: received_scans.append(scan)

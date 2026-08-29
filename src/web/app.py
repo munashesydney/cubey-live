@@ -138,6 +138,7 @@ async def get_system_status(_: str = Depends(verify_credentials)):
             "active_map_id": mapping_svc.active_map_id,
             "explored_cells": snapshot.total_explored_cells,
             "pose": snapshot.pose.to_dict(),
+            "localization": mapping_svc.localization_status(),
             "navigation": mapping_svc.navigator.status(),
         },
     }
@@ -399,6 +400,7 @@ async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(
                     "target_frontier": snapshot.target_frontier,
                     "nav_state": mapping_svc.navigator.state.value if hasattr(mapping_svc, "navigator") else "IDLE",
                     "nav_status": mapping_svc.navigator.status() if hasattr(mapping_svc, "navigator") else {},
+                    "localization": mapping_svc.localization_status(),
                     "timestamp": snapshot.timestamp,
                 }
                 await websocket.send_json(payload)

@@ -208,8 +208,20 @@ class AppConfig:
         """Reject unsafe autonomous-navigation configuration independently."""
         if not 70 <= self.nav_drive_speed <= 180:
             raise ValueError("NAV_DRIVE_SPEED must be between 70 and 180 for autonomy")
+        if not 60 <= self.nav_recovery_speed <= 120:
+            raise ValueError(
+                "NAV_RECOVERY_SPEED must be between 60 and 120 for autonomy"
+            )
+        if not 0.25 <= self.nav_backtrack_distance_m <= 1.5:
+            raise ValueError(
+                "NAV_BACKTRACK_DISTANCE_M must be between 0.25 and 1.5"
+            )
         if self.robot_length_m <= 0 or self.robot_width_m <= 0:
             raise ValueError("ROBOT_LENGTH_M and ROBOT_WIDTH_M must be measured positive values")
+        if not 0.02 <= self.robot_footprint_margin_m <= 0.15:
+            raise ValueError(
+                "ROBOT_FOOTPRINT_MARGIN_M must be between 0.02 and 0.15"
+            )
         minimum_stop_m = self.robot_length_m / 2.0 + self.robot_footprint_margin_m
         if self.lidar_safety_distance_mm / 1000.0 <= minimum_stop_m:
             raise ValueError(

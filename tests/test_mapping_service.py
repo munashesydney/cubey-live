@@ -3,6 +3,7 @@ Unit tests for MappingService: coordinate transformation, occupancy grid updates
 LiDAR scan matching, raycasting, and map serialization.
 """
 
+import math
 import time
 import unittest
 import numpy as np
@@ -85,6 +86,58 @@ class MappingServiceTests(unittest.TestCase):
         gx_mid, gy_mid = self.mapping_svc.world_to_grid(0.0, 0.5)
         self.assertEqual(self.mapping_svc._grid[gy_mid, gx_mid], 0)
 
+    def test_scan_matching_holds_pose_when_scan_has_no_map_correspondence(self):
+        self.mapping_svc._grid.fill(-1)
+        self.mapping_svc._grid[5, 5:30] = 100
+        self.mapping_svc.pose = RobotPose(0.0, 0.0, 0.0)
+        points = [
+            LidarPoint(
+                angle_deg=float(index * 20),
+                distance_mm=800.0 + index * 13.0,
+                quality=60,
+            )
+            for index in range(18)
+        ]
+
+        for _ in range(5):
+            self.mapping_svc.pose = self.mapping_svc._scan_match(points)
+
+        self.assertAlmostEqual(self.mapping_svc.pose.x_m, 0.0)
+        self.assertAlmostEqual(self.mapping_svc.pose.y_m, 0.0)
+        self.assertAlmostEqual(self.mapping_svc.pose.theta_deg, 0.0)
+        self.assertFalse(self.mapping_svc.last_scan_match_accepted)
+        self.assertEqual(
+            self.mapping_svc.last_scan_match_reason,
+            "insufficient_map_correspondence",
+        )
+
+    def test_scan_matching_accepts_supported_motion_correction(self):
+        self.mapping_svc._grid.fill(-1)
+        self.mapping_svc.pose = RobotPose(0.0, 0.0, 0.0)
+        self.mapping_svc.navigator._last_command = "forward"
+        true_x, true_y, true_theta = 0.0, 0.06, 4.0
+        points = []
+        for index in range(36):
+            angle = float(index * 10)
+            distance_m = 1.1 + 0.22 * math.sin(math.radians(angle * 3))
+            point = LidarPoint(
+                angle_deg=angle,
+                distance_mm=distance_m * 1000.0,
+                quality=60,
+            )
+            points.append(point)
+            theta_rad = math.radians(true_theta)
+            wx = true_x + point.x_m * math.cos(theta_rad) + point.y_m * math.sin(theta_rad)
+            wy = true_y - point.x_m * math.sin(theta_rad) + point.y_m * math.cos(theta_rad)
+            gx, gy = self.mapping_svc.world_to_grid(wx, wy)
+            self.mapping_svc._grid[gy, gx] = 100
+
+        matched_pose = self.mapping_svc._scan_match(points)
+
+        self.assertAlmostEqual(matched_pose.y_m, true_y, delta=0.021)
+        self.assertAlmostEqual(matched_pose.theta_deg, true_theta, delta=2.01)
+        self.assertTrue(self.mapping_svc.last_scan_match_accepted)
+
     def test_raycasting_ignores_robot_chassis_reflection(self):
         reflection = LidarPoint(angle_deg=351.4, distance_mm=56.0, quality=60)
 
@@ -115,6 +168,34 @@ class MappingServiceTests(unittest.TestCase):
         )
 
         self.assertEqual(self.mapping_svc._grid[gy_wall, gx_wall], 100)
+
+    def test_observed_wall_survives_several_crossing_free_rays(self):
+        wall = LidarPoint(angle_deg=0.0, distance_mm=500.0, quality=60)
+        self.mapping_svc._raycast_update(0.0, 0.0, [wall])
+        gx_wall, gy_wall = self.mapping_svc.world_to_grid(0.0, 0.5)
+
+        farther_return = LidarPoint(
+            angle_deg=0.0, distance_mm=1000.0, quality=60
+        )
+        for _ in range(4):
+            self.mapping_svc._raycast_update(0.0, 0.0, [farther_return])
+
+        self.assertEqual(self.mapping_svc._grid[gy_wall, gx_wall], 100)
+
+    def test_nearby_scan_samples_fill_free_space_between_rays(self):
+        points = [
+            LidarPoint(angle_deg=0.0, distance_mm=2000.0, quality=60),
+            LidarPoint(angle_deg=4.0, distance_mm=2000.0, quality=60),
+        ]
+
+        self.mapping_svc._raycast_update(0.0, 0.0, points)
+
+        angle_rad = math.radians(2.0)
+        gx_mid, gy_mid = self.mapping_svc.world_to_grid(
+            1.5 * math.sin(angle_rad),
+            1.5 * math.cos(angle_rad),
+        )
+        self.assertEqual(self.mapping_svc._grid[gy_mid, gx_mid], 0)
 
     def test_compression_and_persistence(self):
         compressed = self.mapping_svc.get_compressed_grid()

@@ -126,6 +126,10 @@ class MappingService:
         self.pose = RobotPose(0.0, 0.0, 0.0)
         self.trajectory: List[Tuple[float, float]] = [(0.0, 0.0)]
         self._latest_hits: List[Tuple[float, float]] = []
+        self.last_scan_match_score = 0.0
+        self.last_scan_match_points = 0
+        self.last_scan_match_accepted = False
+        self.last_scan_match_reason = "map_bootstrap"
 
         self.is_mapping: bool = False
         self.active_map_id: Optional[int] = None
@@ -245,6 +249,10 @@ class MappingService:
             self.pose = RobotPose(0.0, 0.0, 0.0)
             self.trajectory = [(0.0, 0.0)]
             self._latest_hits.clear()
+            self.last_scan_match_score = 0.0
+            self.last_scan_match_points = 0
+            self.last_scan_match_accepted = False
+            self.last_scan_match_reason = "map_reset"
             self.active_map_id = None
             self.map_name = "Live Floorplan"
         logger.info("Occupancy grid map reset.")
@@ -252,6 +260,105 @@ class MappingService:
     # ------------------------------------------------------------------
     # Scan Matching & Pose Estimation (LiDAR Odometry)
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _ordered_symmetric_offsets(max_value: float, step: float) -> List[float]:
+        offsets = [0.0]
+        count = int(round(max_value / step))
+        for index in range(1, count + 1):
+            value = round(index * step, 6)
+            offsets.extend((-value, value))
+        return offsets
+
+    def _current_motion_command(self) -> str:
+        """Return the freshest normalized command available to scan matching."""
+        navigator_command = str(
+            getattr(getattr(self, "navigator", None), "_last_command", "stop")
+        )
+        if navigator_command.lower() != "stop":
+            return navigator_command.lower()
+        telemetry = getattr(
+            getattr(getattr(self, "navigator", None), "wheels_service", None),
+            "telemetry",
+            None,
+        )
+        return str(getattr(telemetry, "motion", "stop")).lower().replace("_", "")
+
+    def _scan_match_candidates(
+        self, motion_command: str
+    ) -> Tuple[List[Tuple[float, float]], List[float]]:
+        """Generate a motion-bounded search window with the current pose first."""
+        command = motion_command.lower().replace("_", "")
+        if command in {"rotateleft", "rotateright"}:
+            positions = [(0.0, 0.0), (-0.02, 0.0), (0.02, 0.0), (0.0, -0.02), (0.0, 0.02)]
+            angles = self._ordered_symmetric_offsets(14.0, 2.0)
+            return positions, angles
+
+        translation_vectors = {
+            "forward": (0.0, 1.0),
+            "backward": (0.0, -1.0),
+            "strafeleft": (-1.0, 0.0),
+            "straferight": (1.0, 0.0),
+            "forwardleft": (-1.0, 1.0),
+            "forwardright": (1.0, 1.0),
+            "backwardleft": (-1.0, -1.0),
+            "backwardright": (1.0, -1.0),
+        }
+        vector = translation_vectors.get(command)
+        if vector:
+            vx, vy = vector
+            magnitude = math.hypot(vx, vy)
+            vx, vy = vx / magnitude, vy / magnitude
+            pose_rad = math.radians(self.pose.theta_deg)
+            sin_p, cos_p = math.sin(pose_rad), math.cos(pose_rad)
+            positions = [(0.0, 0.0)]
+            for along in (0.02, 0.04, 0.06, 0.08, 0.10, 0.12):
+                for lateral in (0.0, -0.02, 0.02):
+                    local_x = vx * along - vy * lateral
+                    local_y = vy * along + vx * lateral
+                    world_dx = local_x * cos_p + local_y * sin_p
+                    world_dy = -local_x * sin_p + local_y * cos_p
+                    positions.append((world_dx, world_dy))
+            angles = self._ordered_symmetric_offsets(8.0, 2.0)
+            return positions, angles
+
+        # When stopped or motion is unknown, permit only tiny corrections. A
+        # weak scan must never invent continuous robot movement.
+        positions = [
+            (0.0, 0.0),
+            (-0.02, 0.0),
+            (0.02, 0.0),
+            (0.0, -0.02),
+            (0.0, 0.02),
+        ]
+        angles = self._ordered_symmetric_offsets(2.0, 1.0)
+        return positions, angles
+
+    def _build_correlation_field(self) -> np.ndarray:
+        """Create a small distance-tolerant wall likelihood field."""
+        occupied = self._grid == 100
+        correlation = np.zeros(self._grid.shape, dtype=np.float32)
+        correlation[self._grid == 0] = -0.12
+        height, width = self._grid.shape
+
+        for dy in range(-2, 3):
+            for dx in range(-2, 3):
+                distance = math.hypot(dx, dy)
+                if distance > 2.01:
+                    continue
+                weight = 1.0 if distance == 0 else (0.65 if distance <= 1.42 else 0.30)
+
+                src_y0 = max(0, -dy)
+                src_y1 = min(height, height - dy)
+                src_x0 = max(0, -dx)
+                src_x1 = min(width, width - dx)
+                dst_y0, dst_y1 = src_y0 + dy, src_y1 + dy
+                dst_x0, dst_x1 = src_x0 + dx, src_x1 + dx
+                source = occupied[src_y0:src_y1, src_x0:src_x1]
+                target = correlation[dst_y0:dst_y1, dst_x0:dst_x1]
+                target[source] = np.maximum(target[source], weight)
+
+        return correlation
 
     def _scan_match(self, scan_points: List[LidarPoint]) -> RobotPose:
         """
@@ -261,19 +368,14 @@ class MappingService:
         # If map is fresh (less than 20 occupied cells), return current pose
         occupied_count = np.count_nonzero(self._grid == 100)
         if occupied_count < 20:
-            return self.pose
-
-        best_score = -1.0
-        best_x = self.pose.x_m
-        best_y = self.pose.y_m
-        best_theta = self.pose.theta_deg
-
-        # Search window around current pose estimate
-        # Positional offsets: +- 6 cm in 2 cm steps
-        # Angular offsets: +- 4 deg in 1 deg steps
-        x_candidates = [self.pose.x_m + dx for dx in [-0.06, -0.03, 0.0, 0.03, 0.06]]
-        y_candidates = [self.pose.y_m + dy for dy in [-0.06, -0.03, 0.0, 0.03, 0.06]]
-        theta_candidates = [self.pose.theta_deg + dth for dth in [-4.0, -2.0, 0.0, 2.0, 4.0]]
+            self.last_scan_match_accepted = False
+            self.last_scan_match_reason = "map_bootstrap"
+            return RobotPose(
+                self.pose.x_m,
+                self.pose.y_m,
+                self.pose.theta_deg,
+                timestamp=time.time(),
+            )
 
         # Sample a subset of high-quality points to speed up correlation
         valid_points = [
@@ -283,47 +385,124 @@ class MappingService:
             and point.quality > 15
             and not self.is_robot_self_return(point)
         ]
-        if len(valid_points) > 80:
-            step = len(valid_points) // 80
-            valid_points = valid_points[::step]
+        if len(valid_points) > 100:
+            indices = np.linspace(0, len(valid_points) - 1, 100, dtype=int)
+            valid_points = [valid_points[index] for index in indices]
 
-        if not valid_points:
-            return self.pose
+        if len(valid_points) < 8:
+            self.last_scan_match_accepted = False
+            self.last_scan_match_reason = "insufficient_quality_points"
+            return RobotPose(
+                self.pose.x_m,
+                self.pose.y_m,
+                self.pose.theta_deg,
+                timestamp=time.time(),
+            )
 
-        for th in theta_candidates:
-            rad = math.radians(th)
-            sin_th = math.sin(rad)
-            cos_th = math.cos(rad)
+        local_x = np.array([point.x_m for point in valid_points], dtype=np.float32)
+        local_y = np.array([point.y_m for point in valid_points], dtype=np.float32)
+        correlation = self._build_correlation_field()
+        positions, angle_offsets = self._scan_match_candidates(
+            self._current_motion_command()
+        )
 
-            for cand_x in x_candidates:
-                for cand_y in y_candidates:
-                    score = 0.0
-                    for pt in valid_points:
-                        pt_rad = math.radians(pt.angle_deg)
-                        # Local point in robot frame
-                        dist_m = pt.distance_mm / 1000.0
-                        lx = dist_m * math.sin(pt_rad)
-                        ly = dist_m * math.cos(pt_rad)
+        best_score = -float("inf")
+        best_matches = 0
+        best_delta = (0.0, 0.0, 0.0)
+        current_score = -float("inf")
+        current_matches = 0
 
-                        # Transform to candidate world frame
-                        wx = cand_x + lx * cos_th + ly * sin_th
-                        wy = cand_y - lx * sin_th + ly * cos_th
+        for delta_theta in angle_offsets:
+            theta = self.pose.theta_deg + delta_theta
+            theta_rad = math.radians(theta)
+            sin_theta, cos_theta = math.sin(theta_rad), math.cos(theta_rad)
+            rotated_x = local_x * cos_theta + local_y * sin_theta
+            rotated_y = -local_x * sin_theta + local_y * cos_theta
 
-                        gx, gy = self.world_to_grid(wx, wy)
-                        if self.is_inside_grid(gx, gy):
-                            val = self._grid[gy, gx]
-                            if val == 100:
-                                score += 1.0
-                            elif val == 0:
-                                score -= 0.15
+            for delta_x, delta_y in positions:
+                candidate_x = self.pose.x_m + delta_x
+                candidate_y = self.pose.y_m + delta_y
+                grid_x = (
+                    (candidate_x + rotated_x - self.origin_x_m)
+                    / self.resolution_m
+                ).astype(np.int32)
+                grid_y = (
+                    (candidate_y + rotated_y - self.origin_y_m)
+                    / self.resolution_m
+                ).astype(np.int32)
+                inside = (
+                    (grid_x >= 0)
+                    & (grid_x < self.width)
+                    & (grid_y >= 0)
+                    & (grid_y < self.height)
+                )
+                if int(np.count_nonzero(inside)) < len(valid_points) * 0.8:
+                    continue
+                values = correlation[grid_y[inside], grid_x[inside]]
+                score = float(np.sum(values) / len(valid_points))
+                matches = int(np.count_nonzero(values >= 0.30))
 
-                    if score > best_score:
-                        best_score = score
-                        best_x = cand_x
-                        best_y = cand_y
-                        best_theta = th
+                if delta_x == 0.0 and delta_y == 0.0 and delta_theta == 0.0:
+                    current_score = score
+                    current_matches = matches
 
-        return RobotPose(x_m=best_x, y_m=best_y, theta_deg=best_theta, timestamp=time.time())
+                if score > best_score + 1e-6 or (
+                    abs(score - best_score) <= 1e-6 and matches > best_matches
+                ):
+                    best_score = score
+                    best_matches = matches
+                    best_delta = (delta_x, delta_y, delta_theta)
+
+        if not math.isfinite(best_score):
+            self.last_scan_match_score = 0.0
+            self.last_scan_match_points = 0
+            self.last_scan_match_accepted = False
+            self.last_scan_match_reason = "scan_outside_map_bounds"
+            return RobotPose(
+                self.pose.x_m,
+                self.pose.y_m,
+                self.pose.theta_deg,
+                timestamp=time.time(),
+            )
+
+        self.last_scan_match_score = round(best_score, 4)
+        self.last_scan_match_points = best_matches
+        minimum_matches = max(6, int(math.ceil(len(valid_points) * 0.08)))
+        if best_matches < minimum_matches:
+            self.last_scan_match_accepted = False
+            self.last_scan_match_reason = "insufficient_map_correspondence"
+            return RobotPose(
+                self.pose.x_m,
+                self.pose.y_m,
+                self.pose.theta_deg,
+                timestamp=time.time(),
+            )
+
+        delta_x, delta_y, delta_theta = best_delta
+        pose_changed = any(
+            abs(value) > 1e-9 for value in (delta_x, delta_y, delta_theta)
+        )
+        if pose_changed and current_matches >= minimum_matches:
+            if best_score - current_score < 0.004:
+                self.last_scan_match_accepted = False
+                self.last_scan_match_reason = "no_confident_improvement"
+                return RobotPose(
+                    self.pose.x_m,
+                    self.pose.y_m,
+                    self.pose.theta_deg,
+                    timestamp=time.time(),
+                )
+
+        self.last_scan_match_accepted = pose_changed
+        self.last_scan_match_reason = (
+            "pose_correction_accepted" if pose_changed else "current_pose_best"
+        )
+        return RobotPose(
+            x_m=self.pose.x_m + delta_x,
+            y_m=self.pose.y_m + delta_y,
+            theta_deg=(self.pose.theta_deg + delta_theta) % 360.0,
+            timestamp=time.time(),
+        )
 
     # ------------------------------------------------------------------
     # Raycasting (Bresenham's Line Algorithm)
@@ -341,7 +520,10 @@ class MappingService:
         Returns list of global world (x, y) hit points.
         """
         L_OCC = 1.2    # Log-odds increase for obstacle hits
-        L_FREE = -0.4  # Log-odds decrease for free space
+        L_FREE = -0.4  # Log-odds decrease for unknown/free space
+        # A reflected wall should not disappear because a few neighboring rays
+        # cross its old cell after millimeter-scale pose/range noise.
+        L_FREE_THROUGH_OCCUPIED = -0.08
         MAX_LOG_ODDS = 5.0
         MIN_LOG_ODDS = -5.0
 
@@ -354,6 +536,53 @@ class MappingService:
         pose_rad = math.radians(self.pose.theta_deg)
         sin_p = math.sin(pose_rad)
         cos_p = math.cos(pose_rad)
+        valid_hit_rays: List[Tuple[float, float]] = []
+
+        def update_free_cell(cell_x: int, cell_y: int) -> None:
+            current = float(self._log_odds[cell_y, cell_x])
+            decrement = (
+                L_FREE_THROUGH_OCCUPIED if current > 0.6 else L_FREE
+            )
+            self._log_odds[cell_y, cell_x] = max(
+                MIN_LOG_ODDS, current + decrement
+            )
+
+        def trace_free_ray(
+            target_x: int,
+            target_y: int,
+            *,
+            include_endpoint: bool,
+            stop_at_observed_wall: bool,
+        ) -> None:
+            dx = abs(target_x - gx0)
+            dy = abs(target_y - gy0)
+            sx = 1 if gx0 < target_x else -1
+            sy = 1 if gy0 < target_y else -1
+            err = dx - dy
+            curr_x, curr_y = gx0, gy0
+
+            while True:
+                at_endpoint = curr_x == target_x and curr_y == target_y
+                if at_endpoint and not include_endpoint:
+                    break
+                if not self.is_inside_grid(curr_x, curr_y):
+                    break
+                if (
+                    stop_at_observed_wall
+                    and (curr_x, curr_y) != (gx0, gy0)
+                    and self._log_odds[curr_y, curr_x] > 0.6
+                ):
+                    break
+                update_free_cell(curr_x, curr_y)
+                if at_endpoint:
+                    break
+                e2 = 2 * err
+                if e2 > -dy:
+                    err -= dy
+                    curr_x += sx
+                if e2 < dx:
+                    err += dx
+                    curr_y += sy
 
         for pt in scan_points:
             dist_m = pt.distance_mm / 1000.0
@@ -373,35 +602,58 @@ class MappingService:
             hit_world_coords.append((round(wx, 3), round(wy, 3)))
 
             gx1, gy1 = self.world_to_grid(wx, wy)
-
-            # Bresenham's line algorithm between (gx0, gy0) and (gx1, gy1)
-            dx = abs(gx1 - gx0)
-            dy = abs(gy1 - gy0)
-            sx = 1 if gx0 < gx1 else -1
-            sy = 1 if gy0 < gy1 else -1
-            err = dx - dy
-
-            curr_x, curr_y = gx0, gy0
-
-            # Trace free-space along ray
-            while curr_x != gx1 or curr_y != gy1:
-                if self.is_inside_grid(curr_x, curr_y):
-                    self._log_odds[curr_y, curr_x] = max(
-                        MIN_LOG_ODDS, self._log_odds[curr_y, curr_x] + L_FREE
-                    )
-                e2 = 2 * err
-                if e2 > -dy:
-                    err -= dy
-                    curr_x += sx
-                if e2 < dx:
-                    err += dx
-                    curr_y += sy
+            trace_free_ray(
+                gx1,
+                gy1,
+                include_endpoint=False,
+                stop_at_observed_wall=False,
+            )
 
             # Mark endpoint as occupied
             if self.is_inside_grid(gx1, gy1) and pt.quality > 10:
                 self._log_odds[gy1, gx1] = min(
                     MAX_LOG_ODDS, self._log_odds[gy1, gx1] + L_OCC
                 )
+                valid_hit_rays.append((pt.angle_deg % 360.0, dist_m))
+
+        # Fill safe free-space slivers between nearby reflected samples. A raw
+        # one-cell Bresenham ray per return creates the large starburst pattern
+        # seen in the browser. Interpolation never marks an obstacle and stops
+        # short of the nearer measured endpoint.
+        if len(valid_hit_rays) >= 2:
+            valid_hit_rays.sort(key=lambda item: item[0])
+            wrapped_rays = valid_hit_rays + [
+                (valid_hit_rays[0][0] + 360.0, valid_hit_rays[0][1])
+            ]
+            for (angle_a, range_a), (angle_b, range_b) in zip(
+                wrapped_rays, wrapped_rays[1:]
+            ):
+                gap_deg = angle_b - angle_a
+                if gap_deg <= 0.0 or gap_deg > 5.0:
+                    continue
+                clear_range_m = min(range_a, range_b) - self.resolution_m * 1.5
+                if clear_range_m <= self.lidar_service.min_valid_distance_mm / 1000.0:
+                    continue
+                target_step_deg = math.degrees(
+                    math.atan2(self.resolution_m * 0.75, clear_range_m)
+                )
+                target_step_deg = max(0.35, min(1.0, target_step_deg))
+                subdivisions = min(12, int(math.ceil(gap_deg / target_step_deg)))
+                for subdivision in range(1, subdivisions):
+                    fraction = subdivision / subdivisions
+                    angle_deg = (angle_a + gap_deg * fraction) % 360.0
+                    angle_rad = math.radians(angle_deg)
+                    lx = clear_range_m * math.sin(angle_rad)
+                    ly = clear_range_m * math.cos(angle_rad)
+                    wx = robot_x + lx * cos_p + ly * sin_p
+                    wy = robot_y - lx * sin_p + ly * cos_p
+                    target_gx, target_gy = self.world_to_grid(wx, wy)
+                    trace_free_ray(
+                        target_gx,
+                        target_gy,
+                        include_endpoint=True,
+                        stop_at_observed_wall=True,
+                    )
 
         # Preserve no-return samples as conservative free-space evidence. The
         # old parser discarded them completely, leaving open doorways black
@@ -415,39 +667,27 @@ class MappingService:
             wy = robot_y - lx * sin_p + ly * cos_p
             gx1, gy1 = self.world_to_grid(wx, wy)
 
-            dx = abs(gx1 - gx0)
-            dy = abs(gy1 - gy0)
-            sx = 1 if gx0 < gx1 else -1
-            sy = 1 if gy0 < gy1 else -1
-            err = dx - dy
-            curr_x, curr_y = gx0, gy0
-
-            while True:
-                if not self.is_inside_grid(curr_x, curr_y):
-                    break
-                # A no-return ray may confirm unknown/free cells, but it must
-                # never erase a wall already observed by a reflected hit.
-                if (curr_x, curr_y) != (gx0, gy0) and self._log_odds[curr_y, curr_x] > 0.6:
-                    break
-                self._log_odds[curr_y, curr_x] = max(
-                    MIN_LOG_ODDS, self._log_odds[curr_y, curr_x] + L_FREE
-                )
-                if curr_x == gx1 and curr_y == gy1:
-                    break
-                e2 = 2 * err
-                if e2 > -dy:
-                    err -= dy
-                    curr_x += sx
-                if e2 < dx:
-                    err += dx
-                    curr_y += sy
+            trace_free_ray(
+                gx1,
+                gy1,
+                include_endpoint=True,
+                stop_at_observed_wall=True,
+            )
 
         # Update display grid matrix from log-odds values
         # -1 = unknown (|log_odds| < 0.25)
         # 0 = free (log_odds < -0.25)
         # 100 = occupied (log_odds > 0.6)
-        free_mask = self._log_odds < -0.25
-        occ_mask = self._log_odds > 0.6
+        previous_free = self._grid == 0
+        previous_occupied = self._grid == 100
+        free_mask = (self._log_odds < -0.25) | (
+            previous_free & (self._log_odds < 0.10)
+        )
+        occ_mask = (self._log_odds > 0.6) | (
+            previous_occupied & (self._log_odds > 0.25)
+        )
+        # Occupied evidence always wins if hysteresis bands overlap.
+        free_mask &= ~occ_mask
         unknown_mask = ~free_mask & ~occ_mask
 
         self._grid[free_mask] = 0
@@ -534,6 +774,15 @@ class MappingService:
         """Return a copy of the current 2D int8 grid array."""
         with self._lock:
             return self._grid.copy()
+
+    def localization_status(self) -> Dict[str, Any]:
+        """Return compact scan-matching confidence diagnostics."""
+        return {
+            "correction_accepted": self.last_scan_match_accepted,
+            "reason": self.last_scan_match_reason,
+            "score": self.last_scan_match_score,
+            "matched_points": self.last_scan_match_points,
+        }
 
     def get_snapshot(self) -> MappingSnapshot:
         """Return the current mapping snapshot for API consumers."""

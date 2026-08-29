@@ -43,6 +43,8 @@ class WebServerApiTests(unittest.TestCase):
         self.assertIn("battery", data)
         self.assertIn("lidar", data)
         self.assertIn("mapping", data)
+        self.assertIn("localization", data["mapping"])
+        self.assertIn("reason", data["mapping"]["localization"])
 
     def test_maps_list_and_save(self):
         res = self.client.get("/api/maps", auth=self.auth)

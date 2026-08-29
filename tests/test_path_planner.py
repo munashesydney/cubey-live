@@ -134,9 +134,11 @@ class PathPlannerTests(unittest.TestCase):
             goal_world=(1.025, 0.425),   # grid cell (20, 8), toward opening
         )
 
+        self.assertIsNotNone(path, planner.last_failure_reason)
+        self.assertGreaterEqual(len(path), 2)
+
     def test_plans_path_when_start_is_in_tight_enclosure(self):
-        # 3-sided tight enclosure (45cm wide, side walls 22.5cm from center)
-        # Even though the start cell is within 26cm of side walls, it must plan out to the open goal
+        # The 50cm opening fits a 36cm robot with the configured 4cm margin.
         grid = np.full((40, 40), -1, dtype=np.int8)
         grid[5:30, 15:25] = 0  # free interior and opening
         grid[10:30, 14] = 100  # left wall
@@ -144,7 +146,7 @@ class PathPlannerTests(unittest.TestCase):
         grid[29, 14:26] = 100  # back wall
         grid[2:10, 10:30] = 0  # open room ahead
 
-        planner = PathPlanner(robot_radius_m=0.18, safety_margin_m=0.08)
+        planner = PathPlanner(robot_radius_m=0.18, safety_margin_m=0.04)
 
         path = planner.plan_path(
             grid=grid,
@@ -157,6 +159,41 @@ class PathPlannerTests(unittest.TestCase):
 
         self.assertIsNotNone(path, planner.last_failure_reason)
         self.assertGreaterEqual(len(path), 2)
+
+    def test_smoothed_route_never_shortcuts_through_footprint_inflation(self):
+        grid = np.zeros((31, 31), dtype=np.int8)
+        grid[15, 15] = 100
+        planner = PathPlanner(robot_radius_m=0.18, safety_margin_m=0.04)
+
+        path = planner.plan_path(
+            grid=grid,
+            resolution_m=0.05,
+            origin_x_m=0.0,
+            origin_y_m=0.0,
+            start_world=(0.275, 0.775),
+            goal_world=(1.275, 0.775),
+        )
+
+        self.assertIsNotNone(path, planner.last_failure_reason)
+        inflated = planner.inflate_obstacles(grid, 0.05)
+        for start, end in zip(path, path[1:]):
+            x0, y0 = int(start[0] / 0.05), int(start[1] / 0.05)
+            x1, y1 = int(end[0] / 0.05), int(end[1] / 0.05)
+            dx, dy = abs(x1 - x0), abs(y1 - y0)
+            sx = 1 if x0 < x1 else -1
+            sy = 1 if y0 < y1 else -1
+            err = dx - dy
+            while True:
+                self.assertFalse(inflated[y0, x0])
+                if (x0, y0) == (x1, y1):
+                    break
+                e2 = 2 * err
+                if e2 > -dy:
+                    err -= dy
+                    x0 += sx
+                if e2 < dx:
+                    err += dx
+                    y0 += sy
 
 
 if __name__ == "__main__":

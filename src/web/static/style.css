@@ -293,6 +293,7 @@ body, html {
 }
 
 .swatch.occupied { background: var(--sky); box-shadow: 0 0 6px var(--sky); }
+.swatch.live-hit { background: var(--red); box-shadow: 0 0 6px var(--red); }
 .swatch.free { background: var(--surface1); }
 .swatch.unknown { background: var(--base); border: 1px dashed var(--surface0); }
 .swatch.trail { background: var(--yellow); }

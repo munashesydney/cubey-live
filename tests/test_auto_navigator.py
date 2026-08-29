@@ -196,29 +196,33 @@ class AutoNavigatorTests(unittest.TestCase):
         self.navigator._stop_event.clear()
         self.navigator.state = NavigationState.NAVIGATING
         self.navigator._last_command = "forward"
-
-        # 1. Simulate sensor drop
-        self.navigator._sensor_health = MagicMock(return_value=(False, "lidar_scan_rate_low:1.7Hz"))
+        self.navigator._start_deadline = time.monotonic() - 10.0
+        health_results = [
+            (False, "lidar_scan_rate_low:1.7Hz"),
+            (False, "lidar_scan_rate_low:1.7Hz"),
+            (True, "ok"),
+            (True, "ok"),
+            (True, "ok"),
+        ]
+        self.navigator._sensor_health = MagicMock(
+            side_effect=lambda: health_results.pop(0) if health_results else (True, "ok")
+        )
         self.navigator.wheels_service.stop = MagicMock()
+        self.navigator._plan_next_frontier = MagicMock(
+            side_effect=self.navigator._stop_event.set
+        )
 
-        # Run single iteration logic
-        healthy, health_reason = self.navigator._sensor_health()
-        self.assertFalse(healthy)
-        self.navigator.wheels_service.stop()
-        self.navigator._last_command = "stop"
-        self.navigator.state = NavigationState.WAITING_FOR_SENSORS
+        thread = __import__("threading").Thread(
+            target=self.navigator._navigation_loop
+        )
+        thread.start()
+        thread.join(timeout=0.5)
 
-        self.assertEqual(self.navigator.state, NavigationState.WAITING_FOR_SENSORS)
-        self.assertEqual(self.navigator._last_command, "stop")
-        self.assertFalse(self.mock_wheels.is_emergency_stopped)
-
-        # 2. Simulate sensor recovery
-        self.navigator._sensor_health = MagicMock(return_value=(True, "ok"))
-        self.navigator._healthy_scan_streak = 3
-        if self.navigator.state == NavigationState.WAITING_FOR_SENSORS and self.navigator._healthy_scan_streak >= 3:
-            self.navigator.state = NavigationState.PLANNING
-
+        self.assertFalse(thread.is_alive())
         self.assertEqual(self.navigator.state, NavigationState.PLANNING)
+        self.assertEqual(self.navigator.fault_reason, "")
+        self.assertEqual(self.navigator._unhealthy_sensors_since, 0.0)
+        self.assertFalse(self.mock_wheels.is_emergency_stopped)
 
     def test_progress_watchdog_stops_frozen_pose(self):
         self.mock_wheels.connect(port="MOCK_SIMULATOR")
@@ -287,11 +291,23 @@ class AutoNavigatorTests(unittest.TestCase):
             (0.0, 0.9),
         ]
         self.mapping_svc.pose = RobotPose(x_m=0.0, y_m=0.9, theta_deg=0.0)
+        self.mapping_svc._grid.fill(0)
         self.navigator.frontier_detector.find_frontiers = MagicMock(
             return_value=[SimpleNamespace(centroid_world=(0.0, 1.5))]
         )
-        self.navigator.path_planner.plan_path = MagicMock(return_value=None)
-        self.navigator.path_planner.last_failure_reason = "doorway_too_narrow"
+        real_plan_path = self.navigator.path_planner.plan_path
+
+        def plan_path_with_unreachable_frontier(*args, **kwargs):
+            if kwargs.get("goal_world") == (0.0, 1.5):
+                self.navigator.path_planner.last_failure_reason = (
+                    "doorway_too_narrow"
+                )
+                return None
+            return real_plan_path(*args, **kwargs)
+
+        self.navigator.path_planner.plan_path = MagicMock(
+            side_effect=plan_path_with_unreachable_frontier
+        )
 
         # Simulate rotation blocked on both sides
         def mock_collision(command):
@@ -307,6 +323,19 @@ class AutoNavigatorTests(unittest.TestCase):
         self.assertTrue(self.navigator.is_backtracking)
         self.assertGreaterEqual(len(self.navigator.current_path), 2)
         self.assertEqual(self.navigator.target_frontier, (0.0, 0.3))
+
+    def test_backtrack_refuses_unvalidated_raw_breadcrumbs(self):
+        self.mapping_svc.trajectory = [
+            (0.0, 0.0),
+            (0.0, 0.3),
+            (0.0, 0.6),
+        ]
+        self.mapping_svc.pose = RobotPose(x_m=0.0, y_m=0.6, theta_deg=0.0)
+        self.mapping_svc._grid.fill(-1)
+
+        backtrack = self.navigator._find_safe_backtrack_pose()
+
+        self.assertIsNone(backtrack)
 
     def test_reverse_path_following_commands_backward(self):
         self.mock_wheels.connect(port="MOCK_SIMULATOR")

@@ -29,10 +29,13 @@ RPLIDAR C1 and host collision monitor are not certified safety devices.
    distance and margin.
 5. Confirm the E-stop button and Space key latch the base. Confirm every motion
    command is rejected until **Re-arm** succeeds.
-6. Disconnect LiDAR while moving on blocks. The base must stop and enter
-   `E_STOPPED` within `NAV_MAX_SCAN_AGE_S` plus serial/control latency.
+6. Disconnect LiDAR while moving on blocks. The base must stop within
+   `NAV_MAX_SCAN_AGE_S` plus serial/control latency, enter
+   `WAITING_FOR_SENSORS`, resume only after three healthy scans, and enter
+   `FAULT` if health does not recover before `NAV_SENSOR_START_TIMEOUT_S`.
 7. Disconnect the ESP32 telemetry TX line. The base must stop after
-   `NAV_MAX_WHEEL_TELEMETRY_AGE_S`.
+   `NAV_MAX_WHEEL_TELEMETRY_AGE_S` and use the same bounded sensor-recovery
+   sequence.
 8. Place obstacles at front, rear, both sides, and each corner. Rotation must be
    rejected whenever the swept footprint is blocked.
 9. Run blocked-corridor and feature-poor-room trials. Cubey must enter `FAULT`
