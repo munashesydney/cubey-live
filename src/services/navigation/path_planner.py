@@ -90,23 +90,19 @@ class PathPlanner:
         goal_gy = max(0, min(height - 1, goal_gy))
 
         inflated_mask = self.inflate_obstacles(grid, resolution_m)
-        # Planning and smoothing must share the same traversability contract.
-        # Unknown cells are not collision-free merely because they do not yet
-        # contain an obstacle observation.
-        blocked_mask = inflated_mask | (grid != 0)
+        # Hard blocked: strictly occupied (100) or unknown (-1) space.
+        # Known free cells (0) are traversable, with a cost penalty when inside
+        # the obstacle inflation buffer.
+        hard_blocked = (grid != 0)
 
-        # A path from an unknown/occupied start is not safe to execute.  Do not
-        # silently clamp or tunnel out of a bad localization estimate.
-        if grid[start_gy, start_gx] != 0:
+        # A path from an unknown/occupied start is not safe to execute.
+        if hard_blocked[start_gy, start_gx]:
             self.last_failure_reason = "start_not_known_free"
             return None
-        if inflated_mask[start_gy, start_gx]:
-            self.last_failure_reason = "start_inside_obstacle_inflation"
-            return None
 
-        # If goal is inside an inflated obstacle, find closest free cell
-        if blocked_mask[goal_gy, goal_gx]:
-            closest_free = self._find_nearest_free_cell(blocked_mask, goal_gx, goal_gy)
+        # If goal is inside an obstacle or unknown space, find closest free cell
+        if hard_blocked[goal_gy, goal_gx]:
+            closest_free = self._find_nearest_free_cell(hard_blocked, goal_gx, goal_gy)
             if not closest_free:
                 self.last_failure_reason = "goal_has_no_nearby_traversable_cell"
                 return None
@@ -151,16 +147,22 @@ class PathPlanner:
                 if not (0 <= nx < width and 0 <= ny < height):
                     continue
 
-                # Collision / Unexplored check: must not be in inflated obstacle and must be free (0)
-                if blocked_mask[ny, nx]:
+                # Hard collision check: cannot pass through obstacles or unknown cells
+                if hard_blocked[ny, nx]:
                     continue
 
                 # Diagonal corner-cutting check
                 if dx != 0 and dy != 0:
-                    if blocked_mask[cy, nx] or blocked_mask[ny, cx]:
+                    if hard_blocked[cy, nx] or hard_blocked[ny, cx]:
                         continue
 
-                tentative_g = current_g + move_cost
+                # Soft inflation penalty: Prefer wide-open paths, but allow passing through
+                # narrow openings and exiting tight enclosures
+                step_cost = move_cost
+                if inflated_mask[ny, nx]:
+                    step_cost += 10.0
+
+                tentative_g = current_g + step_cost
                 neighbor = (nx, ny)
 
                 if tentative_g < g_score.get(neighbor, float("inf")):
@@ -182,8 +184,8 @@ class PathPlanner:
         grid_path.append((start_gx, start_gy))
         grid_path.reverse()
 
-        # Smooth path using Line-of-Sight simplification
-        smoothed_grid_path = self._smooth_path(grid_path, blocked_mask)
+        # Smooth path using Line-of-Sight simplification (never cutting through hard obstacles)
+        smoothed_grid_path = self._smooth_path(grid_path, hard_blocked)
 
         # Convert to real-world metric coordinates
         world_path = [

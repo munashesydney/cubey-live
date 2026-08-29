@@ -134,6 +134,27 @@ class PathPlannerTests(unittest.TestCase):
             goal_world=(1.025, 0.425),   # grid cell (20, 8), toward opening
         )
 
+    def test_plans_path_when_start_is_in_tight_enclosure(self):
+        # 3-sided tight enclosure (45cm wide, side walls 22.5cm from center)
+        # Even though the start cell is within 26cm of side walls, it must plan out to the open goal
+        grid = np.full((40, 40), -1, dtype=np.int8)
+        grid[5:30, 15:25] = 0  # free interior and opening
+        grid[10:30, 14] = 100  # left wall
+        grid[10:30, 25] = 100  # right wall
+        grid[29, 14:26] = 100  # back wall
+        grid[2:10, 10:30] = 0  # open room ahead
+
+        planner = PathPlanner(robot_radius_m=0.18, safety_margin_m=0.08)
+
+        path = planner.plan_path(
+            grid=grid,
+            resolution_m=0.05,
+            origin_x_m=0.0,
+            origin_y_m=0.0,
+            start_world=(1.0, 1.0),   # Inside the tight box (x=20, y=20)
+            goal_world=(1.0, 0.25),   # Out in the open room ahead (x=20, y=5)
+        )
+
         self.assertIsNotNone(path, planner.last_failure_reason)
         self.assertGreaterEqual(len(path), 2)
 

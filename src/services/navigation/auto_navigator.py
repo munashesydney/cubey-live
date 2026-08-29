@@ -507,7 +507,7 @@ class AutoNavigator:
     # Frontier selection and bounded recovery
     # ------------------------------------------------------------------
 
-    def _block_target(self, target: Tuple[float, float], duration_s: float = 45.0) -> None:
+    def _block_target(self, target: Tuple[float, float], duration_s: float = 15.0) -> None:
         self._blocked_targets.append(
             (target[0], target[1], time.monotonic() + duration_s)
         )
@@ -516,7 +516,7 @@ class AutoNavigator:
         now = time.monotonic()
         self._blocked_targets = [item for item in self._blocked_targets if item[2] > now]
         return any(
-            math.hypot(target[0] - x, target[1] - y) < 0.30
+            math.hypot(target[0] - x, target[1] - y) < 0.18
             for x, y, _ in self._blocked_targets
         )
 
@@ -604,9 +604,6 @@ class AutoNavigator:
         if rear_block:
             logger.warning("Backtrack rejected: rear collision risk (%s)", rear_block)
             return False
-
-        # Quarantine current dead-end area
-        self._block_target((pose.x_m, pose.y_m), duration_s=45.0)
 
         self.current_path = path
         self.current_waypoint_idx = 0
