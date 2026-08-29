@@ -244,6 +244,54 @@ class AutoNavigatorTests(unittest.TestCase):
         self.assertTrue(cleared, reason)
         self.assertFalse(self.mock_wheels.is_emergency_stopped)
 
+    def test_backtrack_recovery_when_rotation_blocked_on_both_sides(self):
+        self.mock_wheels.connect(port="MOCK_SIMULATOR")
+        self.navigator._running = True
+        self.navigator._stop_event.clear()
+        self.mapping_svc.trajectory = [
+            (0.0, 0.0),
+            (0.0, 0.3),
+            (0.0, 0.6),
+            (0.0, 0.9),
+        ]
+        self.mapping_svc.pose = RobotPose(x_m=0.0, y_m=0.9, theta_deg=0.0)
+        self.navigator.frontier_detector.find_frontiers = MagicMock(
+            return_value=[SimpleNamespace(centroid_world=(0.0, 1.5))]
+        )
+        self.navigator.path_planner.plan_path = MagicMock(return_value=None)
+        self.navigator.path_planner.last_failure_reason = "doorway_too_narrow"
+
+        # Simulate rotation blocked on both sides
+        def mock_collision(command):
+            if command in {"rotateLeft", "rotateRight"}:
+                return f"{command}:214mm@58.0deg"
+            return None
+
+        self.navigator._collision_reason = MagicMock(side_effect=mock_collision)
+
+        self.navigator._plan_next_frontier()
+
+        self.assertEqual(self.navigator.state, NavigationState.BACKTRACKING)
+        self.assertTrue(self.navigator.is_backtracking)
+        self.assertGreaterEqual(len(self.navigator.current_path), 2)
+        self.assertEqual(self.navigator.target_frontier, (0.0, 0.3))
+
+    def test_reverse_path_following_commands_backward(self):
+        self.mock_wheels.connect(port="MOCK_SIMULATOR")
+        self.mock_wheels.set_speed = MagicMock(return_value=True)
+        self.navigator._running = True
+        self.navigator.is_backtracking = True
+        self.navigator.state = NavigationState.BACKTRACKING
+        self.navigator.current_path = [(0.0, 0.9), (0.0, 0.4), (0.0, 0.0)]
+        self.navigator.current_waypoint_idx = 1
+        self.mapping_svc.pose = RobotPose(x_m=0.0, y_m=0.9, theta_deg=0.0)
+        self.navigator._collision_reason = MagicMock(return_value=None)
+
+        self.navigator._follow_path()
+
+        self.assertEqual(self.navigator._last_command, "backward")
+        self.mock_wheels.set_speed.assert_called_with(self.navigator.recovery_speed)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -161,7 +161,11 @@ class AppConfig:
     ).strip().lower() not in {"0", "false", "no", "off"}
 
     # Fail-closed autonomous navigation and measured physical footprint.
-    nav_drive_speed: int = int(os.getenv("NAV_DRIVE_SPEED", "120"))
+    nav_drive_speed: int = int(os.getenv("NAV_DRIVE_SPEED", "90"))
+    nav_recovery_speed: int = int(os.getenv("NAV_RECOVERY_SPEED", "80"))
+    nav_backtrack_distance_m: float = float(
+        os.getenv("NAV_BACKTRACK_DISTANCE_M", "0.60")
+    )
     nav_autonomy_enabled: bool = os.getenv(
         "NAV_AUTONOMY_ENABLED", "false"
     ).strip().lower() not in {"0", "false", "no", "off"}

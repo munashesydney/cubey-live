@@ -147,6 +147,8 @@ class MappingService:
             lidar_service=self.lidar_service,
             wheels_service=wheels_service,
             drive_speed=config.nav_drive_speed,
+            recovery_speed=config.nav_recovery_speed,
+            backtrack_distance_m=config.nav_backtrack_distance_m,
             safety_stop_dist_mm=config.lidar_safety_distance_mm,
             max_scan_age_s=config.nav_max_scan_age_s,
             max_wheel_telemetry_age_s=config.nav_max_wheel_telemetry_age_s,

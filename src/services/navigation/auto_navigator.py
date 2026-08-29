@@ -28,6 +28,7 @@ class NavigationState(str, enum.Enum):
     WAITING_FOR_SENSORS = "WAITING_FOR_SENSORS"
     PLANNING = "PLANNING"
     NAVIGATING = "NAVIGATING"
+    BACKTRACKING = "BACKTRACKING"
     RECOVERY = "RECOVERY"
     TELEOP_OVERRIDE = "TELEOP_OVERRIDE"
     COMPLETED = "COMPLETED"
@@ -55,7 +56,9 @@ class AutoNavigator:
         mapping_service,
         wheels_service: Optional[WheelsService] = None,
         lidar_service: Optional[LidarService] = None,
-        drive_speed: int = 120,
+        drive_speed: int = 90,
+        recovery_speed: int = 80,
+        backtrack_distance_m: float = 0.60,
         safety_stop_dist_mm: int = 350,
         waypoint_reach_dist_m: float = 0.12,
         max_scan_age_s: float = 0.35,
@@ -73,7 +76,9 @@ class AutoNavigator:
         self.wheels_service = wheels_service or get_wheels_service()
         self.lidar_service = lidar_service or get_lidar_service()
 
-        self.drive_speed = max(70, min(255, int(drive_speed)))
+        self.drive_speed = max(60, min(255, int(drive_speed)))
+        self.recovery_speed = max(60, min(255, int(recovery_speed)))
+        self.backtrack_distance_m = max(0.25, float(backtrack_distance_m))
         self.safety_stop_dist_m = max(0.20, safety_stop_dist_mm / 1000.0)
         self.safety_stop_dist_mm = int(self.safety_stop_dist_m * 1000)
         self.waypoint_reach_dist_m = waypoint_reach_dist_m
@@ -103,6 +108,7 @@ class AutoNavigator:
         self.current_path: List[Tuple[float, float]] = []
         self.current_waypoint_idx = 0
         self.target_frontier: Optional[Tuple[float, float]] = None
+        self.is_backtracking: bool = False
 
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -130,6 +136,7 @@ class AutoNavigator:
             NavigationState.WAITING_FOR_SENSORS,
             NavigationState.PLANNING,
             NavigationState.NAVIGATING,
+            NavigationState.BACKTRACKING,
             NavigationState.RECOVERY,
             NavigationState.TELEOP_OVERRIDE,
         }
@@ -139,6 +146,7 @@ class AutoNavigator:
         return {
             "state": self.state.value,
             "active": self.is_active,
+            "is_backtracking": self.is_backtracking,
             "fault_reason": self.fault_reason,
             "emergency_stopped": self.wheels_service.is_emergency_stopped,
             "sensor_healthy": healthy,
@@ -331,6 +339,7 @@ class AutoNavigator:
                     self._healthy_scan_streak = 0
                     if self.state in {
                         NavigationState.NAVIGATING,
+                        NavigationState.BACKTRACKING,
                         NavigationState.RECOVERY,
                         NavigationState.TELEOP_OVERRIDE,
                     }:
@@ -375,7 +384,7 @@ class AutoNavigator:
                 if self.state in {NavigationState.PLANNING, NavigationState.RECOVERY}:
                     if now >= self._replan_after:
                         self._plan_next_frontier()
-                elif self.state == NavigationState.NAVIGATING:
+                elif self.state in {NavigationState.NAVIGATING, NavigationState.BACKTRACKING}:
                     self._follow_path()
                 elif self.state == NavigationState.COMPLETED:
                     self.wheels_service.stop()
@@ -483,12 +492,15 @@ class AutoNavigator:
             self._block_target(self.target_frontier, duration_s=30.0)
         self.current_path.clear()
         self.current_waypoint_idx = 0
+        self.is_backtracking = False
         self.state = NavigationState.RECOVERY
         self._recovery_attempts += 1
         self._replan_after = time.monotonic() + 0.5
         self._heading_turn_started = 0.0
         logger.warning("Collision monitor stopped autonomous motion: %s", reason)
         if self._recovery_attempts > self.max_recovery_attempts:
+            if self._attempt_backtrack(f"recovery_limit_exceeded:{reason}"):
+                return
             self._set_fault(f"recovery_limit_exceeded:{reason}")
 
     # ------------------------------------------------------------------
@@ -507,6 +519,111 @@ class AutoNavigator:
             math.hypot(target[0] - x, target[1] - y) < 0.30
             for x, y, _ in self._blocked_targets
         )
+
+    def _find_safe_backtrack_pose(
+        self,
+    ) -> Optional[Tuple[Tuple[float, float], List[Tuple[float, float]]]]:
+        """
+        Scans recent historical poses along the robot's trajectory to find a
+        known-free waypoint with adequate rotational/safety clearance.
+        Returns ((target_x, target_y), path) or None if no safe retreat is available.
+        """
+        pose = self.mapping_service.pose
+        trajectory = list(self.mapping_service.trajectory)
+        if len(trajectory) < 2:
+            return None
+
+        grid = self.mapping_service.get_grid_copy()
+        inflated_mask = self.path_planner.inflate_obstacles(
+            grid, resolution_m=self.mapping_service.resolution_m
+        )
+
+        min_retreat_m = max(0.20, self.backtrack_distance_m * 0.4)
+        max_retreat_m = max(0.80, self.backtrack_distance_m * 2.5)
+
+        # Search recent trajectory points backwards
+        for tx, ty in reversed(trajectory[:-1]):
+            dist = math.hypot(tx - pose.x_m, ty - pose.y_m)
+            if dist < min_retreat_m:
+                continue
+            if dist > max_retreat_m:
+                break
+
+            gx, gy = self.mapping_service.world_to_grid(tx, ty)
+            if not self.mapping_service.is_inside_grid(gx, gy):
+                continue
+            if grid[gy, gx] != 0 or inflated_mask[gy, gx]:
+                continue
+
+            path = self.path_planner.plan_path(
+                grid=grid,
+                resolution_m=self.mapping_service.resolution_m,
+                origin_x_m=self.mapping_service.origin_x_m,
+                origin_y_m=self.mapping_service.origin_y_m,
+                start_world=(pose.x_m, pose.y_m),
+                goal_world=(tx, ty),
+            )
+            if path and len(path) >= 2:
+                return (tx, ty), path
+
+        # Fallback: extract downsampled breadcrumbs directly from trajectory
+        breadcrumb_path: List[Tuple[float, float]] = []
+        for tx, ty in reversed(trajectory):
+            dist = math.hypot(tx - pose.x_m, ty - pose.y_m)
+            if (
+                not breadcrumb_path
+                or math.hypot(
+                    tx - breadcrumb_path[-1][0], ty - breadcrumb_path[-1][1]
+                )
+                >= 0.08
+            ):
+                breadcrumb_path.append((tx, ty))
+            if dist >= self.backtrack_distance_m:
+                break
+
+        if len(breadcrumb_path) >= 2:
+            target = breadcrumb_path[-1]
+            return target, breadcrumb_path
+
+        return None
+
+    def _attempt_backtrack(self, trigger_reason: str) -> bool:
+        """
+        Attempts a planned breadcrumb retreat back to a safe open pose.
+        Returns True if backtrack navigation was successfully initiated.
+        """
+        backtrack = self._find_safe_backtrack_pose()
+        if not backtrack:
+            return False
+
+        target, path = backtrack
+        pose = self.mapping_service.pose
+
+        # Verify rear sector is not physically blocked before reversing
+        rear_block = self._collision_reason("backward")
+        if rear_block:
+            logger.warning("Backtrack rejected: rear collision risk (%s)", rear_block)
+            return False
+
+        # Quarantine current dead-end area
+        self._block_target((pose.x_m, pose.y_m), duration_s=45.0)
+
+        self.current_path = path
+        self.current_waypoint_idx = 0
+        self.target_frontier = target
+        self.is_backtracking = True
+        self.state = NavigationState.BACKTRACKING
+        self._last_progress_pose = (pose.x_m, pose.y_m, pose.theta_deg)
+        self._last_progress_time = time.monotonic()
+        self._heading_turn_started = 0.0
+        self.last_planning_rejection = ""
+        logger.info(
+            "Initiating breadcrumb backtrack (%s) to %s along %d waypoints",
+            trigger_reason,
+            target,
+            len(path),
+        )
+        return True
 
     def _plan_next_frontier(self) -> None:
         grid = self.mapping_service.get_grid_copy()
@@ -563,6 +680,7 @@ class AutoNavigator:
             self.current_path = path
             self.current_waypoint_idx = 0
             self.target_frontier = target
+            self.is_backtracking = False
             self.state = NavigationState.NAVIGATING
             self._last_progress_pose = (pose.x_m, pose.y_m, pose.theta_deg)
             self._last_progress_time = time.monotonic()
@@ -587,6 +705,10 @@ class AutoNavigator:
             self.last_planning_rejection = "all_frontier_targets_temporarily_blocked"
 
         if self._recovery_attempts >= self.max_recovery_attempts:
+            if self._attempt_backtrack(
+                f"recovery_limit_exceeded:{self.last_planning_rejection}"
+            ):
+                return
             self._set_fault(
                 "no_reachable_frontier_after_bounded_recovery:"
                 f"{self.last_planning_rejection}"
@@ -600,6 +722,10 @@ class AutoNavigator:
             opposite = "rotateLeft" if direction == "rotateRight" else "rotateRight"
             opposite_block = self._collision_reason(opposite)
             if opposite_block:
+                if self._attempt_backtrack(
+                    f"rotations_blocked:{rotation_block};{opposite_block}"
+                ):
+                    return
                 self._set_fault(
                     "recovery_rotation_blocked_both_directions:"
                     f"{rotation_block};{opposite_block}"
@@ -613,7 +739,7 @@ class AutoNavigator:
 
     def _bounded_rotation(self, direction: str, duration_s: float) -> None:
         self.state = NavigationState.RECOVERY
-        self.wheels_service.set_speed(min(self.drive_speed, 110))
+        self.wheels_service.set_speed(self.recovery_speed)
         if not self.wheels_service.move(direction):
             self._set_fault("recovery_motion_command_rejected")
             return
@@ -641,6 +767,7 @@ class AutoNavigator:
         if not self.current_path:
             self.wheels_service.stop()
             self._last_command = "stop"
+            self.is_backtracking = False
             self.state = NavigationState.PLANNING
             return
 
@@ -662,10 +789,16 @@ class AutoNavigator:
             if self.target_frontier:
                 self._block_target(self.target_frontier)
             self.current_path.clear()
+            was_backtracking = self.is_backtracking
+            self.is_backtracking = False
             self.state = NavigationState.RECOVERY
             self._recovery_attempts += 1
             self._replan_after = now + 0.5
             if self._recovery_attempts > self.max_recovery_attempts:
+                if not was_backtracking and self._attempt_backtrack(
+                    "progress_timeout_exhausted"
+                ):
+                    return
                 self._set_fault("robot_not_making_progress")
             return
 
@@ -680,10 +813,11 @@ class AutoNavigator:
         if math.hypot(final_x - pose.x_m, final_y - pose.y_m) < self.waypoint_reach_dist_m:
             self.wheels_service.stop()
             self._last_command = "stop"
-            if self.target_frontier:
+            if self.target_frontier and not self.is_backtracking:
                 self._block_target(self.target_frontier, duration_s=15.0)
             self.current_path.clear()
             self.target_frontier = None
+            self.is_backtracking = False
             self.state = NavigationState.PLANNING
             self._recovery_attempts = 0
             self._replan_after = now + 0.2
@@ -693,35 +827,68 @@ class AutoNavigator:
         target_heading_deg = math.degrees(
             math.atan2(target_x - pose.x_m, target_y - pose.y_m)
         ) % 360.0
-        heading_error = (target_heading_deg - pose.theta_deg + 180.0) % 360.0 - 180.0
 
-        if abs(heading_error) > 55.0:
-            command = "rotateRight" if heading_error > 0 else "rotateLeft"
-            if self._heading_turn_started == 0.0:
-                self._heading_turn_started = now
-            elif now - self._heading_turn_started > self.max_rotation_s:
-                self.wheels_service.stop()
-                self._last_command = "stop"
-                if self.target_frontier:
-                    self._block_target(self.target_frontier)
-                self.current_path.clear()
-                self.state = NavigationState.RECOVERY
-                self._recovery_attempts += 1
-                self._replan_after = now + 0.5
-                return
-        elif abs(heading_error) > 18.0:
-            command = "forwardRight" if heading_error > 0 else "forwardLeft"
-            self._heading_turn_started = 0.0
+        if self.is_backtracking:
+            # Reversing into waypoints without rotating 180 deg
+            # Rear facing direction in world coordinates is (pose.theta_deg + 180.0)
+            reverse_heading_error = (
+                target_heading_deg - (pose.theta_deg + 180.0) + 180.0
+            ) % 360.0 - 180.0
+
+            if abs(reverse_heading_error) > 55.0:
+                rot_dir = "rotateRight" if reverse_heading_error > 0 else "rotateLeft"
+                if not self._collision_reason(rot_dir):
+                    command = rot_dir
+                    if self._heading_turn_started == 0.0:
+                        self._heading_turn_started = now
+                    elif now - self._heading_turn_started > self.max_rotation_s:
+                        self.wheels_service.stop()
+                        self._last_command = "stop"
+                        self.current_path.clear()
+                        self.is_backtracking = False
+                        self.state = NavigationState.RECOVERY
+                        self._recovery_attempts += 1
+                        self._replan_after = now + 0.5
+                        return
+                else:
+                    command = "strafeRight" if reverse_heading_error < 0 else "strafeLeft"
+                    self._heading_turn_started = 0.0
+            elif abs(reverse_heading_error) > 18.0:
+                command = "backwardRight" if reverse_heading_error < 0 else "backwardLeft"
+                self._heading_turn_started = 0.0
+            else:
+                command = "backward"
+                self._heading_turn_started = 0.0
         else:
-            command = "forward"
-            self._heading_turn_started = 0.0
+            heading_error = (target_heading_deg - pose.theta_deg + 180.0) % 360.0 - 180.0
+            if abs(heading_error) > 55.0:
+                command = "rotateRight" if heading_error > 0 else "rotateLeft"
+                if self._heading_turn_started == 0.0:
+                    self._heading_turn_started = now
+                elif now - self._heading_turn_started > self.max_rotation_s:
+                    self.wheels_service.stop()
+                    self._last_command = "stop"
+                    if self.target_frontier:
+                        self._block_target(self.target_frontier)
+                    self.current_path.clear()
+                    self.state = NavigationState.RECOVERY
+                    self._recovery_attempts += 1
+                    self._replan_after = now + 0.5
+                    return
+            elif abs(heading_error) > 18.0:
+                command = "forwardRight" if heading_error > 0 else "forwardLeft"
+                self._heading_turn_started = 0.0
+            else:
+                command = "forward"
+                self._heading_turn_started = 0.0
 
         collision = self._collision_reason(command)
         if collision:
             self._handle_obstacle(collision)
             return
 
-        self.wheels_service.set_speed(self.drive_speed)
+        speed = self.recovery_speed if self.is_backtracking else self.drive_speed
+        self.wheels_service.set_speed(speed)
         if not self.wheels_service.move(command):
             if self.wheels_service.is_emergency_stopped:
                 self.state = NavigationState.E_STOPPED
