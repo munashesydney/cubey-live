@@ -243,6 +243,7 @@ class MappingService:
     def reset_map(self) -> None:
         """Clear grid back to unexplored space, reset robot pose, and stop autonomous navigation."""
         self.navigator.stop()
+        self.navigator.clear_local_hazards()
         with self._lock:
             self._log_odds.fill(0.0)
             self._grid.fill(-1)
@@ -835,6 +836,10 @@ class MappingService:
         map_obj = get_map(map_id)
         if not map_obj:
             return False
+
+        # Local collision memory is expressed in the current map's world
+        # frame and must never leak into a newly loaded map.
+        self.navigator.clear_local_hazards()
 
         with self._lock:
             decompressed = zlib.decompress(map_obj.grid_data)

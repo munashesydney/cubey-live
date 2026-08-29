@@ -45,6 +45,8 @@ class WebServerApiTests(unittest.TestCase):
         self.assertIn("mapping", data)
         self.assertIn("localization", data["mapping"])
         self.assertIn("reason", data["mapping"]["localization"])
+        self.assertIn("active_local_hazards", data["mapping"]["navigation"])
+        self.assertIn("last_local_hazard", data["mapping"]["navigation"])
 
     def test_maps_list_and_save(self):
         res = self.client.get("/api/maps", auth=self.auth)

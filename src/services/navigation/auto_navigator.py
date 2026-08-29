@@ -11,6 +11,7 @@ import logging
 import math
 import threading
 import time
+from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
 
 import numpy as np
@@ -21,6 +22,19 @@ from src.services.navigation.path_planner import PathPlanner
 from src.services.wheels_service import WheelsService, get_wheels_service
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class LocalHazard:
+    """Short-lived world-frame memory of a live collision-monitor hit."""
+
+    x_m: float
+    y_m: float
+    first_seen_at: float
+    last_seen_at: float
+    expires_at: float
+    hit_count: int
+    last_reason: str
 
 
 class NavigationState(str, enum.Enum):
@@ -121,6 +135,12 @@ class AutoNavigator:
         self._recovery_attempts = 0
         self._replan_after = 0.0
         self._blocked_targets: List[Tuple[float, float, float]] = []
+        self._local_hazards: List[LocalHazard] = []
+        self._local_hazard_ttl_s = 90.0
+        self._local_hazard_merge_radius_m = 0.25
+        self._local_hazard_stamp_radius_m = 0.08
+        self._last_collision_point: Optional[LidarPoint] = None
+        self._last_collision_reason = ""
         self._last_command = "stop"
         self._last_progress_pose: Optional[Tuple[float, float, float]] = None
         self._last_progress_time = 0.0
@@ -144,6 +164,12 @@ class AutoNavigator:
 
     def status(self) -> dict:
         healthy, health_reason = self._sensor_health()
+        hazards = self._active_local_hazards()
+        last_hazard = (
+            max(hazards, key=lambda hazard: hazard.last_seen_at)
+            if hazards
+            else None
+        )
         return {
             "state": self.state.value,
             "active": self.is_active,
@@ -156,6 +182,20 @@ class AutoNavigator:
             "last_safety_rejection": self.last_safety_rejection,
             "last_safety_rejection_at": self.last_safety_rejection_at,
             "last_planning_rejection": self.last_planning_rejection,
+            "active_local_hazards": len(hazards),
+            "last_local_hazard": (
+                {
+                    "x_m": round(last_hazard.x_m, 3),
+                    "y_m": round(last_hazard.y_m, 3),
+                    "hit_count": last_hazard.hit_count,
+                    "expires_in_s": round(
+                        max(0.0, last_hazard.expires_at - time.monotonic()), 1
+                    ),
+                    "reason": last_hazard.last_reason,
+                }
+                if last_hazard
+                else None
+            ),
             "self_masked_lidar_points": sum(
                 1
                 for point in self.lidar_service.latest_scan.points
@@ -459,6 +499,8 @@ class AutoNavigator:
 
     def _collision_reason(self, command: str) -> Optional[str]:
         if command == "stop":
+            self._last_collision_point = None
+            self._last_collision_reason = ""
             return None
 
         danger_points: List[LidarPoint] = []
@@ -503,14 +545,20 @@ class AutoNavigator:
                     danger_points.append(point)
 
         if not danger_points:
+            self._last_collision_point = None
+            self._last_collision_reason = ""
             return None
         closest = min(danger_points, key=lambda point: point.distance_mm)
-        return f"{command}:{closest.distance_mm:.0f}mm@{closest.angle_deg:.1f}deg"
+        reason = f"{command}:{closest.distance_mm:.0f}mm@{closest.angle_deg:.1f}deg"
+        self._last_collision_point = closest
+        self._last_collision_reason = reason
+        return reason
 
     def _handle_obstacle(self, reason: str) -> None:
         self.wheels_service.stop()
         self._last_command = "stop"
         was_backtracking = self.is_backtracking
+        hazard = self._remember_last_collision_hazard(reason)
         if self.target_frontier:
             self._block_target(self.target_frontier, duration_s=30.0)
         self.current_path.clear()
@@ -521,6 +569,13 @@ class AutoNavigator:
         self._replan_after = time.monotonic() + 0.5
         self._heading_turn_started = 0.0
         logger.warning("Collision monitor stopped autonomous motion: %s", reason)
+        if (
+            hazard is not None
+            and hazard.hit_count >= 2
+            and not was_backtracking
+            and self._attempt_backtrack(f"repeated_local_hazard:{reason}")
+        ):
+            return
         if self._recovery_attempts > self.max_recovery_attempts:
             if not was_backtracking and self._attempt_backtrack(
                 f"recovery_limit_exceeded:{reason}"
@@ -548,6 +603,112 @@ class AutoNavigator:
             for x, y, _ in self._blocked_targets
         )
 
+    def _active_local_hazards(self) -> List[LocalHazard]:
+        """Return unexpired collision hazards and discard stale entries."""
+        now = time.monotonic()
+        with self._lock:
+            self._local_hazards = [
+                hazard
+                for hazard in self._local_hazards
+                if hazard.expires_at > now
+            ]
+            return list(self._local_hazards)
+
+    def clear_local_hazards(self) -> None:
+        """Discard run-local obstacle memory after the map frame is reset."""
+        with self._lock:
+            self._local_hazards.clear()
+            self._last_collision_point = None
+            self._last_collision_reason = ""
+
+    def _remember_last_collision_hazard(
+        self, reason: str
+    ) -> Optional[LocalHazard]:
+        """Project the matching live LiDAR rejection into the world frame."""
+        with self._lock:
+            if (
+                self._last_collision_point is None
+                or self._last_collision_reason != reason
+            ):
+                return None
+            point = self._last_collision_point
+        pose = self.mapping_service.pose
+        theta_rad = math.radians(pose.theta_deg)
+        cos_theta = math.cos(theta_rad)
+        sin_theta = math.sin(theta_rad)
+        world_x = pose.x_m + point.x_m * cos_theta + point.y_m * sin_theta
+        world_y = pose.y_m - point.x_m * sin_theta + point.y_m * cos_theta
+        now = time.monotonic()
+
+        with self._lock:
+            self._local_hazards = [
+                hazard
+                for hazard in self._local_hazards
+                if hazard.expires_at > now
+            ]
+            nearby = next(
+                (
+                    hazard
+                    for hazard in self._local_hazards
+                    if math.hypot(hazard.x_m - world_x, hazard.y_m - world_y)
+                    <= self._local_hazard_merge_radius_m
+                ),
+                None,
+            )
+            if nearby is None:
+                nearby = LocalHazard(
+                    x_m=world_x,
+                    y_m=world_y,
+                    first_seen_at=now,
+                    last_seen_at=now,
+                    expires_at=now + self._local_hazard_ttl_s,
+                    hit_count=1,
+                    last_reason=reason,
+                )
+                self._local_hazards.append(nearby)
+            else:
+                # Smooth repeated edge samples without letting one noisy sweep
+                # relocate the keep-out region.
+                sample_weight = 1.0 / min(nearby.hit_count + 1, 4)
+                nearby.x_m += (world_x - nearby.x_m) * sample_weight
+                nearby.y_m += (world_y - nearby.y_m) * sample_weight
+                nearby.hit_count += 1
+                nearby.last_seen_at = now
+                nearby.expires_at = now + self._local_hazard_ttl_s
+                nearby.last_reason = reason
+
+            logger.warning(
+                "Remembering local collision hazard at (%.2f, %.2f), hits=%d, ttl=%.0fs",
+                nearby.x_m,
+                nearby.y_m,
+                nearby.hit_count,
+                self._local_hazard_ttl_s,
+            )
+            return nearby
+
+    def _planning_grid_with_local_hazards(self) -> np.ndarray:
+        """Overlay transient collision memory without corrupting the saved map."""
+        grid = self.mapping_service.get_grid_copy()
+        resolution_m = self.mapping_service.resolution_m
+        stamp_cells = max(
+            1, int(math.ceil(self._local_hazard_stamp_radius_m / resolution_m))
+        )
+        stamp_radius_sq = self._local_hazard_stamp_radius_m ** 2
+
+        for hazard in self._active_local_hazards():
+            center_x, center_y = self.mapping_service.world_to_grid(
+                hazard.x_m, hazard.y_m
+            )
+            for gy in range(center_y - stamp_cells, center_y + stamp_cells + 1):
+                for gx in range(center_x - stamp_cells, center_x + stamp_cells + 1):
+                    if not self.mapping_service.is_inside_grid(gx, gy):
+                        continue
+                    dx_m = (gx - center_x) * resolution_m
+                    dy_m = (gy - center_y) * resolution_m
+                    if dx_m ** 2 + dy_m ** 2 <= stamp_radius_sq:
+                        grid[gy, gx] = 100
+        return grid
+
     def _find_safe_backtrack_pose(
         self,
     ) -> Optional[Tuple[Tuple[float, float], List[Tuple[float, float]]]]:
@@ -561,7 +722,7 @@ class AutoNavigator:
         if len(trajectory) < 2:
             return None
 
-        grid = self.mapping_service.get_grid_copy()
+        grid = self._planning_grid_with_local_hazards()
         inflated_mask = self.path_planner.inflate_obstacles(
             grid, resolution_m=self.mapping_service.resolution_m
         )
@@ -648,7 +809,7 @@ class AutoNavigator:
         return True
 
     def _plan_next_frontier(self) -> None:
-        grid = self.mapping_service.get_grid_copy()
+        grid = self._planning_grid_with_local_hazards()
         pose = self.mapping_service.pose
         frontiers = self.frontier_detector.find_frontiers(
             grid=grid,

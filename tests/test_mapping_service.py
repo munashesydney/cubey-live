@@ -52,6 +52,21 @@ class MappingServiceTests(unittest.TestCase):
         self.assertEqual(self.mapping_svc.pose.x_m, 0.0)
         self.assertEqual(self.mapping_svc.pose.y_m, 0.0)
 
+    def test_map_reset_clears_transient_navigation_hazards(self):
+        wall = LidarPoint(angle_deg=0.0, distance_mm=240.0, quality=60)
+        self.mock_lidar.latest_scan = LidarScanData(points=[wall])
+        reason = self.mapping_svc.navigator._collision_reason("forward")
+        self.mapping_svc.navigator._handle_obstacle(reason)
+        self.assertEqual(
+            self.mapping_svc.navigator.status()["active_local_hazards"], 1
+        )
+
+        self.mapping_svc.reset_map()
+
+        self.assertEqual(
+            self.mapping_svc.navigator.status()["active_local_hazards"], 0
+        )
+
     def test_mapping_only_mode_does_not_start_autonomy(self):
         mapping_only = MappingService(
             width=100,

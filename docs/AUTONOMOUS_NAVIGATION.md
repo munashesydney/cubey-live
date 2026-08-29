@@ -8,6 +8,14 @@ telemetry, it monitors the complete commanded-motion corridor, bounds every
 recovery rotation, detects lack of pose progress, and faults instead of retrying
 forever.
 
+When the live collision monitor rejects a route, the in-repository navigator
+also keeps the physical hit location in a transient local keep-out layer for 90
+seconds. This prevents an intermittent low or thin obstacle from disappearing
+on the next occupancy-grid update and attracting a slightly shifted frontier.
+A second hit in the same area requests an immediate validated breadcrumb
+retreat. This memory is not written into saved maps and is cleared on map reset
+or load.
+
 Autonomous motion is disabled by default. `NAV_AUTONOMY_ENABLED=true` may only
 be set after the following commissioning checks pass; mapping-only mode does
 not require it.

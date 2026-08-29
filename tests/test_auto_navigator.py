@@ -76,6 +76,51 @@ class AutoNavigatorTests(unittest.TestCase):
         self.assertIsNotNone(reason)
         self.assertIn("220mm", reason)
 
+    def test_collision_hit_is_retained_as_temporary_planning_hazard(self):
+        self.mapping_svc._grid.fill(0)
+        wall = LidarPoint(angle_deg=0.0, distance_mm=240.0, quality=60)
+        self.mock_lidar.latest_scan = LidarScanData(points=[wall])
+
+        reason = self.navigator._collision_reason("forward")
+        self.navigator._handle_obstacle(reason)
+
+        planning_grid = self.navigator._planning_grid_with_local_hazards()
+        hit_gx, hit_gy = self.mapping_svc.world_to_grid(0.0, 0.24)
+        self.assertEqual(planning_grid[hit_gy, hit_gx], 100)
+        status = self.navigator.status()
+        self.assertEqual(status["active_local_hazards"], 1)
+        self.assertEqual(status["last_local_hazard"]["hit_count"], 1)
+
+    def test_repeated_collision_at_same_place_triggers_early_backtrack(self):
+        wall = LidarPoint(angle_deg=0.0, distance_mm=240.0, quality=60)
+        self.mock_lidar.latest_scan = LidarScanData(points=[wall])
+        self.navigator._attempt_backtrack = MagicMock(return_value=True)
+
+        first_reason = self.navigator._collision_reason("forward")
+        self.navigator._handle_obstacle(first_reason)
+        second_reason = self.navigator._collision_reason("forward")
+        self.navigator._handle_obstacle(second_reason)
+
+        self.navigator._attempt_backtrack.assert_called_once_with(
+            f"repeated_local_hazard:{second_reason}"
+        )
+        self.assertEqual(
+            self.navigator.status()["last_local_hazard"]["hit_count"], 2
+        )
+
+    def test_expired_local_collision_hazard_is_removed_from_planning(self):
+        self.mapping_svc._grid.fill(0)
+        wall = LidarPoint(angle_deg=0.0, distance_mm=240.0, quality=60)
+        self.mock_lidar.latest_scan = LidarScanData(points=[wall])
+        reason = self.navigator._collision_reason("forward")
+        self.navigator._handle_obstacle(reason)
+        self.navigator._local_hazards[0].expires_at = time.monotonic() - 1.0
+
+        planning_grid = self.navigator._planning_grid_with_local_hazards()
+
+        self.assertEqual(int(np.count_nonzero(planning_grid == 100)), 0)
+        self.assertEqual(self.navigator.status()["active_local_hazards"], 0)
+
     def test_chassis_reflection_does_not_block_any_motion(self):
         # Exact signature observed on Cubey: 56-58 mm around zero degrees.
         reflection = LidarPoint(angle_deg=351.4, distance_mm=56.0, quality=60)
