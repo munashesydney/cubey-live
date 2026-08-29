@@ -166,7 +166,7 @@ class RosBridgeService:
             {
                 "op": "call_service",
                 "id": "cubey-clear-slam",
-                "service": "/slam_toolbox/clear",
+                "service": "/slam_toolbox/reset",
                 "args": {},
             }
         )
