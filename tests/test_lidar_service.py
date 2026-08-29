@@ -88,6 +88,26 @@ class LidarServiceTests(unittest.TestCase):
         self.assertIsNotNone(metrics.closest_point)
         self.assertEqual(metrics.closest_point.distance_mm, 280.0)
 
+    def test_close_wall_is_not_discarded(self):
+        metrics = LidarService._compute_scan_metrics(
+            [LidarPoint(angle_deg=0.0, distance_mm=100.0, quality=60)],
+            scan_rate_hz=10.0,
+            sample_rate_hz=1000.0,
+        )
+
+        self.assertEqual(metrics.min_front_dist_mm, 100)
+
+    def test_scan_health_fails_closed_for_stale_or_empty_data(self):
+        service = LidarService(default_port="MOCK_SIMULATOR")
+        service._is_connected = True
+        service._is_scanning = True
+        service.latest_scan = LidarScanData(timestamp=time.time() - 1.0)
+
+        healthy, reason = service.scan_health(max_age_s=0.2)
+
+        self.assertFalse(healthy)
+        self.assertIn("stale", reason)
+
     def test_mock_radar_stream_emission(self):
         received_scans = []
         self.service.on_scan_data = lambda scan: received_scans.append(scan)

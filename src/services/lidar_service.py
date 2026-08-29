@@ -108,12 +108,16 @@ class LidarService:
         self,
         default_port: Optional[str] = None,
         default_baudrate: int = DEFAULT_BAUDRATE,
+        min_valid_distance_mm: int = 30,
+        mount_yaw_deg: float = 0.0,
         on_scan_data: Optional[Callable[[LidarScanData], None]] = None,
         on_log: Optional[Callable[[str], None]] = None,
         on_connection_change: Optional[Callable[[bool, str], None]] = None,
     ):
         self.port: str = default_port or self._get_default_port_for_platform()
         self.baudrate: int = default_baudrate
+        self.min_valid_distance_mm = max(1, int(min_valid_distance_mm))
+        self.mount_yaw_deg = float(mount_yaw_deg) % 360.0
 
         self.on_scan_data = on_scan_data
         self.on_log = on_log
@@ -187,6 +191,33 @@ class LidarService:
     @property
     def is_mock(self) -> bool:
         return self._is_mock
+
+    def scan_health(
+        self,
+        *,
+        max_age_s: float = 0.35,
+        min_points: int = 30,
+        min_scan_rate_hz: float = 2.0,
+        now: Optional[float] = None,
+    ) -> Tuple[bool, str]:
+        """Return fail-closed scan-stream health and a diagnostic reason."""
+        if not self._is_connected:
+            return False, "lidar_disconnected"
+        if not self._is_scanning:
+            return False, "lidar_not_scanning"
+
+        scan = self.latest_scan
+        check_time = time.time() if now is None else now
+        age_s = max(0.0, check_time - scan.timestamp)
+        if age_s > max_age_s:
+            return False, f"lidar_scan_stale:{age_s:.3f}s"
+        if scan.point_count < min_points:
+            return False, f"lidar_too_few_points:{scan.point_count}"
+        if scan.scan_rate_hz < min_scan_rate_hz:
+            return False, f"lidar_scan_rate_low:{scan.scan_rate_hz:.1f}Hz"
+        if scan.health_status != "OK":
+            return False, f"lidar_health:{scan.health_status}"
+        return True, "ok"
 
     # ------------------------------------------------------------------
     # Connection Management
@@ -487,7 +518,10 @@ class LidarService:
 
     @staticmethod
     def _compute_scan_metrics(
-        points: List[LidarPoint], scan_rate_hz: float, sample_rate_hz: float
+        points: List[LidarPoint],
+        scan_rate_hz: float,
+        sample_rate_hz: float,
+        min_valid_distance_mm: int = 30,
     ) -> LidarScanData:
         """
         Calculates cardinal 4-sector proximity distances and locates the closest obstacle.
@@ -506,8 +540,11 @@ class LidarService:
 
         for pt in points:
             dist = pt.distance_mm
-            # Filter out robot chassis reflections (< 170mm) and out-of-range (> 16000mm)
-            if dist < 170 or dist > 16000:
+            # Never use a broad near-field exclusion here. It made real walls
+            # disappear once they were close enough to be most dangerous.
+            # Platform self-reflections must be removed with a calibrated
+            # footprint filter at the collision-monitor layer.
+            if dist < min_valid_distance_mm or dist > 16000:
                 continue
 
             angle = pt.angle_deg
@@ -615,7 +652,10 @@ class LidarService:
                         window_start_time = now
 
                     scan_data = self._compute_scan_metrics(
-                        accumulated_points, scan_rate_hz, sample_rate_hz
+                        accumulated_points,
+                        scan_rate_hz,
+                        sample_rate_hz,
+                        self.min_valid_distance_mm,
                     )
                     self.latest_scan = scan_data
 
@@ -630,7 +670,7 @@ class LidarService:
                 if distance_mm > 0:
                     accumulated_points.append(
                         LidarPoint(
-                            angle_deg=angle_deg,
+                            angle_deg=(angle_deg + self.mount_yaw_deg) % 360.0,
                             distance_mm=distance_mm,
                             quality=quality,
                         )
@@ -784,9 +824,17 @@ def get_lidar_service() -> LidarService:
     """Get or instantiate the global shared LidarService singleton."""
     global _SHARED_LIDAR_SERVICE
     if _SHARED_LIDAR_SERVICE is None:
-        _SHARED_LIDAR_SERVICE = LidarService()
-        try:
-            _SHARED_LIDAR_SERVICE.connect()
-        except Exception as e:
-            logger.warning("Auto-connection for LidarService deferred: %s", e)
+        from src.config import config
+
+        _SHARED_LIDAR_SERVICE = LidarService(
+            default_port=config.lidar_port or None,
+            default_baudrate=config.lidar_baudrate,
+            min_valid_distance_mm=config.lidar_min_valid_distance_mm,
+            mount_yaw_deg=config.lidar_mount_yaw_deg,
+        )
+        if config.lidar_auto_connect:
+            try:
+                _SHARED_LIDAR_SERVICE.connect()
+            except Exception as e:
+                logger.warning("Auto-connection for LidarService deferred: %s", e)
     return _SHARED_LIDAR_SERVICE

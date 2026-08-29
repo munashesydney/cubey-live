@@ -81,10 +81,19 @@ class PathPlanner:
         goal_gy = max(0, min(height - 1, goal_gy))
 
         inflated_mask = self.inflate_obstacles(grid, resolution_m)
+        # Planning and smoothing must share the same traversability contract.
+        # Unknown cells are not collision-free merely because they do not yet
+        # contain an obstacle observation.
+        blocked_mask = inflated_mask | (grid != 0)
+
+        # A path from an unknown/occupied start is not safe to execute.  Do not
+        # silently clamp or tunnel out of a bad localization estimate.
+        if blocked_mask[start_gy, start_gx]:
+            return None
 
         # If goal is inside an inflated obstacle, find closest free cell
-        if inflated_mask[goal_gy, goal_gx]:
-            closest_free = self._find_nearest_free_cell(inflated_mask, goal_gx, goal_gy)
+        if blocked_mask[goal_gy, goal_gx]:
+            closest_free = self._find_nearest_free_cell(blocked_mask, goal_gx, goal_gy)
             if not closest_free:
                 return None
             goal_gx, goal_gy = closest_free
@@ -129,12 +138,12 @@ class PathPlanner:
                     continue
 
                 # Collision / Unexplored check: must not be in inflated obstacle and must be free (0)
-                if inflated_mask[ny, nx] or grid[ny, nx] != 0:
+                if blocked_mask[ny, nx]:
                     continue
 
                 # Diagonal corner-cutting check
                 if dx != 0 and dy != 0:
-                    if inflated_mask[cy, nx] or inflated_mask[ny, cx]:
+                    if blocked_mask[cy, nx] or blocked_mask[ny, cx]:
                         continue
 
                 tentative_g = current_g + move_cost
@@ -159,7 +168,7 @@ class PathPlanner:
         grid_path.reverse()
 
         # Smooth path using Line-of-Sight simplification
-        smoothed_grid_path = self._smooth_path(grid_path, inflated_mask)
+        smoothed_grid_path = self._smooth_path(grid_path, blocked_mask)
 
         # Convert to real-world metric coordinates
         world_path = [

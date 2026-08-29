@@ -21,6 +21,7 @@ class MappingServiceTests(unittest.TestCase):
             height=100,
             resolution_m=0.05,
             lidar_service=self.mock_lidar,
+            autonomy_enabled=True,
         )
 
     def tearDown(self):
@@ -49,6 +50,22 @@ class MappingServiceTests(unittest.TestCase):
         self.mapping_svc.reset_map()
         self.assertEqual(self.mapping_svc.pose.x_m, 0.0)
         self.assertEqual(self.mapping_svc.pose.y_m, 0.0)
+
+    def test_mapping_only_mode_does_not_start_autonomy(self):
+        mapping_only = MappingService(
+            width=100,
+            height=100,
+            resolution_m=0.05,
+            lidar_service=self.mock_lidar,
+            autonomy_enabled=False,
+        )
+
+        autonomous_started = mapping_only.start_mapping()
+
+        self.assertFalse(autonomous_started)
+        self.assertTrue(mapping_only.is_mapping)
+        self.assertFalse(mapping_only.navigator.is_active)
+        mapping_only.pause_mapping()
 
     def test_raycasting_marks_free_and_occupied(self):
         # Single point 1.0 meter straight ahead (North: angle=0°)

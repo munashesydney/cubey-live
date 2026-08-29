@@ -120,6 +120,10 @@ async def get_system_status(_: str = Depends(verify_credentials)):
             "is_charging": wheels_svc.telemetry.is_charging,
         },
         "motion": wheels_svc.telemetry.motion,
+        "emergency_stop": {
+            "latched": wheels_svc.is_emergency_stopped,
+            "reason": wheels_svc.emergency_stop_reason,
+        },
         "lidar": {
             "is_connected": lidar_svc.is_connected,
             "is_scanning": lidar_svc.is_scanning,
@@ -129,10 +133,12 @@ async def get_system_status(_: str = Depends(verify_credentials)):
         },
         "mapping": {
             "is_mapping": mapping_svc.is_mapping,
+            "autonomy_enabled": mapping_svc.autonomy_enabled,
             "map_name": mapping_svc.map_name,
             "active_map_id": mapping_svc.active_map_id,
             "explored_cells": snapshot.total_explored_cells,
             "pose": snapshot.pose.to_dict(),
+            "navigation": mapping_svc.navigator.status(),
         },
     }
 
@@ -191,8 +197,13 @@ async def delete_saved_map(map_id: int, _: str = Depends(verify_credentials)):
 async def start_mapping_session(_: str = Depends(verify_credentials)):
     """Start active 2D occupancy grid updates."""
     mapping_svc = get_mapping_service()
-    mapping_svc.start_mapping()
-    return {"status": "mapping_started"}
+    autonomous_started = mapping_svc.start_mapping()
+    return {
+        "status": "mapping_started",
+        "autonomous_started": autonomous_started,
+        "autonomy_enabled": mapping_svc.autonomy_enabled,
+        "navigation": mapping_svc.navigator.status(),
+    }
 
 
 @app.post("/api/mapping/pause")
@@ -217,9 +228,18 @@ async def send_drive_command(req: DriveCommandRequest, _: str = Depends(verify_c
     wheels_svc = get_wheels_service()
     if not wheels_svc.is_connected:
         wheels_svc.connect()
+    if wheels_svc.is_emergency_stopped and req.action != "stop":
+        raise HTTPException(
+            status_code=423,
+            detail=f"Emergency stop is latched: {wheels_svc.emergency_stop_reason}",
+        )
+
+    mapping_svc = get_mapping_service()
+    safe, safety_reason = mapping_svc.navigator.authorize_manual_motion(req.action)
+    if not safe:
+        raise HTTPException(status_code=409, detail=safety_reason)
 
     # Yield autonomous exploration to manual teleoperation
-    mapping_svc = get_mapping_service()
     if hasattr(mapping_svc, "navigator"):
         mapping_svc.navigator.yield_to_teleop(3.0)
 
@@ -236,22 +256,35 @@ async def send_drive_command(req: DriveCommandRequest, _: str = Depends(verify_c
     )
 
     if req.action == "stop":
-        wheels_svc.stop()
+        sent = wheels_svc.stop()
     elif req.continuous:
-        wheels_svc.start_continuous(req.action)
+        sent = wheels_svc.start_continuous(req.action)
     else:
-        wheels_svc.pulse(req.action, req.duration_ms or 250)
+        sent = wheels_svc.pulse(req.action, req.duration_ms or 250)
+
+    if not sent:
+        raise HTTPException(status_code=503, detail="Wheel command was rejected")
 
     return {"status": "command_sent", "action": req.action, "connected": wheels_svc.is_connected}
 
 
 @app.post("/api/control/stop")
 async def stop_all_motors(_: str = Depends(verify_credentials)):
-    """Emergency stop for motors."""
-    wheels_svc = get_wheels_service()
+    """Latch emergency stop across navigator, host service, and ESP32."""
+    mapping_svc = get_mapping_service()
     logger.info("HTTP Drive CMD: Emergency STOP")
-    wheels_svc.stop()
-    return {"status": "stopped"}
+    mapping_svc.navigator.emergency_stop("operator_http_estop")
+    return {"status": "emergency_stopped", "latched": True}
+
+
+@app.post("/api/control/estop/reset")
+async def reset_emergency_stop(_: str = Depends(verify_credentials)):
+    """Explicitly re-arm motion after all safety preconditions pass."""
+    navigator = get_mapping_service().navigator
+    cleared, reason = navigator.clear_emergency_stop()
+    if not cleared:
+        raise HTTPException(status_code=409, detail=reason)
+    return {"status": "emergency_stop_cleared", "latched": False}
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +390,7 @@ async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(
                     "origin_x_m": snapshot.origin_x_m,
                     "origin_y_m": snapshot.origin_y_m,
                     "is_mapping": snapshot.is_mapping,
+                    "autonomy_enabled": mapping_svc.autonomy_enabled,
                     "map_name": snapshot.map_name,
                     "battery_pct": wheels_svc.telemetry.battery_pct,
                     "motion": wheels_svc.telemetry.motion,
@@ -364,6 +398,7 @@ async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(
                     "planned_path": snapshot.planned_path,
                     "target_frontier": snapshot.target_frontier,
                     "nav_state": mapping_svc.navigator.state.value if hasattr(mapping_svc, "navigator") else "IDLE",
+                    "nav_status": mapping_svc.navigator.status() if hasattr(mapping_svc, "navigator") else {},
                     "timestamp": snapshot.timestamp,
                 }
                 await websocket.send_json(payload)
@@ -383,6 +418,10 @@ async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(
                 speed = msg.get("speed", 180)
                 if not wheels_svc.is_connected:
                     wheels_svc.connect()
+                safe, safety_reason = mapping_svc.navigator.authorize_manual_motion(action)
+                if not safe:
+                    await websocket.send_json({"type": "command_rejected", "reason": safety_reason})
+                    continue
                 wheels_svc.set_speed(speed)
 
                 if hasattr(mapping_svc, "navigator"):
@@ -399,13 +438,19 @@ async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(
                 if action == "stop":
                     wheels_svc.stop()
                 elif msg.get("continuous", False):
-                    wheels_svc.start_continuous(action)
+                    if not wheels_svc.start_continuous(action):
+                        await websocket.send_json({"type": "command_rejected", "reason": wheels_svc.emergency_stop_reason})
                 else:
-                    wheels_svc.pulse(action, msg.get("duration_ms", 250))
+                    if not wheels_svc.pulse(action, msg.get("duration_ms", 250)):
+                        await websocket.send_json({"type": "command_rejected", "reason": wheels_svc.emergency_stop_reason})
 
             elif mtype == "stop":
-                logger.info("WS Drive CMD: STOP")
-                wheels_svc.stop()
+                logger.info("WS Drive CMD: Emergency STOP")
+                mapping_svc.navigator.emergency_stop("operator_websocket_estop")
+
+            elif mtype == "reset_estop":
+                cleared, reason = mapping_svc.navigator.clear_emergency_stop()
+                await websocket.send_json({"type": "estop_reset", "cleared": cleared, "reason": reason})
 
             elif mtype == "start_mapping":
                 mapping_svc.start_mapping()

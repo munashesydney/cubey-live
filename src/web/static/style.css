@@ -196,6 +196,17 @@ body, html {
   border: 1px solid rgba(243, 139, 168, 0.4);
 }
 
+.btn-danger {
+  color: #fff;
+  background: #dc2626;
+  border-color: #ef4444;
+  box-shadow: 0 0 18px rgba(239, 68, 68, 0.32);
+}
+
+.btn-danger:hover {
+  background: #b91c1c;
+}
+
 .btn-danger-outline:hover {
   background: rgba(243, 139, 168, 0.15);
 }

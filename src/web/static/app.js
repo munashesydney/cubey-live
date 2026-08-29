@@ -58,6 +58,8 @@
   const btnSaveMap = document.getElementById("btn-save-map");
   const btnOpenLibrary = document.getElementById("btn-open-library");
   const btnResetMap = document.getElementById("btn-reset-map");
+  const btnEstop = document.getElementById("btn-estop");
+  const btnResetEstop = document.getElementById("btn-reset-estop");
   const btnRecenter = document.getElementById("btn-recenter");
   const btnZoomIn = document.getElementById("btn-zoom-in");
   const btnZoomOut = document.getElementById("btn-zoom-out");
@@ -182,16 +184,21 @@
     plannedPath = data.planned_path || [];
     targetFrontier = data.target_frontier || null;
     navState = data.nav_state || "IDLE";
+    const navStatus = data.nav_status || {};
+    const autonomyEnabled = data.autonomy_enabled === true;
 
     // Update Header Badges
     lblActiveMapName.textContent = activeMapName;
     if (isMapping) {
       pillStatus.classList.add("active");
-      let stateLabel = "Auto-Exploring";
+      let stateLabel = autonomyEnabled ? "Auto-Exploring" : "Mapping Only (Autonomy Disabled)";
       if (navState === "PLANNING") stateLabel = "Planning Route...";
-      else if (navState === "OBSTACLE_AVOIDANCE") stateLabel = "Obstacle Detected";
+      else if (navState === "WAITING_FOR_SENSORS") stateLabel = "Waiting for Healthy Sensors";
+      else if (navState === "RECOVERY") stateLabel = "Bounded Recovery";
       else if (navState === "TELEOP_OVERRIDE") stateLabel = "Manual Driving";
       else if (navState === "COMPLETED") stateLabel = "House Mapped! 🎉";
+      else if (navState === "FAULT") stateLabel = `Navigation Fault: ${navStatus.fault_reason || "unknown"}`;
+      else if (navState === "E_STOPPED") stateLabel = `EMERGENCY STOPPED: ${navStatus.fault_reason || "operator"}`;
 
       lblMappingState.textContent = stateLabel;
       btnMappingText.textContent = "Pause Mapping";
@@ -535,8 +542,19 @@
 
   function sendStop() {
     if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "drive", action: "stop", speed: currentSpeed }));
+    }
+  }
+
+  function sendEmergencyStop() {
+    if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "stop" }));
     }
+    // Use an independent HTTP path as well. ESTOP is idempotent, and this
+    // still reaches the host if the live-map socket is stalled or reconnecting.
+    fetch("/api/control/stop", { method: "POST" }).catch((err) => {
+      console.error("Emergency stop request failed:", err);
+    });
   }
 
   function handleJoystickMove(clientX, clientY) {
@@ -628,7 +646,7 @@
     else if (key === "q") cmd = "rotateLeft";
     else if (key === "e") cmd = "rotateRight";
     else if (key === " ") {
-      sendStop();
+      sendEmergencyStop();
       return;
     }
 
@@ -662,6 +680,15 @@
   btnResetMap.addEventListener("click", () => {
     if (confirm("Reset current occupancy grid map and robot pose?")) {
       fetch("/api/mapping/reset", { method: "POST" });
+    }
+  });
+
+  btnEstop.addEventListener("click", sendEmergencyStop);
+  btnResetEstop.addEventListener("click", async () => {
+    const res = await fetch("/api/control/estop/reset", { method: "POST" });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      alert(`Cannot re-arm: ${data.detail || "safety preconditions failed"}`);
     }
   });
 

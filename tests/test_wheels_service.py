@@ -24,6 +24,8 @@ class WheelsServiceProtocolTests(unittest.TestCase):
     def test_mock_connection_lifecycle(self):
         self.assertTrue(self.service.is_connected)
         self.assertTrue(self.service.is_mock)
+        healthy, reason = self.service.telemetry_health()
+        self.assertTrue(healthy, reason)
         self.service.disconnect()
         self.assertFalse(self.service.is_connected)
 
@@ -47,6 +49,37 @@ class WheelsServiceProtocolTests(unittest.TestCase):
 
         self.service.stop()
         self.assertIn("[TX-MOCK] CMD:stop", sent_lines)
+
+    def test_emergency_stop_is_latched_until_explicit_reset(self):
+        sent_lines = []
+        self.service._emit_log = lambda text: sent_lines.append(text)
+
+        self.assertTrue(self.service.emergency_stop("test_collision"))
+        self.assertTrue(self.service.is_emergency_stopped)
+        self.assertFalse(self.service.move("forward"))
+        self.assertFalse(self.service.test_motor("fl", 1))
+        self.assertNotIn("[TX-MOCK] CMD:forward", sent_lines)
+
+        self.assertTrue(self.service.clear_emergency_stop())
+        self.assertFalse(self.service.is_emergency_stopped)
+        self.assertTrue(self.service.move("forward"))
+        self.assertIn("[TX-MOCK] CMD:forward", sent_lines)
+
+    def test_old_pulse_cannot_stop_a_newer_command(self):
+        sent_lines = []
+        self.service._emit_log = lambda text: sent_lines.append(text)
+
+        self.assertTrue(self.service.pulse("forward", duration_ms=50))
+        time.sleep(0.02)
+        self.assertTrue(self.service.move("rotateLeft"))
+        time.sleep(0.08)
+
+        stop_index = next(
+            (i for i, line in enumerate(sent_lines) if line == "[TX-MOCK] CMD:stop"),
+            None,
+        )
+        rotate_index = sent_lines.index("[TX-MOCK] CMD:rotateLeft")
+        self.assertTrue(stop_index is None or stop_index < rotate_index)
 
     def test_speed_command_constrains(self):
         sent_lines = []

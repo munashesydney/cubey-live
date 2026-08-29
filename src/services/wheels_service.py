@@ -38,6 +38,7 @@ class TelemetryData:
     battery_voltage: float = 0.0
     battery_pct: int = 0
     is_charging: bool = False
+    emergency_stopped: bool = False
     timestamp: float = field(default_factory=time.time)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -51,6 +52,7 @@ class TelemetryData:
             "battery_voltage": self.battery_voltage,
             "battery_pct": self.battery_pct,
             "is_charging": self.is_charging,
+            "emergency_stopped": self.emergency_stopped,
             "timestamp": self.timestamp,
         }
 
@@ -103,8 +105,20 @@ class WheelsService:
         self._continuous_command: Optional[str] = None
         self._continuous_lock = threading.Lock()
 
+        # All motion producers share one inhibit and generation counter.  This
+        # prevents an old pulse worker from stopping a newer command and gives
+        # emergency stop true latched semantics across reconnects.
+        # Wheel callbacks can synchronously inspect motion state while a command
+        # is being issued.  A re-entrant lock prevents that callback path from
+        # deadlocking the command thread.
+        self._motion_lock = threading.RLock()
+        self._motion_inhibited: bool = False
+        self._motion_inhibit_reason: str = ""
+        self._pulse_generation: int = 0
+
         # Telemetry state cache
         self.telemetry = TelemetryData()
+        self._telemetry_received = False
 
         # Battery charging trend detection
         self._voltage_samples: List[tuple] = []
@@ -166,6 +180,29 @@ class WheelsService:
     def is_mock(self) -> bool:
         return self._is_mock
 
+    @property
+    def is_emergency_stopped(self) -> bool:
+        with self._motion_lock:
+            return self._motion_inhibited
+
+    @property
+    def emergency_stop_reason(self) -> str:
+        with self._motion_lock:
+            return self._motion_inhibit_reason
+
+    def telemetry_health(
+        self, *, max_age_s: float = 1.0, now: Optional[float] = None
+    ) -> tuple[bool, str]:
+        if not self._is_connected:
+            return False, "wheels_disconnected"
+        if not self._telemetry_received:
+            return False, "wheel_telemetry_missing"
+        check_time = time.time() if now is None else now
+        age_s = max(0.0, check_time - self.telemetry.timestamp)
+        if age_s > max_age_s:
+            return False, f"wheel_telemetry_stale:{age_s:.3f}s"
+        return True, "ok"
+
     def connect(self, port: Optional[str] = None, baudrate: Optional[int] = None) -> bool:
         """
         Open serial connection to ESP32 on specified port and baudrate.
@@ -177,6 +214,7 @@ class WheelsService:
             self.baudrate = baudrate
 
         self.disconnect()
+        self._telemetry_received = False
 
         if self.port == "MOCK_SIMULATOR" or not PYSERIAL_AVAILABLE:
             self._is_mock = True
@@ -186,6 +224,7 @@ class WheelsService:
                 target=self._mock_reader_loop, daemon=True, name="WheelsMockReader"
             )
             self._reader_thread.start()
+            self._handle_mock_command("STATUS")
             self._emit_log(f"Connected to {self.port} (Mock/Simulated Mode)")
             self._emit_connection_change(True, f"Mock Mode ({self.port})")
             logger.info("WheelsService connected in MOCK_SIMULATOR mode.")
@@ -297,12 +336,51 @@ class WheelsService:
 
     def move(self, direction: str) -> bool:
         """Send a single motion command (e.g. 'forward', 'strafeLeft')."""
+        if direction not in self.COMMANDS or direction == "stop":
+            if direction == "stop":
+                return self.stop()
+            self._emit_log(f"Rejected unsupported motion command '{direction}'")
+            return False
+        with self._motion_lock:
+            inhibited = self._motion_inhibited
+            inhibit_reason = self._motion_inhibit_reason
+            if not inhibited:
+                self._pulse_generation += 1
+        if inhibited:
+            self._emit_log(
+                f"Motion inhibited ({inhibit_reason}); rejected '{direction}'"
+            )
+            return False
         return self.send_raw(f"CMD:{direction}")
 
     def stop(self) -> bool:
-        """Emergency stop: stops continuous repeat and sends stop command."""
+        """Normal stop; does not clear or create a latched emergency stop."""
         self._stop_continuous_repeat()
+        with self._motion_lock:
+            self._pulse_generation += 1
         return self.send_raw("CMD:stop")
+
+    def emergency_stop(self, reason: str = "operator_request") -> bool:
+        """Latch motion inhibition locally and in the ESP32 controller."""
+        self._stop_continuous_repeat()
+        with self._motion_lock:
+            self._motion_inhibited = True
+            self._motion_inhibit_reason = reason or "unspecified"
+            self._pulse_generation += 1
+        sent = self.send_raw("ESTOP")
+        # Older firmware may not know ESTOP, so always follow with a normal stop.
+        stopped = self.send_raw("CMD:stop")
+        return sent and stopped
+
+    def clear_emergency_stop(self) -> bool:
+        """Explicitly re-arm motion after the caller has verified safe conditions."""
+        if not self.send_raw("RESET_ESTOP"):
+            return False
+        with self._motion_lock:
+            self._motion_inhibited = False
+            self._motion_inhibit_reason = ""
+            self._pulse_generation += 1
+        return True
 
     def set_speed(self, speed: int) -> bool:
         """Update robot motor speed (70-255)."""
@@ -315,30 +393,61 @@ class WheelsService:
         motor_name: 'fl', 'fr', 'bl', 'br'
         direction: 1 (fwd), -1 (rev), 0 (stop)
         """
+        with self._motion_lock:
+            inhibited = self._motion_inhibited and direction != 0
+            inhibit_reason = self._motion_inhibit_reason
+        if inhibited:
+            self._emit_log(
+                f"Motion inhibited ({inhibit_reason}); rejected motor test"
+            )
+            return False
         if speed > 0:
             return self.send_raw(f"MOTOR:{motor_name},{direction},{speed}")
         return self.send_raw(f"MOTOR:{motor_name},{direction}")
 
-    def pulse(self, direction: str, duration_ms: int = 250) -> None:
+    def pulse(self, direction: str, duration_ms: int = 250) -> bool:
         """
         Move in a direction for a short duration, then automatically stop.
         Useful for precise step testing.
         """
+        if direction not in self.COMMANDS or direction == "stop":
+            return False
+        with self._motion_lock:
+            inhibited = self._motion_inhibited
+            inhibit_reason = self._motion_inhibit_reason
+            if not inhibited:
+                self._pulse_generation += 1
+                generation = self._pulse_generation
+        if inhibited:
+            self._emit_log(
+                f"Motion inhibited ({inhibit_reason}); rejected pulse '{direction}'"
+            )
+            return False
+
+        if not self.send_raw(f"CMD:{direction}"):
+            return False
+
         def _pulse_worker():
-            self.move(direction)
             time.sleep(duration_ms / 1000.0)
-            self.send_raw("CMD:stop")
+            with self._motion_lock:
+                if generation != self._pulse_generation:
+                    return
+                self._pulse_generation += 1
+                self.send_raw("CMD:stop")
 
         threading.Thread(target=_pulse_worker, daemon=True, name="WheelsPulseWorker").start()
+        return True
 
-    def start_continuous(self, direction: str, interval_ms: int = 200) -> None:
+    def start_continuous(self, direction: str, interval_ms: int = 200) -> bool:
         """
         Begin continuous movement stream for hold-to-move controls.
         Periodically repeats command to prevent ESP32 700ms timeout.
         """
         with self._continuous_lock:
             self._continuous_command = direction
-            self.move(direction)
+            if not self.move(direction):
+                self._continuous_command = None
+                return False
 
             def _repeat_step():
                 with self._continuous_lock:
@@ -355,6 +464,7 @@ class WheelsService:
             self._continuous_timer = threading.Timer(interval_ms / 1000.0, _repeat_step)
             self._continuous_timer.daemon = True
             self._continuous_timer.start()
+        return True
 
     def stop_continuous(self) -> None:
         """Stop hold-to-move repeat and stop wheels."""
@@ -445,8 +555,16 @@ class WheelsService:
                 battery_voltage=batt_v,
                 battery_pct=batt_pct,
                 is_charging=self._is_charging,
+                emergency_stopped=kv.get("estop", "0") in ("1", "true", "True"),
                 timestamp=now,
             )
+            self._telemetry_received = True
+
+            if self.telemetry.emergency_stopped:
+                with self._motion_lock:
+                    self._motion_inhibited = True
+                    if not self._motion_inhibit_reason:
+                        self._motion_inhibit_reason = "controller_reported_estop"
 
             if self.on_telemetry:
                 self.on_telemetry(self.telemetry)
@@ -484,6 +602,7 @@ class WheelsService:
                     f"TELEMETRY:front_dist=52,back_dist=55,"
                     f"front_cliff=0,back_cliff=0,"
                     f"motion={self.telemetry.motion},speed={self.telemetry.speed}"
+                    f",estop={1 if self._motion_inhibited else 0}"
                 )
                 self._parse_incoming_line(simulated_line)
 
@@ -506,8 +625,14 @@ class WheelsService:
                 f"TELEMETRY:front_dist=52,back_dist=55,"
                 f"front_cliff=0,back_cliff=0,"
                 f"motion={self.telemetry.motion},speed={self.telemetry.speed}"
+                f",estop={1 if self._motion_inhibited else 0}"
             )
             self._parse_incoming_line(simulated)
+        elif line == "ESTOP":
+            self.telemetry.motion = "STOPPED"
+            self._parse_incoming_line("ACK:ESTOP")
+        elif line == "RESET_ESTOP":
+            self._parse_incoming_line("ACK:RESET_ESTOP")
 
     # ------------------------------------------------------------------
     # Notification Helpers
@@ -535,7 +660,12 @@ def get_wheels_service() -> WheelsService:
     """Get or create the global shared WheelsService singleton."""
     global _SHARED_WHEELS_SERVICE
     if _SHARED_WHEELS_SERVICE is None:
-        _SHARED_WHEELS_SERVICE = WheelsService()
+        from src.config import config
+
+        _SHARED_WHEELS_SERVICE = WheelsService(
+            default_port=config.wheels_port or None,
+            default_baudrate=config.wheels_baudrate,
+        )
         try:
             _SHARED_WHEELS_SERVICE.connect()
         except Exception as e:

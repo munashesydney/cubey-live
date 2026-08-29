@@ -1,10 +1,10 @@
-"""
-Auto Navigator — Frontier Exploration State Machine & Trajectory Controller.
+"""Fail-closed autonomous frontier exploration for Cubey.
 
-Coordinates autonomous exploration by combining real-time SLAM occupancy grids,
-frontier extraction, A* path planning, reactive LiDAR safety braking, and
-mecanum wheel trajectory execution.
+No state may refresh motor commands indefinitely: sensor health, command
+duration, progress, and recovery attempts are all bounded.
 """
+
+from __future__ import annotations
 
 import enum
 import logging
@@ -15,7 +15,7 @@ from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 
-from src.services.lidar_service import LidarService, get_lidar_service
+from src.services.lidar_service import LidarPoint, LidarService, get_lidar_service
 from src.services.navigation.frontier_detector import FrontierDetector
 from src.services.navigation.path_planner import PathPlanner
 from src.services.wheels_service import WheelsService, get_wheels_service
@@ -24,84 +24,153 @@ logger = logging.getLogger(__name__)
 
 
 class NavigationState(str, enum.Enum):
-    """Lifecycle states of the autonomous exploration engine."""
     IDLE = "IDLE"
+    WAITING_FOR_SENSORS = "WAITING_FOR_SENSORS"
     PLANNING = "PLANNING"
     NAVIGATING = "NAVIGATING"
-    OBSTACLE_AVOIDANCE = "OBSTACLE_AVOIDANCE"
+    RECOVERY = "RECOVERY"
     TELEOP_OVERRIDE = "TELEOP_OVERRIDE"
     COMPLETED = "COMPLETED"
+    FAULT = "FAULT"
+    E_STOPPED = "E_STOPPED"
 
 
 class AutoNavigator:
-    """
-    Autonomous Exploration Manager.
-    Drives Cubey through unknown rooms, following A* paths to open frontiers.
-    """
+    """Bounded frontier explorer with an independent LiDAR safety gate."""
+
+    _FORWARD_COMMANDS = {"forward", "forwardLeft", "forwardRight"}
+    _BACKWARD_COMMANDS = {"backward", "backwardLeft", "backwardRight"}
+    _ROTATION_COMMANDS = {"rotateLeft", "rotateRight"}
 
     def __init__(
         self,
         mapping_service,
         wheels_service: Optional[WheelsService] = None,
         lidar_service: Optional[LidarService] = None,
-        drive_speed: int = 160,              # Exploration drive speed (100-255)
-        safety_stop_dist_mm: int = 280,       # Emergency obstacle brake distance
-        waypoint_reach_dist_m: float = 0.12,  # 12cm waypoint arrival threshold
+        drive_speed: int = 120,
+        safety_stop_dist_mm: int = 350,
+        waypoint_reach_dist_m: float = 0.12,
+        max_scan_age_s: float = 0.35,
+        max_wheel_telemetry_age_s: float = 1.0,
+        min_scan_points: int = 30,
+        sensor_start_timeout_s: float = 5.0,
+        progress_timeout_s: float = 2.5,
+        max_rotation_s: float = 1.8,
+        max_recovery_attempts: int = 4,
+        robot_length_m: float = 0.36,
+        robot_width_m: float = 0.36,
+        footprint_margin_m: float = 0.08,
     ):
         self.mapping_service = mapping_service
         self.wheels_service = wheels_service or get_wheels_service()
         self.lidar_service = lidar_service or get_lidar_service()
 
-        self.drive_speed = drive_speed
-        self.safety_stop_dist_mm = safety_stop_dist_mm
+        self.drive_speed = max(70, min(255, int(drive_speed)))
+        self.safety_stop_dist_m = max(0.20, safety_stop_dist_mm / 1000.0)
+        self.safety_stop_dist_mm = int(self.safety_stop_dist_m * 1000)
         self.waypoint_reach_dist_m = waypoint_reach_dist_m
+        self.max_scan_age_s = max_scan_age_s
+        self.max_wheel_telemetry_age_s = max_wheel_telemetry_age_s
+        self.min_scan_points = min_scan_points
+        self.sensor_start_timeout_s = sensor_start_timeout_s
+        self.progress_timeout_s = progress_timeout_s
+        self.max_rotation_s = max_rotation_s
+        self.max_recovery_attempts = max_recovery_attempts
+        self.robot_half_length_m = robot_length_m / 2.0
+        self.robot_half_width_m = robot_width_m / 2.0
+        self.footprint_margin_m = footprint_margin_m
 
         self.frontier_detector = FrontierDetector(
             min_cluster_size=4,
             wall_clearance_cells=2,
             min_frontier_dist_m=0.35,
         )
-        self.path_planner = PathPlanner(robot_radius_m=0.18, safety_margin_m=0.04)
+        self.path_planner = PathPlanner(
+            robot_radius_m=max(robot_length_m, robot_width_m) / 2.0,
+            safety_margin_m=footprint_margin_m,
+        )
 
         self.state = NavigationState.IDLE
+        self.fault_reason = ""
         self.current_path: List[Tuple[float, float]] = []
-        self.current_waypoint_idx: int = 0
+        self.current_waypoint_idx = 0
         self.target_frontier: Optional[Tuple[float, float]] = None
-        self._visited_targets: List[Tuple[float, float, float]] = []  # (x, y, timestamp)
 
-        self._running: bool = False
+        self._running = False
         self._thread: Optional[threading.Thread] = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._stop_event = threading.Event()
+        self._teleop_override_until = 0.0
+        self._healthy_scan_streak = 0
+        self._start_deadline = 0.0
+        self._recovery_attempts = 0
+        self._replan_after = 0.0
+        self._blocked_targets: List[Tuple[float, float, float]] = []
+        self._last_command = "stop"
+        self._last_progress_pose: Optional[Tuple[float, float, float]] = None
+        self._last_progress_time = 0.0
+        self._heading_turn_started = 0.0
 
-        # Teleoperation override watchdog
-        self._teleop_override_until: float = 0.0
-
-        # Exploration completion callback
         self.on_exploration_complete: Optional[Callable[[], None]] = None
 
     @property
     def is_active(self) -> bool:
-        return self._running and self.state in (
+        return self._running and self.state in {
+            NavigationState.WAITING_FOR_SENSORS,
             NavigationState.PLANNING,
             NavigationState.NAVIGATING,
-            NavigationState.OBSTACLE_AVOIDANCE,
+            NavigationState.RECOVERY,
             NavigationState.TELEOP_OVERRIDE,
-        )
+        }
+
+    def status(self) -> dict:
+        healthy, health_reason = self._sensor_health()
+        return {
+            "state": self.state.value,
+            "active": self.is_active,
+            "fault_reason": self.fault_reason,
+            "emergency_stopped": self.wheels_service.is_emergency_stopped,
+            "sensor_healthy": healthy,
+            "sensor_health_reason": health_reason,
+            "recovery_attempts": self._recovery_attempts,
+        }
 
     # ------------------------------------------------------------------
-    # Lifecycle Controls
+    # Lifecycle and safety controls
     # ------------------------------------------------------------------
 
-    def start(self) -> None:
-        """Start autonomous exploration in a background thread."""
+    def start(self) -> bool:
         with self._lock:
             if self._running:
-                return
+                return True
+            if self.wheels_service.is_emergency_stopped:
+                self.state = NavigationState.E_STOPPED
+                self.fault_reason = self.wheels_service.emergency_stop_reason
+                return False
+
+            if not self.wheels_service.is_connected:
+                try:
+                    self.wheels_service.connect()
+                except Exception as exc:
+                    self._set_fault(f"wheel_connection_failed:{exc}")
+                    return False
+            if not self.wheels_service.is_connected:
+                self._set_fault("wheel_connection_failed")
+                return False
+
             self._running = True
-            self.state = NavigationState.PLANNING
+            self._stop_event.clear()
+            self.state = NavigationState.WAITING_FOR_SENSORS
+            self.fault_reason = ""
             self.current_path.clear()
             self.current_waypoint_idx = 0
             self.target_frontier = None
+            self._healthy_scan_streak = 0
+            self._recovery_attempts = 0
+            self._last_command = "stop"
+            self._last_progress_pose = None
+            self._last_progress_time = time.monotonic()
+            self._start_deadline = time.monotonic() + self.sensor_start_timeout_s
 
             self._thread = threading.Thread(
                 target=self._navigation_loop,
@@ -109,231 +178,469 @@ class AutoNavigator:
                 name="AutoNavigatorWorker",
             )
             self._thread.start()
-        logger.info("Autonomous Frontier Exploration started.")
+        logger.info("Fail-closed autonomous frontier exploration started.")
+        return True
 
     def stop(self) -> None:
-        """Halt autonomous exploration and stop motors."""
         with self._lock:
             self._running = False
-            self.state = NavigationState.IDLE
+            self._stop_event.set()
             self.current_path.clear()
             self.target_frontier = None
+            self._last_command = "stop"
+            self.state = (
+                NavigationState.E_STOPPED
+                if self.wheels_service.is_emergency_stopped
+                else NavigationState.IDLE
+            )
 
         self.wheels_service.stop()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=0.5)
+        if (
+            self._thread
+            and self._thread.is_alive()
+            and self._thread is not threading.current_thread()
+        ):
+            self._thread.join(timeout=1.0)
         self._thread = None
-        logger.info("Autonomous Frontier Exploration stopped.")
 
-    def yield_to_teleop(self, duration_s: float = 3.0) -> None:
-        """
-        Temporarily pause autonomous driving when manual user teleoperation is detected.
-        Automatically resumes auto-exploration after duration_s seconds of user inactivity.
-        """
-        self._teleop_override_until = time.time() + duration_s
-        if self.state == NavigationState.NAVIGATING:
+    def emergency_stop(self, reason: str = "operator_request") -> None:
+        with self._lock:
+            self.fault_reason = reason
+            self.state = NavigationState.E_STOPPED
+            self._running = False
+            self._stop_event.set()
+            self.current_path.clear()
+            self.target_frontier = None
+            self._last_command = "stop"
+        self.wheels_service.emergency_stop(reason)
+        logger.error("Autonomous emergency stop latched: %s", reason)
+
+    def clear_emergency_stop(self) -> Tuple[bool, str]:
+        if self._running:
+            return False, "autonomy_must_be_stopped"
+        healthy, reason = self._sensor_health()
+        if not healthy:
+            return False, reason
+        if not self.wheels_service.clear_emergency_stop():
+            return False, "wheel_controller_reset_failed"
+        with self._lock:
+            self.fault_reason = ""
+            self.state = NavigationState.IDLE
+        return True, "cleared"
+
+    def yield_to_teleop(self, duration_s: float = 3.0) -> bool:
+        if self.wheels_service.is_emergency_stopped:
+            return False
+        self._teleop_override_until = time.monotonic() + max(0.0, duration_s)
+        if self._running:
             self.state = NavigationState.TELEOP_OVERRIDE
+        return True
+
+    def authorize_manual_motion(self, command: str) -> Tuple[bool, str]:
+        """Apply the same fail-closed gate before any remote drive command."""
+        if command == "stop":
+            return True, "ok"
+        if self.wheels_service.is_emergency_stopped:
+            return False, self.wheels_service.emergency_stop_reason
+        healthy, reason = self._sensor_health()
+        if not healthy:
+            self.emergency_stop(f"manual_motion_rejected:{reason}")
+            return False, reason
+        collision = self._collision_reason(command)
+        if collision:
+            self.emergency_stop(f"manual_motion_collision:{collision}")
+            return False, collision
+        return True, "ok"
+
+    def _set_fault(self, reason: str) -> None:
+        with self._lock:
+            self.fault_reason = reason
+            self.state = NavigationState.FAULT
+            self._running = False
+            self._stop_event.set()
+            self.current_path.clear()
+            self.target_frontier = None
+            self._last_command = "stop"
+        self.wheels_service.stop()
+        logger.error("Autonomous navigation fault: %s", reason)
 
     # ------------------------------------------------------------------
-    # Main Navigation Loop
+    # Main control loop and health gates
     # ------------------------------------------------------------------
+
+    def _sensor_health(self) -> Tuple[bool, str]:
+        wheels_healthy, wheels_reason = self.wheels_service.telemetry_health(
+            max_age_s=self.max_wheel_telemetry_age_s
+        )
+        if not wheels_healthy:
+            return False, wheels_reason
+        return self.lidar_service.scan_health(
+            max_age_s=self.max_scan_age_s,
+            min_points=self.min_scan_points,
+            min_scan_rate_hz=2.0,
+        )
 
     def _navigation_loop(self) -> None:
-        """Main 10 Hz exploration and trajectory tracking loop."""
-        replan_cooldown = 0.0
-
-        while self._running:
+        while self._running and not self._stop_event.is_set():
             try:
-                now = time.time()
-
-                # 1. Check if user is manually driving (Teleop Override)
-                if now < self._teleop_override_until:
-                    self.state = NavigationState.TELEOP_OVERRIDE
-                    time.sleep(0.10)
-                    continue
-
-                # 2. Check real-time LiDAR safety collision buffer (ignoring robot chassis < 170mm)
-                min_front = self.lidar_service.latest_scan.min_front_dist_mm
-                if 170 <= min_front < self.safety_stop_dist_mm:
-                    if self.state == NavigationState.NAVIGATING:
-                        logger.warning(
-                            "Autonomous Navigation Obstacle Warning: %d mm in front. Halting.",
-                            min_front,
-                        )
-                        self.wheels_service.stop()
-                        self.state = NavigationState.OBSTACLE_AVOIDANCE
-                        replan_cooldown = now + 1.5
-                        time.sleep(0.20)
-                        continue
-
-                # 3. State Machine Execution
-                if self.state in (NavigationState.PLANNING, NavigationState.OBSTACLE_AVOIDANCE, NavigationState.TELEOP_OVERRIDE):
-                    if now >= replan_cooldown:
-                        self._plan_next_frontier()
-
-                elif self.state == NavigationState.NAVIGATING:
-                    self._follow_path()
-
-                elif self.state == NavigationState.COMPLETED:
-                    self.wheels_service.stop()
+                now = time.monotonic()
+                if self.wheels_service.is_emergency_stopped:
+                    self.state = NavigationState.E_STOPPED
+                    self._running = False
                     break
 
-            except Exception as e:
-                logger.error("Error in AutoNavigator loop: %s", e, exc_info=True)
+                healthy, health_reason = self._sensor_health()
+                if not healthy:
+                    self._healthy_scan_streak = 0
+                    if self.state in {
+                        NavigationState.NAVIGATING,
+                        NavigationState.RECOVERY,
+                        NavigationState.TELEOP_OVERRIDE,
+                    }:
+                        self.emergency_stop(health_reason)
+                        break
+                    self.wheels_service.stop()
+                    self._last_command = "stop"
+                    self.state = NavigationState.WAITING_FOR_SENSORS
+                    if now >= self._start_deadline:
+                        self._set_fault(health_reason)
+                        break
+                    self._stop_event.wait(0.05)
+                    continue
 
-            time.sleep(0.08)
+                self._healthy_scan_streak += 1
+                if self.state == NavigationState.WAITING_FOR_SENSORS:
+                    if self._healthy_scan_streak >= 3:
+                        self.state = NavigationState.PLANNING
+                    else:
+                        self._stop_event.wait(0.05)
+                        continue
+
+                if now < self._teleop_override_until:
+                    self.state = NavigationState.TELEOP_OVERRIDE
+                    collision = self._collision_reason(self._telemetry_motion_command())
+                    if collision:
+                        self.emergency_stop(f"teleop_collision:{collision}")
+                        break
+                    self._stop_event.wait(0.05)
+                    continue
+                if self.state == NavigationState.TELEOP_OVERRIDE:
+                    self.wheels_service.stop()
+                    self._last_command = "stop"
+                    self.state = NavigationState.PLANNING
+
+                collision = self._collision_reason(self._last_command)
+                if collision and self._last_command != "stop":
+                    self._handle_obstacle(collision)
+                    self._stop_event.wait(0.05)
+                    continue
+
+                if self.state in {NavigationState.PLANNING, NavigationState.RECOVERY}:
+                    if now >= self._replan_after:
+                        self._plan_next_frontier()
+                elif self.state == NavigationState.NAVIGATING:
+                    self._follow_path()
+                elif self.state == NavigationState.COMPLETED:
+                    self.wheels_service.stop()
+                    self._last_command = "stop"
+                    self._running = False
+                    break
+                elif self.state in {NavigationState.FAULT, NavigationState.E_STOPPED}:
+                    self._running = False
+                    break
+            except Exception as exc:
+                logger.exception("Unhandled AutoNavigator error")
+                self.emergency_stop(f"navigation_exception:{type(exc).__name__}")
+                break
+
+            self._stop_event.wait(0.05)
+
+    def _telemetry_motion_command(self) -> str:
+        return {
+            "forward": "forward",
+            "backward": "backward",
+            "forward_left": "forwardLeft",
+            "forward_right": "forwardRight",
+            "backward_left": "backwardLeft",
+            "backward_right": "backwardRight",
+            "rotate_left": "rotateLeft",
+            "rotate_right": "rotateRight",
+            "strafe_left": "strafeLeft",
+            "strafe_right": "strafeRight",
+        }.get(self.wheels_service.telemetry.motion.lower(), "stop")
 
     # ------------------------------------------------------------------
-    # Frontier Selection & Path Generation
+    # Independent collision monitor
     # ------------------------------------------------------------------
+
+    def _valid_points(self) -> List[LidarPoint]:
+        return [
+            point
+            for point in self.lidar_service.latest_scan.points
+            if point.quality > 0
+            and point.distance_mm >= self.lidar_service.min_valid_distance_mm
+        ]
+
+    def _collision_reason(self, command: str) -> Optional[str]:
+        if command == "stop":
+            return None
+
+        danger_points: List[LidarPoint] = []
+        rotation_radius = math.hypot(
+            self.robot_half_length_m, self.robot_half_width_m
+        ) + self.footprint_margin_m
+        corridor_half_width = self.robot_half_width_m + self.footprint_margin_m
+
+        for point in self._valid_points():
+            x, y = point.x_m, point.y_m
+            if command in self._ROTATION_COMMANDS:
+                if math.hypot(x, y) <= rotation_radius:
+                    danger_points.append(point)
+            elif command in self._FORWARD_COMMANDS:
+                if 0.0 <= y <= self.safety_stop_dist_m and abs(x) <= corridor_half_width:
+                    danger_points.append(point)
+            elif command in self._BACKWARD_COMMANDS:
+                if -self.safety_stop_dist_m <= y <= 0.0 and abs(x) <= corridor_half_width:
+                    danger_points.append(point)
+            elif command == "strafeLeft":
+                if -self.robot_half_length_m <= y <= self.robot_half_length_m and -self.safety_stop_dist_m <= x <= 0.0:
+                    danger_points.append(point)
+            elif command == "strafeRight":
+                if -self.robot_half_length_m <= y <= self.robot_half_length_m and 0.0 <= x <= self.safety_stop_dist_m:
+                    danger_points.append(point)
+
+        if not danger_points:
+            return None
+        closest = min(danger_points, key=lambda point: point.distance_mm)
+        return f"{command}:{closest.distance_mm:.0f}mm@{closest.angle_deg:.1f}deg"
+
+    def _handle_obstacle(self, reason: str) -> None:
+        self.wheels_service.stop()
+        self._last_command = "stop"
+        if self.target_frontier:
+            self._block_target(self.target_frontier, duration_s=30.0)
+        self.current_path.clear()
+        self.current_waypoint_idx = 0
+        self.state = NavigationState.RECOVERY
+        self._recovery_attempts += 1
+        self._replan_after = time.monotonic() + 0.5
+        self._heading_turn_started = 0.0
+        logger.warning("Collision monitor stopped autonomous motion: %s", reason)
+        if self._recovery_attempts > self.max_recovery_attempts:
+            self._set_fault(f"recovery_limit_exceeded:{reason}")
+
+    # ------------------------------------------------------------------
+    # Frontier selection and bounded recovery
+    # ------------------------------------------------------------------
+
+    def _block_target(self, target: Tuple[float, float], duration_s: float = 45.0) -> None:
+        self._blocked_targets.append(
+            (target[0], target[1], time.monotonic() + duration_s)
+        )
+
+    def _target_is_blocked(self, target: Tuple[float, float]) -> bool:
+        now = time.monotonic()
+        self._blocked_targets = [item for item in self._blocked_targets if item[2] > now]
+        return any(
+            math.hypot(target[0] - x, target[1] - y) < 0.30
+            for x, y, _ in self._blocked_targets
+        )
 
     def _plan_next_frontier(self) -> None:
-        """Find open frontiers and generate an A* route to the best candidate."""
         grid = self.mapping_service.get_grid_copy()
-        res_m = self.mapping_service.resolution_m
-        origin_x = self.mapping_service.origin_x_m
-        origin_y = self.mapping_service.origin_y_m
-        robot_pose = self.mapping_service.pose
-
-        # Find all open frontier clusters
+        pose = self.mapping_service.pose
         frontiers = self.frontier_detector.find_frontiers(
             grid=grid,
-            resolution_m=res_m,
-            origin_x_m=origin_x,
-            origin_y_m=origin_y,
-            robot_x_m=robot_pose.x_m,
-            robot_y_m=robot_pose.y_m,
+            resolution_m=self.mapping_service.resolution_m,
+            origin_x_m=self.mapping_service.origin_x_m,
+            origin_y_m=self.mapping_service.origin_y_m,
+            robot_x_m=pose.x_m,
+            robot_y_m=pose.y_m,
         )
 
         if not frontiers:
-            # If map is fresh (less than 10 free cells explored), remain in PLANNING waiting for lidar scans
-            explored_free = int(np.count_nonzero(grid == 0))
-            if explored_free < 10:
+            if int(np.count_nonzero(grid == 0)) < 10:
                 self.state = NavigationState.PLANNING
                 return
-
-            logger.info("No reachable frontiers found. Exploration complete.")
-            self.state = NavigationState.COMPLETED
             self.wheels_service.stop()
+            self._last_command = "stop"
+            self.state = NavigationState.COMPLETED
             if self.on_exploration_complete:
                 try:
                     self.on_exploration_complete()
                 except Exception:
-                    pass
+                    logger.exception("Exploration completion callback failed")
             return
 
-        # Attempt A* route to top ranked frontiers (filtering out targets visited in last 15s)
-        now = time.time()
-        # Clean expired visited targets (> 15s old)
-        self._visited_targets = [v for v in self._visited_targets if (now - v[2]) < 15.0]
-
-        planned_path = None
-        chosen_target = None
-
-        for candidate in frontiers[:8]:
-            cx, cy = candidate.centroid_world
-            # Skip if visited very recently
-            if any(math.hypot(cx - vx, cy - vy) < 0.30 for vx, vy, _ in self._visited_targets):
+        attempted_targets: List[Tuple[float, float]] = []
+        for candidate in frontiers[:12]:
+            target = candidate.centroid_world
+            if self._target_is_blocked(target):
                 continue
-
+            attempted_targets.append(target)
             path = self.path_planner.plan_path(
                 grid=grid,
-                resolution_m=res_m,
-                origin_x_m=origin_x,
-                origin_y_m=origin_y,
-                start_world=(robot_pose.x_m, robot_pose.y_m),
-                goal_world=(cx, cy),
+                resolution_m=self.mapping_service.resolution_m,
+                origin_x_m=self.mapping_service.origin_x_m,
+                origin_y_m=self.mapping_service.origin_y_m,
+                start_world=(pose.x_m, pose.y_m),
+                goal_world=target,
             )
-            # Require at least 2 steps and meaningful total distance >= 25cm
-            if path and len(path) >= 2:
-                total_dist = sum(
-                    math.hypot(path[i+1][0] - path[i][0], path[i+1][1] - path[i][1])
-                    for i in range(len(path) - 1)
-                )
-                if total_dist >= 0.25:
-                    planned_path = path
-                    chosen_target = (cx, cy)
-                    break
+            if not path or len(path) < 2:
+                continue
+            total_dist = sum(
+                math.hypot(path[i + 1][0] - path[i][0], path[i + 1][1] - path[i][1])
+                for i in range(len(path) - 1)
+            )
+            if total_dist < 0.25:
+                continue
 
-        if planned_path and chosen_target:
-            with self._lock:
-                self.current_path = planned_path
-                self.current_waypoint_idx = 0
-                self.target_frontier = chosen_target
-                self.state = NavigationState.NAVIGATING
-            logger.info(
-                "Planned autonomous route with %d waypoints (dist=%.2fm) towards target %s",
-                len(planned_path),
-                total_dist,
-                chosen_target,
-            )
-        else:
-            # If path planner was blocked, rotate slightly to scan into unexplored space
-            logger.info("No clear route to top frontiers. Rotating to discover open corridors.")
-            self.wheels_service.set_speed(self.drive_speed)
-            self.wheels_service.pulse("rotateRight", 300)
-            time.sleep(0.4)
+            self.current_path = path
+            self.current_waypoint_idx = 0
+            self.target_frontier = target
+            self.state = NavigationState.NAVIGATING
+            self._last_progress_pose = (pose.x_m, pose.y_m, pose.theta_deg)
+            self._last_progress_time = time.monotonic()
+            self._heading_turn_started = 0.0
+            logger.info("Planned %d-waypoint route to %s", len(path), target)
+            return
+
+        for target in attempted_targets:
+            self._block_target(target)
+
+        if self._recovery_attempts >= self.max_recovery_attempts:
+            self._set_fault("no_reachable_frontier_after_bounded_recovery")
+            return
+
+        self._recovery_attempts += 1
+        direction = "rotateRight" if self._recovery_attempts % 2 else "rotateLeft"
+        if self._collision_reason(direction):
+            opposite = "rotateLeft" if direction == "rotateRight" else "rotateRight"
+            if self._collision_reason(opposite):
+                self._set_fault("recovery_rotation_blocked_both_directions")
+                return
+            direction = opposite
+        self._bounded_rotation(direction, duration_s=0.25)
+        if self._running:
+            self.state = NavigationState.PLANNING
+            self._replan_after = time.monotonic() + 0.25
+
+    def _bounded_rotation(self, direction: str, duration_s: float) -> None:
+        self.state = NavigationState.RECOVERY
+        self.wheels_service.set_speed(min(self.drive_speed, 110))
+        if not self.wheels_service.move(direction):
+            self._set_fault("recovery_motion_command_rejected")
+            return
+        self._last_command = direction
+        deadline = time.monotonic() + min(duration_s, self.max_rotation_s)
+        while self._running and not self._stop_event.is_set() and time.monotonic() < deadline:
+            healthy, reason = self._sensor_health()
+            if not healthy:
+                self.emergency_stop(reason)
+                return
+            collision = self._collision_reason(direction)
+            if collision:
+                self.wheels_service.stop()
+                self._last_command = "stop"
+                return
+            self._stop_event.wait(0.02)
+        self.wheels_service.stop()
+        self._last_command = "stop"
 
     # ------------------------------------------------------------------
-    # Pure-Pursuit Waypoint Following & Smooth Motion Controller
+    # Bounded path following
     # ------------------------------------------------------------------
 
     def _follow_path(self) -> None:
-        """Steer mecanum wheel base along the calculated A* waypoint route with look-ahead pure pursuit."""
         if not self.current_path:
             self.wheels_service.stop()
+            self._last_command = "stop"
             self.state = NavigationState.PLANNING
             return
 
-        robot_pose = self.mapping_service.pose
-        LOOKAHEAD_DIST_M = 0.35  # Look ahead 35 cm along path for smooth curves
+        pose = self.mapping_service.pose
+        now = time.monotonic()
+        if self._last_progress_pose is None:
+            self._last_progress_pose = (pose.x_m, pose.y_m, pose.theta_deg)
+            self._last_progress_time = now
 
-        # Advance waypoint index along path until finding a point >= LOOKAHEAD_DIST_M away
+        px, py, ptheta = self._last_progress_pose
+        translated = math.hypot(pose.x_m - px, pose.y_m - py)
+        rotated = abs((pose.theta_deg - ptheta + 180.0) % 360.0 - 180.0)
+        if translated >= 0.04 or rotated >= 4.0:
+            self._last_progress_pose = (pose.x_m, pose.y_m, pose.theta_deg)
+            self._last_progress_time = now
+        elif now - self._last_progress_time > self.progress_timeout_s:
+            self.wheels_service.stop()
+            self._last_command = "stop"
+            if self.target_frontier:
+                self._block_target(self.target_frontier)
+            self.current_path.clear()
+            self.state = NavigationState.RECOVERY
+            self._recovery_attempts += 1
+            self._replan_after = now + 0.5
+            if self._recovery_attempts > self.max_recovery_attempts:
+                self._set_fault("robot_not_making_progress")
+            return
+
+        lookahead_dist_m = 0.30
         while self.current_waypoint_idx < len(self.current_path) - 1:
             wp_x, wp_y = self.current_path[self.current_waypoint_idx]
-            dist_to_wp = math.hypot(wp_x - robot_pose.x_m, wp_y - robot_pose.y_m)
-            if dist_to_wp >= LOOKAHEAD_DIST_M:
+            if math.hypot(wp_x - pose.x_m, wp_y - pose.y_m) >= lookahead_dist_m:
                 break
             self.current_waypoint_idx += 1
 
-        # Check if arrived at final destination waypoint
         final_x, final_y = self.current_path[-1]
-        dist_to_final = math.hypot(final_x - robot_pose.x_m, final_y - robot_pose.y_m)
-        if dist_to_final < self.waypoint_reach_dist_m:
-            logger.info("Reached frontier destination! Performing scan sweep...")
+        if math.hypot(final_x - pose.x_m, final_y - pose.y_m) < self.waypoint_reach_dist_m:
             self.wheels_service.stop()
-            # Record visited target
+            self._last_command = "stop"
             if self.target_frontier:
-                self._visited_targets.append((self.target_frontier[0], self.target_frontier[1], time.time()))
-            # Brief sweep rotation to clear LiDAR into the open room
-            self.wheels_service.pulse("rotateRight", 250)
-            time.sleep(0.3)
+                self._block_target(self.target_frontier, duration_s=15.0)
+            self.current_path.clear()
+            self.target_frontier = None
             self.state = NavigationState.PLANNING
+            self._recovery_attempts = 0
+            self._replan_after = now + 0.2
             return
 
-        # Target look-ahead waypoint
         target_x, target_y = self.current_path[self.current_waypoint_idx]
-        dx = target_x - robot_pose.x_m
-        dy = target_y - robot_pose.y_m
+        target_heading_deg = math.degrees(
+            math.atan2(target_x - pose.x_m, target_y - pose.y_m)
+        ) % 360.0
+        heading_error = (target_heading_deg - pose.theta_deg + 180.0) % 360.0 - 180.0
 
-        # Target angle in world frame (0° = North / +Y, 90° = East / +X, clockwise)
-        target_heading_rad = math.atan2(dx, dy)
-        target_heading_deg = math.degrees(target_heading_rad) % 360.0
+        if abs(heading_error) > 55.0:
+            command = "rotateRight" if heading_error > 0 else "rotateLeft"
+            if self._heading_turn_started == 0.0:
+                self._heading_turn_started = now
+            elif now - self._heading_turn_started > self.max_rotation_s:
+                self.wheels_service.stop()
+                self._last_command = "stop"
+                if self.target_frontier:
+                    self._block_target(self.target_frontier)
+                self.current_path.clear()
+                self.state = NavigationState.RECOVERY
+                self._recovery_attempts += 1
+                self._replan_after = now + 0.5
+                return
+        elif abs(heading_error) > 18.0:
+            command = "forwardRight" if heading_error > 0 else "forwardLeft"
+            self._heading_turn_started = 0.0
+        else:
+            command = "forward"
+            self._heading_turn_started = 0.0
 
-        # Heading error relative to robot's current orientation
-        heading_diff = (target_heading_deg - robot_pose.theta_deg + 180.0) % 360.0 - 180.0
+        collision = self._collision_reason(command)
+        if collision:
+            self._handle_obstacle(collision)
+            return
 
         self.wheels_service.set_speed(self.drive_speed)
-
-        # Smooth Continuous Mecanum Steering
-        if abs(heading_diff) > 55.0:
-            # Significant angle mismatch: rotate smoothly towards target
-            cmd = "rotateRight" if heading_diff > 0 else "rotateLeft"
-            self.wheels_service.move(cmd)
-        elif abs(heading_diff) > 18.0:
-            # Moderate angle mismatch: curve smoothly forward
-            cmd = "forwardRight" if heading_diff > 0 else "forwardLeft"
-            self.wheels_service.move(cmd)
-        else:
-            # Aligned: drive straight forward
-            self.wheels_service.move("forward")
+        if not self.wheels_service.move(command):
+            if self.wheels_service.is_emergency_stopped:
+                self.state = NavigationState.E_STOPPED
+                self._running = False
+            else:
+                self._set_fault("wheel_motion_command_rejected")
+            return
+        self._last_command = command

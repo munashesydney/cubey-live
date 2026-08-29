@@ -81,6 +81,7 @@ class MappingService:
         resolution_m: float = 0.05,  # 5cm per pixel -> 20m x 20m map
         lidar_service=None,
         wheels_service=None,
+        autonomy_enabled: Optional[bool] = None,
     ):
         self.width = width
         self.height = height
@@ -109,12 +110,32 @@ class MappingService:
 
         self.on_snapshot: Optional[Callable[[MappingSnapshot], None]] = None
 
-        # Autonomous Frontier Navigation Manager
+        # Autonomous Frontier Navigation Manager. Motion is opt-in after
+        # commissioning; mapping-only mode remains available by default.
         from src.services.navigation import AutoNavigator
+        from src.config import config
+        config.validate_navigation()
+        self.autonomy_enabled = (
+            config.nav_autonomy_enabled
+            if autonomy_enabled is None
+            else bool(autonomy_enabled)
+        )
         self.navigator = AutoNavigator(
             mapping_service=self,
             lidar_service=self.lidar_service,
             wheels_service=wheels_service,
+            drive_speed=config.nav_drive_speed,
+            safety_stop_dist_mm=config.lidar_safety_distance_mm,
+            max_scan_age_s=config.nav_max_scan_age_s,
+            max_wheel_telemetry_age_s=config.nav_max_wheel_telemetry_age_s,
+            min_scan_points=config.nav_min_scan_points,
+            sensor_start_timeout_s=config.nav_sensor_start_timeout_s,
+            progress_timeout_s=config.nav_progress_timeout_s,
+            max_rotation_s=config.nav_max_rotation_s,
+            max_recovery_attempts=config.nav_max_recovery_attempts,
+            robot_length_m=config.robot_length_m,
+            robot_width_m=config.robot_width_m,
+            footprint_margin_m=config.robot_footprint_margin_m,
         )
 
         # Subscribe to LiDAR scan stream
@@ -151,7 +172,7 @@ class MappingService:
     # Mapping & Autonomous Exploration Controls
     # ------------------------------------------------------------------
 
-    def start_mapping(self) -> None:
+    def start_mapping(self) -> bool:
         """Enable active SLAM map updates and launch autonomous frontier exploration."""
         with self._lock:
             self.is_mapping = True
@@ -166,8 +187,16 @@ class MappingService:
             logger.warning("Could not auto-start LiDAR for mapping: %s", e)
 
         # Launch autonomous navigation
-        self.navigator.start()
+        if self.autonomy_enabled:
+            autonomous_started = self.navigator.start()
+        else:
+            self.navigator.stop()
+            autonomous_started = False
+            logger.warning(
+                "Mapping started in mapping-only mode; set NAV_AUTONOMY_ENABLED=true after commissioning"
+            )
         logger.info("2D House Mapping & Autonomous Exploration session started.")
+        return autonomous_started
 
     def pause_mapping(self) -> None:
         """Pause grid updates and autonomous exploration while keeping current map state."""
@@ -285,7 +314,7 @@ class MappingService:
 
         for pt in scan_points:
             dist_m = pt.distance_mm / 1000.0
-            if dist_m < 0.17 or dist_m > 14.0:
+            if dist_m < (self.lidar_service.min_valid_distance_mm / 1000.0) or dist_m > 14.0:
                 continue
 
             pt_rad = math.radians(pt.angle_deg)

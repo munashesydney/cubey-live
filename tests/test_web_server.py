@@ -7,6 +7,9 @@ from fastapi.testclient import TestClient
 
 from src.config import config
 from src.web.app import app
+from src.services.lidar_service import get_lidar_service
+from src.services.mapping_service import get_mapping_service
+from src.services.wheels_service import get_wheels_service
 
 
 class WebServerApiTests(unittest.TestCase):
@@ -15,6 +18,15 @@ class WebServerApiTests(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(app)
         self.auth = (config.web_username or "admin", config.web_password or "cubey")
+        self.wheels = get_wheels_service()
+        self.lidar = get_lidar_service()
+        self.wheels.connect(port="MOCK_SIMULATOR")
+        self.lidar.connect(port="MOCK_SIMULATOR")
+        self.wheels.clear_emergency_stop()
+
+    def tearDown(self):
+        get_mapping_service().pause_mapping()
+        self.wheels.clear_emergency_stop()
 
     def test_unauthorized_access_fails(self):
         res = self.client.get("/api/status")
@@ -64,6 +76,17 @@ class WebServerApiTests(unittest.TestCase):
 
         stop_res = self.client.post("/api/control/stop", auth=self.auth)
         self.assertEqual(stop_res.status_code, 200)
+        self.assertTrue(stop_res.json().get("latched"))
+
+        blocked_res = self.client.post(
+            "/api/control/move",
+            json={"action": "forward", "duration_ms": 50},
+            auth=self.auth,
+        )
+        self.assertEqual(blocked_res.status_code, 423)
+
+        reset_res = self.client.post("/api/control/estop/reset", auth=self.auth)
+        self.assertEqual(reset_res.status_code, 200)
 
 
 if __name__ == "__main__":

@@ -152,9 +152,35 @@ class AppConfig:
     lidar_port: str = os.getenv("LIDAR_PORT", "")
     lidar_baudrate: int = int(os.getenv("LIDAR_BAUDRATE", "460800"))
     lidar_safety_distance_mm: int = int(os.getenv("LIDAR_SAFETY_DISTANCE_MM", "300"))
+    lidar_min_valid_distance_mm: int = int(
+        os.getenv("LIDAR_MIN_VALID_DISTANCE_MM", "30")
+    )
+    lidar_mount_yaw_deg: float = float(os.getenv("LIDAR_MOUNT_YAW_DEG", "0"))
     lidar_auto_connect: bool = os.getenv(
         "LIDAR_AUTO_CONNECT", "false"
     ).strip().lower() not in {"0", "false", "no", "off"}
+
+    # Fail-closed autonomous navigation and measured physical footprint.
+    nav_drive_speed: int = int(os.getenv("NAV_DRIVE_SPEED", "120"))
+    nav_autonomy_enabled: bool = os.getenv(
+        "NAV_AUTONOMY_ENABLED", "false"
+    ).strip().lower() not in {"0", "false", "no", "off"}
+    nav_max_scan_age_s: float = float(os.getenv("NAV_MAX_SCAN_AGE_S", "0.35"))
+    nav_max_wheel_telemetry_age_s: float = float(
+        os.getenv("NAV_MAX_WHEEL_TELEMETRY_AGE_S", "1.0")
+    )
+    nav_min_scan_points: int = int(os.getenv("NAV_MIN_SCAN_POINTS", "30"))
+    nav_sensor_start_timeout_s: float = float(
+        os.getenv("NAV_SENSOR_START_TIMEOUT_S", "5.0")
+    )
+    nav_progress_timeout_s: float = float(os.getenv("NAV_PROGRESS_TIMEOUT_S", "2.5"))
+    nav_max_rotation_s: float = float(os.getenv("NAV_MAX_ROTATION_S", "1.8"))
+    nav_max_recovery_attempts: int = int(os.getenv("NAV_MAX_RECOVERY_ATTEMPTS", "4"))
+    robot_length_m: float = float(os.getenv("ROBOT_LENGTH_M", "0.36"))
+    robot_width_m: float = float(os.getenv("ROBOT_WIDTH_M", "0.36"))
+    robot_footprint_margin_m: float = float(
+        os.getenv("ROBOT_FOOTPRINT_MARGIN_M", "0.08")
+    )
 
     # Web Server & Remote Map Control (SLAM & Live View)
     web_server_enabled: bool = os.getenv(
@@ -172,5 +198,22 @@ class AppConfig:
                 "GEMINI_API_KEY environment variable is not set. "
                 "Please set GEMINI_API_KEY in your environment or in a .env file."
             )
+        self.validate_navigation()
+
+    def validate_navigation(self) -> None:
+        """Reject unsafe autonomous-navigation configuration independently."""
+        if not 70 <= self.nav_drive_speed <= 180:
+            raise ValueError("NAV_DRIVE_SPEED must be between 70 and 180 for autonomy")
+        if self.robot_length_m <= 0 or self.robot_width_m <= 0:
+            raise ValueError("ROBOT_LENGTH_M and ROBOT_WIDTH_M must be measured positive values")
+        minimum_stop_m = self.robot_length_m / 2.0 + self.robot_footprint_margin_m
+        if self.lidar_safety_distance_mm / 1000.0 <= minimum_stop_m:
+            raise ValueError(
+                "LIDAR_SAFETY_DISTANCE_MM must extend beyond the front footprint and margin"
+            )
+        if not 0.1 <= self.nav_max_scan_age_s <= 1.0:
+            raise ValueError("NAV_MAX_SCAN_AGE_S must be between 0.1 and 1.0")
+        if self.nav_min_scan_points < 10:
+            raise ValueError("NAV_MIN_SCAN_POINTS must be at least 10")
 
 config = AppConfig()
