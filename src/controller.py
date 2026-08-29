@@ -344,7 +344,7 @@ class ApplicationController:
                 self.gui.client = self.client
 
             wheels_service = get_wheels_service()
-            wheels_service.on_telemetry = self._on_telemetry_received
+            wheels_service.add_telemetry_listener(self._on_telemetry_received)
             threading.Thread(
                 target=wheels_service.connect,
                 daemon=True,

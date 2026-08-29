@@ -91,6 +91,8 @@ class WheelsService:
         self.on_telemetry = on_telemetry
         self.on_log = on_log
         self.on_connection_change = on_connection_change
+        self._telemetry_listener_lock = threading.RLock()
+        self._telemetry_listeners: List[Callable[[TelemetryData], None]] = []
 
         self._serial: Optional[Any] = None
         self._connection_lock = threading.RLock()
@@ -132,8 +134,33 @@ class WheelsService:
         if charging is not None:
             self._is_charging = charging
             self.telemetry.is_charging = charging
-            if self.on_telemetry:
-                self.on_telemetry(self.telemetry)
+            self._notify_telemetry(self.telemetry)
+
+    def add_telemetry_listener(
+        self, listener: Callable[[TelemetryData], None]
+    ) -> None:
+        """Subscribe without replacing other telemetry consumers."""
+        with self._telemetry_listener_lock:
+            if listener not in self._telemetry_listeners:
+                self._telemetry_listeners.append(listener)
+
+    def remove_telemetry_listener(
+        self, listener: Callable[[TelemetryData], None]
+    ) -> None:
+        with self._telemetry_listener_lock:
+            if listener in self._telemetry_listeners:
+                self._telemetry_listeners.remove(listener)
+
+    def _notify_telemetry(self, telemetry: TelemetryData) -> None:
+        with self._telemetry_listener_lock:
+            listeners = list(self._telemetry_listeners)
+        if self.on_telemetry and self.on_telemetry not in listeners:
+            listeners.insert(0, self.on_telemetry)
+        for listener in listeners:
+            try:
+                listener(telemetry)
+            except Exception as exc:
+                logger.warning("Telemetry listener failed: %s", exc)
 
     @staticmethod
     def _get_default_port_for_platform() -> str:
@@ -536,14 +563,20 @@ class WheelsService:
         if not line:
             return
 
+        if line.startswith("TELEMETRY:"):
+            # Telemetry arrives four times per second and is reflected in the
+            # live labels. Do not flood the developer terminal with raw frames.
+            self._parse_telemetry(line[len("TELEMETRY:"):])
+            return
+
         self._emit_log(f"[RX] {line}")
 
-        if line.startswith("TELEMETRY:"):
-            self._parse_telemetry(line[len("TELEMETRY:"):])
-        elif line.startswith("ACK:"):
-            pass
-        elif line == "PONG":
-            pass
+        if line.startswith("CHARGE_DIAG:"):
+            logger.info("ESP32 %s", line)
+        elif line.startswith("CLIFF_EVENT:") or line.startswith("[CLIFF DETECTED]"):
+            logger.warning("ESP32 %s", line)
+        elif line.startswith("SENSOR_ERROR:") or "cliff sensor failed" in line:
+            logger.error("ESP32 %s", line)
 
     def _parse_telemetry(self, payload: str) -> None:
         """
@@ -606,10 +639,11 @@ class WheelsService:
                     if not self._motion_inhibit_reason:
                         self._motion_inhibit_reason = "controller_reported_estop"
 
-            if self.on_telemetry:
-                self.on_telemetry(self.telemetry)
         except Exception as e:
             logger.warning("Failed to parse telemetry '%s': %s", payload, e)
+            return
+
+        self._notify_telemetry(self.telemetry)
 
     # ------------------------------------------------------------------
     # Background Worker Loops

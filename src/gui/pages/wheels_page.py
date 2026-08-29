@@ -7,7 +7,8 @@ for the Raspberry Pi 5 to ESP32-S3 UART connection.
 """
 
 import logging
-from typing import Optional
+import threading
+from typing import List, Optional
 
 import customtkinter as ctk
 
@@ -39,8 +40,9 @@ class WheelsPage(ctk.CTkFrame):
 
         self.service = wheels_service or get_wheels_service()
 
-        # Ensure service callbacks point here even if injected
-        self.service.on_telemetry = self._on_telemetry_received
+        # Telemetry has multiple consumers (main face, API, developer page).
+        # Subscribe without replacing the controller's charging-animation feed.
+        self.service.add_telemetry_listener(self._on_telemetry_received)
         self.service.on_log = self._on_log_received
         self.service.on_connection_change = self._on_connection_changed
 
@@ -49,11 +51,18 @@ class WheelsPage(ctk.CTkFrame):
         self._pulse_duration_ms: int = 250
         self._control_mode: str = "hold"  # "hold" or "pulse"
         self._pending_logs: List[str] = []
-        self._log_flush_scheduled: bool = False
+        self._pending_logs_lock = threading.Lock()
+        self._pending_telemetry: Optional[TelemetryData] = None
+        self._pending_telemetry_lock = threading.Lock()
 
         self._create_layout()
         self._bind_keyboard_events()
         self._refresh_port_list()
+        self.after(50, self._drain_background_updates)
+
+    def destroy(self) -> None:
+        self.service.remove_telemetry_listener(self._on_telemetry_received)
+        super().destroy()
 
     def _create_layout(self) -> None:
         """Create header, connection bar, and two-column main workspace."""
@@ -823,49 +832,57 @@ class WheelsPage(ctk.CTkFrame):
     # ------------------------------------------------------------------
 
     def _on_telemetry_received(self, data: TelemetryData) -> None:
-        """Update live UI telemetry badges (dispatched on main idle)."""
-        def _update():
-            if not self.winfo_exists():
-                return
-            try:
-                self.front_dist_label.configure(text=f"{data.front_distance_mm} mm")
-                self.back_dist_label.configure(text=f"{data.back_distance_mm} mm")
+        """Store the newest frame without calling Tk from the serial thread."""
+        with self._pending_telemetry_lock:
+            self._pending_telemetry = data
 
-                if data.front_cliff:
-                    self.front_cliff_badge.configure(
-                        text="⚠️ CLIFF DETECTED", text_color=COLOR_DANGER
-                    )
-                else:
-                    self.front_cliff_badge.configure(text="Safe", text_color=COLOR_SUCCESS)
+    def _apply_telemetry(self, data: TelemetryData) -> None:
+        self.front_dist_label.configure(text=f"{data.front_distance_mm} mm")
+        self.back_dist_label.configure(text=f"{data.back_distance_mm} mm")
 
-                if data.back_cliff:
-                    self.back_cliff_badge.configure(
-                        text="⚠️ CLIFF DETECTED", text_color=COLOR_DANGER
-                    )
-                else:
-                    self.back_cliff_badge.configure(text="Safe", text_color=COLOR_SUCCESS)
+        if data.front_cliff:
+            self.front_cliff_badge.configure(
+                text="⚠️ CLIFF DETECTED", text_color=COLOR_DANGER
+            )
+        else:
+            self.front_cliff_badge.configure(text="Safe", text_color=COLOR_SUCCESS)
 
-                motion_color = COLOR_SUCCESS if data.motion != "STOPPED" else COLOR_WARNING
-                self.motion_label.configure(
-                    text=f"State: {data.motion}", text_color=motion_color
+        if data.back_cliff:
+            self.back_cliff_badge.configure(
+                text="⚠️ CLIFF DETECTED", text_color=COLOR_DANGER
+            )
+        else:
+            self.back_cliff_badge.configure(text="Safe", text_color=COLOR_SUCCESS)
+
+        motion_color = COLOR_SUCCESS if data.motion != "STOPPED" else COLOR_WARNING
+        self.motion_label.configure(
+            text=f"State: {data.motion}", text_color=motion_color
+        )
+
+        if data.battery_voltage > 0:
+            if data.is_charging:
+                self.battery_label.configure(
+                    text=(
+                        f"⚡ Charging: {data.battery_pct}% "
+                        f"({data.battery_voltage:.2f}V)"
+                    ),
+                    text_color="#A6E3A1",
                 )
-
-                if data.battery_voltage > 0:
-                    if data.is_charging:
-                        self.battery_label.configure(
-                            text=f"⚡ Charging: {data.battery_pct}% ({data.battery_voltage:.2f}V)",
-                            text_color="#A6E3A1"
-                        )
-                    else:
-                        batt_color = COLOR_SUCCESS if data.battery_pct >= 50 else (COLOR_WARNING if data.battery_pct >= 20 else COLOR_DANGER)
-                        self.battery_label.configure(
-                            text=f"🔋 Battery: {data.battery_pct}% ({data.battery_voltage:.2f}V)",
-                            text_color=batt_color
-                        )
-            except Exception:
-                pass
-
-        self.after_idle(_update)
+            else:
+                batt_color = (
+                    COLOR_SUCCESS
+                    if data.battery_pct >= 50
+                    else COLOR_WARNING
+                    if data.battery_pct >= 20
+                    else COLOR_DANGER
+                )
+                self.battery_label.configure(
+                    text=(
+                        f"🔋 Battery: {data.battery_pct}% "
+                        f"({data.battery_voltage:.2f}V)"
+                    ),
+                    text_color=batt_color,
+                )
 
     def _toggle_sim_charge(self) -> None:
         """Toggle simulated charging state on WheelsService for testing."""
@@ -875,20 +892,34 @@ class WheelsPage(ctk.CTkFrame):
         self.service._emit_log(f"⚡ [Sim] Charging state set to: {new_state}")
 
     def _on_log_received(self, text: str) -> None:
-        """Buffer incoming log line and schedule batched UI flush to prevent GUI freezing."""
-        self._pending_logs.append(text)
-        if not self._log_flush_scheduled:
-            self._log_flush_scheduled = True
-            self.after(50, self._flush_pending_logs)
+        """Buffer a log line without calling Tk from a worker thread."""
+        with self._pending_logs_lock:
+            self._pending_logs.append(text)
+
+    def _drain_background_updates(self) -> None:
+        """Apply worker-thread telemetry and logs from the Tk main thread."""
+        if not self.winfo_exists():
+            return
+        with self._pending_telemetry_lock:
+            telemetry = self._pending_telemetry
+            self._pending_telemetry = None
+        if telemetry is not None:
+            try:
+                self._apply_telemetry(telemetry)
+            except Exception:
+                logger.exception("Failed to update Wheels telemetry UI")
+        self._flush_pending_logs()
+        self.after(50, self._drain_background_updates)
 
     def _flush_pending_logs(self) -> None:
         """Batch-insert pending log lines into the embedded terminal."""
-        self._log_flush_scheduled = False
-        if not self.winfo_exists() or not self._pending_logs:
+        if not self.winfo_exists():
             return
-
-        chunk = "\n".join(self._pending_logs) + "\n"
-        self._pending_logs.clear()
+        with self._pending_logs_lock:
+            if not self._pending_logs:
+                return
+            chunk = "\n".join(self._pending_logs) + "\n"
+            self._pending_logs.clear()
 
         try:
             self.terminal_box.insert("end", chunk)
@@ -901,5 +932,6 @@ class WheelsPage(ctk.CTkFrame):
             pass
 
     def _clear_terminal(self) -> None:
-        self._pending_logs.clear()
+        with self._pending_logs_lock:
+            self._pending_logs.clear()
         self.terminal_box.delete("1.0", "end")

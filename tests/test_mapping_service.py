@@ -85,6 +85,14 @@ class MappingServiceTests(unittest.TestCase):
         gx_mid, gy_mid = self.mapping_svc.world_to_grid(0.0, 0.5)
         self.assertEqual(self.mapping_svc._grid[gy_mid, gx_mid], 0)
 
+    def test_raycasting_ignores_robot_chassis_reflection(self):
+        reflection = LidarPoint(angle_deg=351.4, distance_mm=56.0, quality=60)
+
+        hits = self.mapping_svc._raycast_update(0.0, 0.0, [reflection])
+
+        self.assertEqual(hits, [])
+        self.assertEqual(int(np.count_nonzero(self.mapping_svc._grid == 100)), 0)
+
     def test_compression_and_persistence(self):
         compressed = self.mapping_svc.get_compressed_grid()
         self.assertIsInstance(compressed, bytes)

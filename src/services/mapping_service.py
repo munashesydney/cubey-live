@@ -82,7 +82,11 @@ class MappingService:
         lidar_service=None,
         wheels_service=None,
         autonomy_enabled: Optional[bool] = None,
+        robot_length_m: Optional[float] = None,
+        robot_width_m: Optional[float] = None,
     ):
+        from src.config import config
+
         self.width = width
         self.height = height
         self.resolution_m = resolution_m
@@ -93,6 +97,16 @@ class MappingService:
         self.origin_y_m = -(self.height * self.resolution_m) / 2.0
 
         self.lidar_service = lidar_service or get_lidar_service()
+        self.robot_half_length_m = (
+            float(robot_length_m)
+            if robot_length_m is not None
+            else config.robot_length_m
+        ) / 2.0
+        self.robot_half_width_m = (
+            float(robot_width_m)
+            if robot_width_m is not None
+            else config.robot_width_m
+        ) / 2.0
 
         # Log-odds probability grid (-5.0 = free, +5.0 = occupied, 0.0 = unknown)
         self._log_odds = np.zeros((self.height, self.width), dtype=np.float32)
@@ -113,7 +127,6 @@ class MappingService:
         # Autonomous Frontier Navigation Manager. Motion is opt-in after
         # commissioning; mapping-only mode remains available by default.
         from src.services.navigation import AutoNavigator
-        from src.config import config
         config.validate_navigation()
         self.autonomy_enabled = (
             config.nav_autonomy_enabled
@@ -133,8 +146,8 @@ class MappingService:
             progress_timeout_s=config.nav_progress_timeout_s,
             max_rotation_s=config.nav_max_rotation_s,
             max_recovery_attempts=config.nav_max_recovery_attempts,
-            robot_length_m=config.robot_length_m,
-            robot_width_m=config.robot_width_m,
+            robot_length_m=self.robot_half_length_m * 2.0,
+            robot_width_m=self.robot_half_width_m * 2.0,
             footprint_margin_m=config.robot_footprint_margin_m,
         )
 
@@ -167,6 +180,13 @@ class MappingService:
     def is_inside_grid(self, gx: int, gy: int) -> bool:
         """Check whether cell coordinates fall within map boundaries."""
         return 0 <= gx < self.width and 0 <= gy < self.height
+
+    def is_robot_self_return(self, point: LidarPoint) -> bool:
+        """Exclude chassis/mount reflections inside the measured robot body."""
+        return (
+            abs(point.x_m) <= self.robot_half_width_m
+            and abs(point.y_m) <= self.robot_half_length_m
+        )
 
     # ------------------------------------------------------------------
     # Mapping & Autonomous Exploration Controls
@@ -245,7 +265,13 @@ class MappingService:
         theta_candidates = [self.pose.theta_deg + dth for dth in [-4.0, -2.0, 0.0, 2.0, 4.0]]
 
         # Sample a subset of high-quality points to speed up correlation
-        valid_points = [p for p in scan_points if 200 <= p.distance_mm <= 10000 and p.quality > 15]
+        valid_points = [
+            point
+            for point in scan_points
+            if 200 <= point.distance_mm <= 10000
+            and point.quality > 15
+            and not self.is_robot_self_return(point)
+        ]
         if len(valid_points) > 80:
             step = len(valid_points) // 80
             valid_points = valid_points[::step]
@@ -315,6 +341,8 @@ class MappingService:
         for pt in scan_points:
             dist_m = pt.distance_mm / 1000.0
             if dist_m < (self.lidar_service.min_valid_distance_mm / 1000.0) or dist_m > 14.0:
+                continue
+            if self.is_robot_self_return(pt):
                 continue
 
             pt_rad = math.radians(pt.angle_deg)

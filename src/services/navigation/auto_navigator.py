@@ -38,9 +38,17 @@ class NavigationState(str, enum.Enum):
 class AutoNavigator:
     """Bounded frontier explorer with an independent LiDAR safety gate."""
 
-    _FORWARD_COMMANDS = {"forward", "forwardLeft", "forwardRight"}
-    _BACKWARD_COMMANDS = {"backward", "backwardLeft", "backwardRight"}
     _ROTATION_COMMANDS = {"rotateLeft", "rotateRight"}
+    _TRANSLATION_VECTORS = {
+        "forward": (0.0, 1.0),
+        "backward": (0.0, -1.0),
+        "strafeLeft": (-1.0, 0.0),
+        "strafeRight": (1.0, 0.0),
+        "forwardLeft": (-1.0, 1.0),
+        "forwardRight": (1.0, 1.0),
+        "backwardLeft": (-1.0, -1.0),
+        "backwardRight": (1.0, -1.0),
+    }
 
     def __init__(
         self,
@@ -137,6 +145,11 @@ class AutoNavigator:
             "recovery_attempts": self._recovery_attempts,
             "last_safety_rejection": self.last_safety_rejection,
             "last_safety_rejection_at": self.last_safety_rejection_at,
+            "self_masked_lidar_points": sum(
+                1
+                for point in self.lidar_service.latest_scan.points
+                if self._is_self_return(point)
+            ),
         }
 
     # ------------------------------------------------------------------
@@ -394,12 +407,20 @@ class AutoNavigator:
     # Independent collision monitor
     # ------------------------------------------------------------------
 
+    def _is_self_return(self, point: LidarPoint) -> bool:
+        """True when a scan hit lies inside Cubey's measured physical body."""
+        return (
+            abs(point.x_m) <= self.robot_half_width_m
+            and abs(point.y_m) <= self.robot_half_length_m
+        )
+
     def _valid_points(self) -> List[LidarPoint]:
         return [
             point
             for point in self.lidar_service.latest_scan.points
             if point.quality > 0
             and point.distance_mm >= self.lidar_service.min_valid_distance_mm
+            and not self._is_self_return(point)
         ]
 
     def _collision_reason(self, command: str) -> Optional[str]:
@@ -410,24 +431,41 @@ class AutoNavigator:
         rotation_radius = math.hypot(
             self.robot_half_length_m, self.robot_half_width_m
         ) + self.footprint_margin_m
-        corridor_half_width = self.robot_half_width_m + self.footprint_margin_m
+        base_clearance_m = max(
+            0.05,
+            self.safety_stop_dist_m
+            - max(self.robot_half_length_m, self.robot_half_width_m),
+        )
 
         for point in self._valid_points():
             x, y = point.x_m, point.y_m
             if command in self._ROTATION_COMMANDS:
                 if math.hypot(x, y) <= rotation_radius:
                     danger_points.append(point)
-            elif command in self._FORWARD_COMMANDS:
-                if 0.0 <= y <= self.safety_stop_dist_m and abs(x) <= corridor_half_width:
-                    danger_points.append(point)
-            elif command in self._BACKWARD_COMMANDS:
-                if -self.safety_stop_dist_m <= y <= 0.0 and abs(x) <= corridor_half_width:
-                    danger_points.append(point)
-            elif command == "strafeLeft":
-                if -self.robot_half_length_m <= y <= self.robot_half_length_m and -self.safety_stop_dist_m <= x <= 0.0:
-                    danger_points.append(point)
-            elif command == "strafeRight":
-                if -self.robot_half_length_m <= y <= self.robot_half_length_m and 0.0 <= x <= self.safety_stop_dist_m:
+            elif command in self._TRANSLATION_VECTORS:
+                vector_x, vector_y = self._TRANSLATION_VECTORS[command]
+                magnitude = math.hypot(vector_x, vector_y)
+                velocity_x = vector_x / magnitude
+                velocity_y = vector_y / magnitude
+
+                # Project the rectangular body onto axes parallel and
+                # perpendicular to the commanded travel direction. The danger
+                # zone is the body swept forward by the stopping clearance.
+                along = x * velocity_x + y * velocity_y
+                cross = x * (-velocity_y) + y * velocity_x
+                along_extent = (
+                    abs(velocity_x) * self.robot_half_width_m
+                    + abs(velocity_y) * self.robot_half_length_m
+                )
+                cross_extent = (
+                    abs(velocity_y) * self.robot_half_width_m
+                    + abs(velocity_x) * self.robot_half_length_m
+                    + self.footprint_margin_m
+                )
+                if (
+                    0.0 < along <= along_extent + base_clearance_m
+                    and abs(cross) <= cross_extent
+                ):
                     danger_points.append(point)
 
         if not danger_points:
@@ -535,10 +573,15 @@ class AutoNavigator:
 
         self._recovery_attempts += 1
         direction = "rotateRight" if self._recovery_attempts % 2 else "rotateLeft"
-        if self._collision_reason(direction):
+        rotation_block = self._collision_reason(direction)
+        if rotation_block:
             opposite = "rotateLeft" if direction == "rotateRight" else "rotateRight"
-            if self._collision_reason(opposite):
-                self._set_fault("recovery_rotation_blocked_both_directions")
+            opposite_block = self._collision_reason(opposite)
+            if opposite_block:
+                self._set_fault(
+                    "recovery_rotation_blocked_both_directions:"
+                    f"{rotation_block};{opposite_block}"
+                )
                 return
             direction = opposite
         self._bounded_rotation(direction, duration_s=0.25)

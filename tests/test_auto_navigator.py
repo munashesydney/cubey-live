@@ -63,7 +63,7 @@ class AutoNavigatorTests(unittest.TestCase):
         self.assertFalse(self.navigator.is_active)
 
     def test_forward_collision_zone_detects_close_wall(self):
-        wall = LidarPoint(angle_deg=0.0, distance_mm=100.0, quality=60)
+        wall = LidarPoint(angle_deg=0.0, distance_mm=220.0, quality=60)
         self.mock_lidar.latest_scan = LidarScanData(
             points=[wall],
             timestamp=time.time(),
@@ -74,7 +74,61 @@ class AutoNavigatorTests(unittest.TestCase):
         reason = self.navigator._collision_reason("forward")
 
         self.assertIsNotNone(reason)
-        self.assertIn("100mm", reason)
+        self.assertIn("220mm", reason)
+
+    def test_chassis_reflection_does_not_block_any_motion(self):
+        # Exact signature observed on Cubey: 56-58 mm around zero degrees.
+        reflection = LidarPoint(angle_deg=351.4, distance_mm=56.0, quality=60)
+        self.mock_lidar.latest_scan = LidarScanData(points=[reflection])
+
+        commands = [
+            "forward",
+            "backward",
+            "strafeLeft",
+            "strafeRight",
+            "forwardLeft",
+            "forwardRight",
+            "backwardLeft",
+            "backwardRight",
+            "rotateLeft",
+            "rotateRight",
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertIsNone(self.navigator._collision_reason(command))
+
+    def test_mapping_joystick_gate_allows_motion_with_observed_self_return(self):
+        self.mock_wheels.connect(port="MOCK_SIMULATOR")
+        self.mock_lidar.connect(port="MOCK_SIMULATOR")
+        points = [
+            LidarPoint(angle_deg=float(i * 10), distance_mm=1500.0, quality=60)
+            for i in range(36)
+        ]
+        points.append(LidarPoint(angle_deg=351.4, distance_mm=56.0, quality=60))
+        self.mock_lidar.latest_scan = LidarScanData(
+            points=points,
+            timestamp=time.time(),
+            scan_rate_hz=10.0,
+            point_count=len(points),
+        )
+
+        for command in [
+            "forward",
+            "strafeLeft",
+            "strafeRight",
+            "rotateLeft",
+            "rotateRight",
+        ]:
+            with self.subTest(command=command):
+                safe, reason = self.navigator.authorize_manual_motion(command)
+                self.assertTrue(safe, reason)
+
+    def test_directional_obstacle_only_blocks_motion_toward_it(self):
+        front_wall = LidarPoint(angle_deg=0.0, distance_mm=240.0, quality=60)
+        self.mock_lidar.latest_scan = LidarScanData(points=[front_wall])
+
+        self.assertIsNotNone(self.navigator._collision_reason("forward"))
+        self.assertIsNone(self.navigator._collision_reason("backward"))
 
     def test_rotation_checks_entire_footprint(self):
         side_wall = LidarPoint(angle_deg=90.0, distance_mm=220.0, quality=60)

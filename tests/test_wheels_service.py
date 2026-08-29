@@ -109,7 +109,9 @@ class WheelsServiceProtocolTests(unittest.TestCase):
 
     def test_telemetry_parsing(self):
         telemetry_events = []
+        terminal_lines = []
         self.service.on_telemetry = lambda telem: telemetry_events.append(telem)
+        self.service.on_log = lambda line: terminal_lines.append(line)
 
         raw_line = "TELEMETRY:front_dist=62,back_dist=65,front_cliff=0,back_cliff=1,motion=FORWARD,speed=210,batt_v=7.85,batt_pct=72"
         self.service._parse_incoming_line(raw_line)
@@ -124,6 +126,47 @@ class WheelsServiceProtocolTests(unittest.TestCase):
         self.assertEqual(t.speed, 210)
         self.assertEqual(t.battery_voltage, 7.85)
         self.assertEqual(t.battery_pct, 72)
+        self.assertFalse(any("TELEMETRY:" in line for line in terminal_lines))
+
+    def test_structured_firmware_events_remain_visible(self):
+        terminal_lines = []
+        self.service.on_log = lambda line: terminal_lines.append(line)
+
+        self.service._parse_incoming_line(
+            "CHARGE_DIAG:batt_v=7.410,baseline_v=7.405,delta_v=0.005,charging=0"
+        )
+        self.service._parse_incoming_line(
+            "CLIFF_EVENT:side=front,front_mm=450,back_mm=52"
+        )
+
+        self.assertTrue(any("CHARGE_DIAG:" in line for line in terminal_lines))
+        self.assertTrue(any("CLIFF_EVENT:" in line for line in terminal_lines))
+
+    def test_telemetry_is_delivered_to_multiple_consumers(self):
+        legacy_events = []
+        listener_events = []
+        self.service.on_telemetry = lambda data: legacy_events.append(data)
+        self.service.add_telemetry_listener(lambda data: listener_events.append(data))
+
+        self.service._parse_incoming_line(
+            "TELEMETRY:front_dist=50,back_dist=51,motion=STOPPED,speed=180"
+        )
+
+        self.assertEqual(len(legacy_events), 1)
+        self.assertEqual(len(listener_events), 1)
+
+    def test_bad_telemetry_listener_does_not_invalidate_frame(self):
+        def broken_listener(_data):
+            raise RuntimeError("closed GUI")
+
+        self.service.add_telemetry_listener(broken_listener)
+        self.service._parse_incoming_line(
+            "TELEMETRY:front_dist=61,back_dist=52,motion=STOPPED,speed=180"
+        )
+
+        healthy, reason = self.service.telemetry_health()
+        self.assertTrue(healthy, reason)
+        self.assertEqual(self.service.telemetry.front_distance_mm, 61)
 
     def test_ping_and_status(self):
         sent_lines = []
