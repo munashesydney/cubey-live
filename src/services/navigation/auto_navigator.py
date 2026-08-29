@@ -562,7 +562,7 @@ class AutoNavigator:
             gx, gy = self.mapping_service.world_to_grid(tx, ty)
             if not self.mapping_service.is_inside_grid(gx, gy):
                 continue
-            if grid[gy, gx] != 0 or inflated_mask[gy, gx]:
+            if grid[gy, gx] != 0:
                 continue
 
             path = self.path_planner.plan_path(

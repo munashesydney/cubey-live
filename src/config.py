@@ -183,7 +183,7 @@ class AppConfig:
     robot_length_m: float = float(os.getenv("ROBOT_LENGTH_M", "0.36"))
     robot_width_m: float = float(os.getenv("ROBOT_WIDTH_M", "0.36"))
     robot_footprint_margin_m: float = float(
-        os.getenv("ROBOT_FOOTPRINT_MARGIN_M", "0.08")
+        os.getenv("ROBOT_FOOTPRINT_MARGIN_M", "0.04")
     )
 
     # Web Server & Remote Map Control (SLAM & Live View)
