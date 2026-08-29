@@ -172,6 +172,17 @@ class WheelsService:
 
         return ports
 
+    @staticmethod
+    def _enumerated_hardware_ports() -> List[str]:
+        """Return only ports reported by the OS, without UI fallback entries."""
+        if not PYSERIAL_AVAILABLE or serial is None:
+            return []
+        try:
+            return [port_info.device for port_info in serial.tools.list_ports.comports()]
+        except Exception as exc:
+            logger.warning("Error scanning physical serial ports: %s", exc)
+            return []
+
     @property
     def is_connected(self) -> bool:
         return self._is_connected
@@ -231,9 +242,9 @@ class WheelsService:
             return True
 
         # Build candidate ports list to try
-        candidate_ports = [self.port]
-        for p in self.list_available_ports():
-            if p not in candidate_ports and p != "MOCK_SIMULATOR":
+        candidate_ports = [self.port] if self.port else []
+        for p in self._enumerated_hardware_ports():
+            if p not in candidate_ports:
                 candidate_ports.append(p)
 
         for candidate in candidate_ports:
@@ -255,21 +266,34 @@ class WheelsService:
                 )
                 self._reader_thread.start()
 
+                # Opening an arbitrary serial port is not proof that it is the
+                # wheel controller. Require a valid telemetry response before
+                # exposing the connection or permitting commands.
+                handshake_deadline = time.monotonic() + 4.0
+                while time.monotonic() < handshake_deadline and not self._telemetry_received:
+                    self.request_status()
+                    time.sleep(0.20)
+                if not self._telemetry_received:
+                    raise TimeoutError("wheel controller telemetry handshake timed out")
+
                 self._emit_log(f"Connected to hardware UART: {self.port} @ {self.baudrate} baud")
                 self._emit_connection_change(True, f"Connected ({self.port})")
                 logger.info("WheelsService successfully connected to ESP32 on %s @ %d baud.", self.port, self.baudrate)
-
-                # Request initial status
-                self.request_status()
                 return True
             except Exception as e:
                 logger.debug("Could not connect WheelsService to port %s: %s", candidate, e)
+                self._running = False
                 if self._serial:
                     try:
                         self._serial.close()
                     except Exception:
                         pass
                 self._serial = None
+                if self._reader_thread and self._reader_thread.is_alive():
+                    self._reader_thread.join(timeout=1.2)
+                self._reader_thread = None
+                self._is_connected = False
+                self._telemetry_received = False
 
         logger.warning("WheelsService could not find physical ESP32 UART on candidates %s", candidate_ports)
         self._is_connected = False

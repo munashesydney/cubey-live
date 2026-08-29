@@ -218,9 +218,12 @@ class AutoNavigator:
     def clear_emergency_stop(self) -> Tuple[bool, str]:
         if self._running:
             return False, "autonomy_must_be_stopped"
-        healthy, reason = self._sensor_health()
-        if not healthy:
-            return False, reason
+        if not self.wheels_service.is_connected:
+            return False, "wheels_disconnected"
+        # Re-arming is an operator-supervised action. Requiring the same wheel
+        # telemetry or LiDAR stream that may have caused the stop creates an
+        # unrecoverable lockout. Reset never resumes motion; subsequent manual
+        # and autonomous commands still pass their own health gates.
         if not self.wheels_service.clear_emergency_stop():
             return False, "wheel_controller_reset_failed"
         with self._lock:
@@ -237,18 +240,21 @@ class AutoNavigator:
         return True
 
     def authorize_manual_motion(self, command: str) -> Tuple[bool, str]:
-        """Apply the same fail-closed gate before any remote drive command."""
+        """Gate supervised motion without coupling it to autonomy health."""
         if command == "stop":
             return True, "ok"
         if self.wheels_service.is_emergency_stopped:
             return False, self.wheels_service.emergency_stop_reason
-        healthy, reason = self._sensor_health()
-        if not healthy:
-            self.emergency_stop(f"manual_motion_rejected:{reason}")
-            return False, reason
+        if not self.wheels_service.is_connected:
+            return False, "wheels_disconnected"
+        lidar_healthy, lidar_reason = self._lidar_health()
+        if not lidar_healthy:
+            return False, lidar_reason
         collision = self._collision_reason(command)
         if collision:
-            self.emergency_stop(f"manual_motion_collision:{collision}")
+            # Reject this direction and cancel any prior continuous command,
+            # while leaving the operator able to steer away from the obstacle.
+            self.wheels_service.stop()
             return False, collision
         return True, "ok"
 
@@ -274,6 +280,9 @@ class AutoNavigator:
         )
         if not wheels_healthy:
             return False, wheels_reason
+        return self._lidar_health()
+
+    def _lidar_health(self) -> Tuple[bool, str]:
         return self.lidar_service.scan_health(
             max_age_s=self.max_scan_age_s,
             min_points=self.min_scan_points,

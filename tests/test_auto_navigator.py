@@ -140,7 +140,35 @@ class AutoNavigatorTests(unittest.TestCase):
 
         self.assertFalse(safe)
         self.assertIn("lidar", reason)
-        self.assertTrue(self.mock_wheels.is_emergency_stopped)
+        self.assertFalse(self.mock_wheels.is_emergency_stopped)
+
+    def test_manual_motion_does_not_require_autonomous_telemetry_heartbeat(self):
+        self.mock_wheels.connect(port="MOCK_SIMULATOR")
+        self.mock_lidar.connect(port="MOCK_SIMULATOR")
+        self.mock_lidar.latest_scan = LidarScanData(
+            points=[
+                LidarPoint(angle_deg=float(i * 10), distance_mm=1500.0, quality=60)
+                for i in range(36)
+            ],
+            timestamp=time.time(),
+            scan_rate_hz=10.0,
+            point_count=36,
+        )
+        self.mock_wheels.telemetry.timestamp = time.time() - 90.0
+
+        safe, reason = self.navigator.authorize_manual_motion("forward")
+
+        self.assertTrue(safe, reason)
+
+    def test_estop_can_be_rearmed_when_wheel_telemetry_is_stale(self):
+        self.mock_wheels.connect(port="MOCK_SIMULATOR")
+        self.mock_wheels.emergency_stop("test")
+        self.mock_wheels.telemetry.timestamp = time.time() - 90.0
+
+        cleared, reason = self.navigator.clear_emergency_stop()
+
+        self.assertTrue(cleared, reason)
+        self.assertFalse(self.mock_wheels.is_emergency_stopped)
 
 
 if __name__ == "__main__":
