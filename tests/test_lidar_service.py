@@ -46,6 +46,20 @@ class LidarServiceTests(unittest.TestCase):
         svc2 = get_lidar_service()
         self.assertIs(svc1, svc2)
 
+    def test_scan_listeners_do_not_replace_primary_callback(self):
+        primary = []
+        secondary = []
+        self.service.on_scan_data = primary.append
+        self.service.add_scan_listener(secondary.append)
+        scan = LidarScanData()
+
+        self.service._notify_scan(scan)
+        self.service.remove_scan_listener(secondary.append)
+        self.service._notify_scan(scan)
+
+        self.assertEqual(primary, [scan, scan])
+        self.assertEqual(secondary, [scan])
+
     def test_lidar_point_cartesian_math(self):
         # 0 deg = North (+Y, X=0)
         p_north = LidarPoint(angle_deg=0.0, distance_mm=1000.0, quality=50)

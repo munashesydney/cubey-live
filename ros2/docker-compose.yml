@@ -1,0 +1,19 @@
+services:
+  cubey-nav:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cubey-nav:jazzy
+    container_name: cubey-nav
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      ROS_DOMAIN_ID: "42"
+      ROS_LOCALHOST_ONLY: "1"
+    command: ["ros2", "launch", "cubey_nav", "navigation.launch.py"]
+    healthcheck:
+      test: ["CMD-SHELL", "bash -lc 'source /opt/ros/jazzy/setup.bash && ros2 node list | grep -q /rosbridge_websocket'"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s

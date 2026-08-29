@@ -128,6 +128,8 @@ class LidarService:
         self.on_scan_data = on_scan_data
         self.on_log = on_log
         self.on_connection_change = on_connection_change
+        self._scan_listener_lock = threading.RLock()
+        self._scan_listeners: List[Callable[[LidarScanData], None]] = []
 
         self._serial: Optional[Any] = None
         self._write_lock = threading.Lock()
@@ -197,6 +199,32 @@ class LidarService:
     @property
     def is_mock(self) -> bool:
         return self._is_mock
+
+    def add_scan_listener(
+        self, listener: Callable[[LidarScanData], None]
+    ) -> None:
+        """Subscribe to complete scans without replacing the GUI/map callback."""
+        with self._scan_listener_lock:
+            if listener not in self._scan_listeners:
+                self._scan_listeners.append(listener)
+
+    def remove_scan_listener(
+        self, listener: Callable[[LidarScanData], None]
+    ) -> None:
+        with self._scan_listener_lock:
+            if listener in self._scan_listeners:
+                self._scan_listeners.remove(listener)
+
+    def _notify_scan(self, scan_data: LidarScanData) -> None:
+        with self._scan_listener_lock:
+            listeners = list(self._scan_listeners)
+        if self.on_scan_data and self.on_scan_data not in listeners:
+            listeners.insert(0, self.on_scan_data)
+        for listener in listeners:
+            try:
+                listener(scan_data)
+            except Exception as exc:
+                logger.warning("LiDAR scan listener failed: %s", exc)
 
     def scan_health(
         self,
@@ -675,11 +703,7 @@ class LidarService:
                     )
                     self.latest_scan = scan_data
 
-                    if self.on_scan_data:
-                        try:
-                            self.on_scan_data(scan_data)
-                        except Exception as e:
-                            logger.warning("Error in on_scan_data callback: %s", e)
+                    self._notify_scan(scan_data)
 
                     accumulated_points = []
                     accumulated_clear_ray_angles = []
@@ -805,11 +829,7 @@ class LidarService:
             )
             self.latest_scan = scan_data
 
-            if self.on_scan_data:
-                try:
-                    self.on_scan_data(scan_data)
-                except Exception as e:
-                    logger.warning("Error in on_scan_data mock callback: %s", e)
+            self._notify_scan(scan_data)
 
             # Maintain ~10 Hz (100ms per frame)
             elapsed = time.time() - frame_start

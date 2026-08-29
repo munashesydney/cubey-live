@@ -50,6 +50,14 @@ class WheelsServiceProtocolTests(unittest.TestCase):
         self.service.stop()
         self.assertIn("[TX-MOCK] CMD:stop", sent_lines)
 
+    def test_normalized_twist_command_is_clamped_and_formatted(self):
+        sent_lines = []
+        self.service._emit_log = lambda text: sent_lines.append(text)
+
+        self.assertTrue(self.service.send_twist_normalized(500, -1200, 250))
+
+        self.assertIn("[TX-MOCK] TWIST:500,-1000,250", sent_lines)
+
     def test_emergency_stop_is_latched_until_explicit_reset(self):
         sent_lines = []
         self.service._emit_log = lambda text: sent_lines.append(text)

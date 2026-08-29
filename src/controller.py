@@ -66,6 +66,7 @@ class ApplicationController:
         self.client: Optional[GeminiLiveClient] = None
         self.gui: Optional[GeminiLiveApp] = None
         self.wake_word_service: Optional[WakeWordService] = None
+        self.ros_bridge_service = None
 
         # On-device embeddings (fastembed) for semantic memory over messages.
         self.embedding_service = EmbeddingService(model_name=config.embedding_model)
@@ -92,6 +93,15 @@ class ApplicationController:
 
         # Start Web Server & SLAM mapper if enabled
         self._start_web_server()
+        if self.config.ros2_enabled:
+            from src.services.ros_bridge_service import get_ros_bridge_service
+
+            self.ros_bridge_service = get_ros_bridge_service()
+            if not self.ros_bridge_service.start():
+                logger.error(
+                    "ROS 2 bridge failed to start: %s",
+                    self.ros_bridge_service.status()["last_error"],
+                )
 
         # 1. Start dedicated background thread for asyncio event loop
         self.async_loop = asyncio.new_event_loop()
@@ -137,6 +147,8 @@ class ApplicationController:
                 self.wake_word_service.stop()
             if self.camera_service:
                 self.camera_service.stop()
+            if self.ros_bridge_service:
+                self.ros_bridge_service.stop()
             if self.recorder:
                 self.recorder.stop()
             if self.player:

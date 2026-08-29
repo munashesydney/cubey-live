@@ -186,6 +186,31 @@ class AppConfig:
         os.getenv("ROBOT_FOOTPRINT_MARGIN_M", "0.04")
     )
 
+    # ROS 2 runs in an isolated Jazzy container and communicates with the
+    # host-owned serial transports through rosbridge. Motor output remains a
+    # separate commissioning switch so bringing up ROS can never move Cubey.
+    ros2_enabled: bool = os.getenv(
+        "ROS2_ENABLED", "false"
+    ).strip().lower() not in {"0", "false", "no", "off"}
+    rosbridge_url: str = os.getenv(
+        "ROSBRIDGE_URL", "ws://127.0.0.1:9090"
+    )
+    ros2_command_output_enabled: bool = os.getenv(
+        "ROS2_COMMAND_OUTPUT_ENABLED", "false"
+    ).strip().lower() not in {"0", "false", "no", "off"}
+    ros2_max_forward_mps: float = float(
+        os.getenv("ROS2_MAX_FORWARD_MPS", "0.18")
+    )
+    ros2_max_strafe_mps: float = float(
+        os.getenv("ROS2_MAX_STRAFE_MPS", "0.15")
+    )
+    ros2_max_angular_rps: float = float(
+        os.getenv("ROS2_MAX_ANGULAR_RPS", "0.70")
+    )
+    ros2_command_timeout_s: float = float(
+        os.getenv("ROS2_COMMAND_TIMEOUT_S", "0.35")
+    )
+
     # Web Server & Remote Map Control (SLAM & Live View)
     web_server_enabled: bool = os.getenv(
         "WEB_SERVER_ENABLED", "true"
@@ -231,5 +256,17 @@ class AppConfig:
             raise ValueError("NAV_MAX_SCAN_AGE_S must be between 0.1 and 1.0")
         if self.nav_min_scan_points < 10:
             raise ValueError("NAV_MIN_SCAN_POINTS must be at least 10")
+        if self.ros2_command_output_enabled and not self.ros2_enabled:
+            raise ValueError(
+                "ROS2_COMMAND_OUTPUT_ENABLED requires ROS2_ENABLED=true"
+            )
+        if min(
+            self.ros2_max_forward_mps,
+            self.ros2_max_strafe_mps,
+            self.ros2_max_angular_rps,
+        ) <= 0.0:
+            raise ValueError("ROS 2 velocity limits must be positive")
+        if not 0.10 <= self.ros2_command_timeout_s <= 1.0:
+            raise ValueError("ROS2_COMMAND_TIMEOUT_S must be between 0.10 and 1.0")
 
 config = AppConfig()

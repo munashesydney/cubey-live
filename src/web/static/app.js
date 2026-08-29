@@ -194,7 +194,11 @@
     lblActiveMapName.textContent = activeMapName;
     if (isMapping) {
       pillStatus.classList.add("active");
-      let stateLabel = autonomyEnabled ? "Auto-Exploring" : "Mapping Only (Autonomy Disabled)";
+      let stateLabel = autonomyEnabled ? "Auto-Exploring" : "ROS Mapping (Motion Monitor-Only)";
+      if (navState === "NAVIGATING") stateLabel = autonomyEnabled ? "Nav2 Exploring" : "Nav2 Planning (Motion Monitor-Only)";
+      else if (navState === "WAITING_FOR_MAP") stateLabel = "Waiting for ROS Map";
+      else if (navState === "WAITING_FOR_NAV2") stateLabel = "Starting Nav2";
+      else if (navState === "WAITING_FOR_LOCALIZATION") stateLabel = "Waiting for SLAM Localization";
       if (navState === "PLANNING") stateLabel = "Planning Route...";
       else if (navState === "WAITING_FOR_SENSORS") stateLabel = "Waiting for Healthy Sensors";
       else if (navState === "RECOVERY") stateLabel = "Bounded Recovery";

@@ -454,6 +454,24 @@ class WheelsService:
         speed = max(70, min(255, int(speed)))
         return self.send_raw(f"SPEED:{speed}")
 
+    def send_twist_normalized(
+        self, forward: int, left: int, counter_clockwise: int
+    ) -> bool:
+        """Send a proportional mecanum command using normalized -1000..1000 axes."""
+        with self._motion_lock:
+            if self._motion_inhibited:
+                self._emit_log(
+                    "Motion inhibited "
+                    f"({self._motion_inhibit_reason}); rejected TWIST"
+                )
+                return False
+            self._pulse_generation += 1
+        values = [
+            max(-1000, min(1000, int(value)))
+            for value in (forward, left, counter_clockwise)
+        ]
+        return self.send_raw(f"TWIST:{values[0]},{values[1]},{values[2]}")
+
     def test_motor(self, motor_name: str, direction: int, speed: int = 0) -> bool:
         """
         Diagnostic command to spin an individual motor.
