@@ -13,6 +13,10 @@ fastapi = "*"
 uvicorn = "*"
 pydantic = "*"
 websockets = "*"
+sqlalchemy = "*"
+alembic = "*"
+python-multipart = "*"
+python-dotenv = "*"
 ros-jazzy-ros-base = "*"
 ros-jazzy-navigation2 = "*"
 ros-jazzy-nav2-bringup = "*"
@@ -23,6 +27,7 @@ ros-jazzy-robot-state-publisher = "*"
 ros-jazzy-rosbridge-server = "*"
 numpy = "*"
 pyyaml = "*"
+
 
 [tasks]
 # Launch full autonomous navigation & mapping stack
