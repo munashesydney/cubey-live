@@ -124,7 +124,7 @@ class AppConfig:
                     Path(__file__).resolve().parent
                     / "assets"
                     / "wakeword"
-                    / "cubey_multigreeting_v1.onnx"
+                    / "cubey_multigreeting_v2.onnx"
                 ),
             )
         )
