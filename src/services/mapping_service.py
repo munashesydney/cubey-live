@@ -174,75 +174,126 @@ class MappingService:
             self.map_name = "Live Floorplan"
         logger.info("Occupancy grid map reset.")
 
+    # LiDAR mounting position relative to robot geometric center:
+    # Centered left/right (X=0.0m), shifted 35mm rearward (Y=-0.035m)
+    LIDAR_OFFSET_X = 0.0
+    LIDAR_OFFSET_Y = -0.035
+
     # ------------------------------------------------------------------
-    # Scan Matching & Pose Estimation (LiDAR Odometry)
+    # Robust Multi-Resolution Scan Matching & Pose Tracking
     # ------------------------------------------------------------------
 
     def _scan_match(self, scan_points: List[LidarPoint]) -> RobotPose:
         """
-        Correlates laser hits against the existing occupancy grid to refine
-        robot position (X, Y, Theta).
+        Robust multi-resolution scan matcher that correlates 360° LiDAR sweeps
+        against the global occupancy grid, compensating for rotation and sensor offset.
         """
-        # If map is fresh (less than 20 occupied cells), return current pose
-        occupied_count = np.count_nonzero(self._grid == 100)
-        if occupied_count < 20:
+        # Filter points: remove chassis reflections (<140mm) and noisy far points (>12m)
+        valid = [p for p in scan_points if 140 <= p.distance_mm <= 12000 and p.quality > 10]
+        if len(valid) < 25 or np.count_nonzero(self._grid == 100) < 30:
             return self.pose
 
-        best_score = -1.0
+        # Downsample to ~90 points for fast vectorized matching
+        if len(valid) > 90:
+            step = len(valid) // 90
+            valid = valid[::step]
+
+        # Extract local points in robot frame accounting for 35mm sensor offset
+        angles_rad = np.array([math.radians(p.angle_deg) for p in valid], dtype=np.float32)
+        dists_m = np.array([p.distance_mm / 1000.0 for p in valid], dtype=np.float32)
+
+        local_x = dists_m * np.sin(angles_rad) + self.LIDAR_OFFSET_X
+        local_y = dists_m * np.cos(angles_rad) + self.LIDAR_OFFSET_Y
+
+        best_score = -999999.0
         best_x = self.pose.x_m
         best_y = self.pose.y_m
-        best_theta = self.pose.theta_deg
+        best_th = self.pose.theta_deg
 
-        # Search window around current pose estimate
-        # Positional offsets: +- 6 cm in 2 cm steps
-        # Angular offsets: +- 4 deg in 1 deg steps
-        x_candidates = [self.pose.x_m + dx for dx in [-0.06, -0.03, 0.0, 0.03, 0.06]]
-        y_candidates = [self.pose.y_m + dy for dy in [-0.06, -0.03, 0.0, 0.03, 0.06]]
-        theta_candidates = [self.pose.theta_deg + dth for dth in [-4.0, -2.0, 0.0, 2.0, 4.0]]
+        # --- PASS 1: Coarse Multi-Angle Search (captures turns up to +-25 deg) ---
+        coarse_dth = [-24.0, -18.0, -12.0, -6.0, 0.0, 6.0, 12.0, 18.0, 24.0]
+        coarse_dx = [-0.10, -0.05, 0.0, 0.05, 0.10]
+        coarse_dy = [-0.10, -0.05, 0.0, 0.05, 0.10]
 
-        # Sample a subset of high-quality points to speed up correlation
-        valid_points = [p for p in scan_points if 200 <= p.distance_mm <= 10000 and p.quality > 15]
-        if len(valid_points) > 80:
-            step = len(valid_points) // 80
-            valid_points = valid_points[::step]
-
-        if not valid_points:
-            return self.pose
-
-        for th in theta_candidates:
+        for dth in coarse_dth:
+            th = self.pose.theta_deg + dth
             rad = math.radians(th)
-            sin_th = math.sin(rad)
             cos_th = math.cos(rad)
+            sin_th = math.sin(rad)
 
-            for cand_x in x_candidates:
-                for cand_y in y_candidates:
-                    score = 0.0
-                    for pt in valid_points:
-                        pt_rad = math.radians(pt.angle_deg)
-                        # Local point in robot frame
-                        dist_m = pt.distance_mm / 1000.0
-                        lx = dist_m * math.sin(pt_rad)
-                        ly = dist_m * math.cos(pt_rad)
+            # Rotated points
+            rot_x = local_x * cos_th + local_y * sin_th
+            rot_y = -local_x * sin_th + local_y * cos_th
 
-                        # Transform to candidate world frame
-                        wx = cand_x + lx * cos_th + ly * sin_th
-                        wy = cand_y - lx * sin_th + ly * cos_th
+            for dx in coarse_dx:
+                cx = self.pose.x_m + dx
+                for dy in coarse_dy:
+                    cy = self.pose.y_m + dy
 
-                        gx, gy = self.world_to_grid(wx, wy)
-                        if self.is_inside_grid(gx, gy):
-                            val = self._grid[gy, gx]
-                            if val == 100:
-                                score += 1.0
-                            elif val == 0:
-                                score -= 0.15
+                    wx = cx + rot_x
+                    wy = cy + rot_y
+
+                    gx = ((wx - self.origin_x_m) / self.resolution_m).astype(np.int32)
+                    gy = ((wy - self.origin_y_m) / self.resolution_m).astype(np.int32)
+
+                    # Mask inside bounds
+                    in_bounds = (gx >= 0) & (gx < self.width) & (gy >= 0) & (gy < self.height)
+                    if not np.any(in_bounds):
+                        continue
+
+                    vals = self._grid[gy[in_bounds], gx[in_bounds]]
+                    score = np.sum(vals == 100) * 1.5 - np.sum(vals == 0) * 0.15
 
                     if score > best_score:
                         best_score = score
-                        best_x = cand_x
-                        best_y = cand_y
-                        best_theta = th
+                        best_x = cx
+                        best_y = cy
+                        best_th = th
 
-        return RobotPose(x_m=best_x, y_m=best_y, theta_deg=best_theta, timestamp=time.time())
+        # --- PASS 2: Fine Search (+- 4 deg in 1 deg steps, +- 3 cm in 1.5 cm steps) ---
+        fine_dth = [-4.0, -2.0, -1.0, 0.0, 1.0, 2.0, 4.0]
+        fine_dx = [-0.03, -0.015, 0.0, 0.015, 0.03]
+        fine_dy = [-0.03, -0.015, 0.0, 0.015, 0.03]
+
+        refined_x, refined_y, refined_th = best_x, best_y, best_th
+
+        for dth in fine_dth:
+            th = best_th + dth
+            rad = math.radians(th)
+            cos_th = math.cos(rad)
+            sin_th = math.sin(rad)
+
+            rot_x = local_x * cos_th + local_y * sin_th
+            rot_y = -local_x * sin_th + local_y * cos_th
+
+            for dx in fine_dx:
+                cx = best_x + dx
+                for dy in fine_dy:
+                    cy = best_y + dy
+
+                    wx = cx + rot_x
+                    wy = cy + rot_y
+
+                    gx = ((wx - self.origin_x_m) / self.resolution_m).astype(np.int32)
+                    gy = ((wy - self.origin_y_m) / self.resolution_m).astype(np.int32)
+
+                    in_bounds = (gx >= 0) & (gx < self.width) & (gy >= 0) & (gy < self.height)
+                    if not np.any(in_bounds):
+                        continue
+
+                    vals = self._grid[gy[in_bounds], gx[in_bounds]]
+                    score = np.sum(vals == 100) * 1.5 - np.sum(vals == 0) * 0.15
+
+                    if score > best_score:
+                        best_score = score
+                        refined_x = cx
+                        refined_y = cy
+                        refined_th = th
+
+        # Normalize theta to [0, 360)
+        norm_theta = refined_th % 360.0
+
+        return RobotPose(x_m=refined_x, y_m=refined_y, theta_deg=norm_theta, timestamp=time.time())
 
     # ------------------------------------------------------------------
     # Raycasting (Bresenham's Line Algorithm)
@@ -253,8 +304,8 @@ class MappingService:
         Clears free cells along laser rays and marks solid obstacle endpoints in the grid.
         Returns list of global world (x, y) hit points.
         """
-        L_OCC = 1.2    # Log-odds increase for obstacle hits
-        L_FREE = -0.4  # Log-odds decrease for free space
+        L_OCC = 1.4    # Log-odds increase for obstacle hits
+        L_FREE = -0.35 # Log-odds decrease for free space
         MAX_LOG_ODDS = 5.0
         MIN_LOG_ODDS = -5.0
 
@@ -270,12 +321,18 @@ class MappingService:
 
         for pt in scan_points:
             dist_m = pt.distance_mm / 1000.0
-            if dist_m < 0.15 or dist_m > 14.0:
+            # Ignore self-reflections (< 14cm) and noise
+            if dist_m < 0.14 or dist_m > 14.0:
                 continue
 
             pt_rad = math.radians(pt.angle_deg)
-            lx = dist_m * math.sin(pt_rad)
-            ly = dist_m * math.cos(pt_rad)
+            # Local sensor point
+            sx = dist_m * math.sin(pt_rad)
+            sy = dist_m * math.cos(pt_rad)
+
+            # Account for 35mm rearward LiDAR mounting offset
+            lx = sx + self.LIDAR_OFFSET_X
+            ly = sy + self.LIDAR_OFFSET_Y
 
             # Transform into world coordinates
             wx = robot_x + lx * cos_p + ly * sin_p
@@ -288,8 +345,8 @@ class MappingService:
             # Bresenham's line algorithm between (gx0, gy0) and (gx1, gy1)
             dx = abs(gx1 - gx0)
             dy = abs(gy1 - gy0)
-            sx = 1 if gx0 < gx1 else -1
-            sy = 1 if gy0 < gy1 else -1
+            sx_step = 1 if gx0 < gx1 else -1
+            sy_step = 1 if gy0 < gy1 else -1
             err = dx - dy
 
             curr_x, curr_y = gx0, gy0
@@ -303,12 +360,12 @@ class MappingService:
                 e2 = 2 * err
                 if e2 > -dy:
                     err -= dy
-                    curr_x += sx
+                    curr_x += sx_step
                 if e2 < dx:
                     err += dx
-                    curr_y += sy
+                    curr_y += sy_step
 
-            # Mark endpoint as occupied
+            # Mark endpoint as occupied if quality is good
             if self.is_inside_grid(gx1, gy1) and pt.quality > 10:
                 self._log_odds[gy1, gx1] = min(
                     MAX_LOG_ODDS, self._log_odds[gy1, gx1] + L_OCC
@@ -327,6 +384,7 @@ class MappingService:
         self._grid[unknown_mask] = -1
 
         return hit_world_coords
+
 
     # ------------------------------------------------------------------
     # Scan Processing Loop

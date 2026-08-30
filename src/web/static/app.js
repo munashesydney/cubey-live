@@ -64,6 +64,11 @@
   const lblSpeedVal = document.getElementById("lbl-speed-val");
 
   // Modals
+  const modalModeSelect = document.getElementById("modal-mode-select");
+  const btnCloseModeModal = document.getElementById("btn-close-mode-modal");
+  const btnStartAuto = document.getElementById("btn-start-auto");
+  const btnStartManual = document.getElementById("btn-start-manual");
+
   const modalSave = document.getElementById("modal-save");
   const inputMapName = document.getElementById("input-map-name");
   const btnConfirmSave = document.getElementById("btn-confirm-save");
@@ -72,6 +77,7 @@
   const modalLibrary = document.getElementById("modal-library");
   const btnCloseLibrary = document.getElementById("btn-close-library");
   const mapsListContainer = document.getElementById("maps-list-container");
+
 
   // Virtual Joystick Elements
   const joystickContainer = document.getElementById("virtual-joystick");
@@ -177,17 +183,26 @@
     }
 
     // Update Header Badges
+    const navState = data.nav_state || "IDLE";
+    const navMode = data.nav_mode || "manual";
+
     lblActiveMapName.textContent = activeMapName;
-    if (isMapping) {
+    if (isMapping || navState === "EXPLORING" || navState === "NAVIGATING") {
       pillStatus.classList.add("active");
-      lblMappingState.textContent = "Mapping Active";
-      btnMappingText.textContent = "Pause Mapping";
-      btnToggleMapping.classList.replace("btn-primary", "btn-secondary");
+      if (navState === "EXPLORING" || navMode === "autonomous") {
+        lblMappingState.textContent = "🤖 Auto Mapping";
+      } else if (navState === "NAVIGATING") {
+        lblMappingState.textContent = "🎯 Navigating Goal";
+      } else {
+        lblMappingState.textContent = "🕹️ Manual Mapping";
+      }
+      btnMappingText.textContent = "Stop Mapping";
+      btnToggleMapping.className = "btn btn-danger-outline";
     } else {
       pillStatus.classList.remove("active");
-      lblMappingState.textContent = "Mapping Paused";
+      lblMappingState.textContent = "Mapping Idle";
       btnMappingText.textContent = "Start Mapping";
-      btnToggleMapping.classList.replace("btn-secondary", "btn-primary");
+      btnToggleMapping.className = "btn btn-primary";
     }
 
     if (data.battery_pct !== undefined) {
@@ -201,6 +216,7 @@
 
     render();
   }
+
 
   // ------------------------------------------------------------------------
   // High-Performance 2D Canvas Renderer
@@ -601,9 +617,54 @@
     if (isMapping) {
       fetch("/api/mapping/pause", { method: "POST" });
     } else {
-      fetch("/api/mapping/start", { method: "POST" });
+      if (modalModeSelect) {
+        modalModeSelect.classList.remove("hidden");
+      } else {
+        fetch("/api/mapping/start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ mode: "autonomous" }),
+        });
+      }
     }
   });
+
+  if (btnCloseModeModal) {
+    btnCloseModeModal.addEventListener("click", () => {
+      modalModeSelect.classList.add("hidden");
+    });
+  }
+
+  if (btnStartAuto) {
+    btnStartAuto.addEventListener("click", async () => {
+      modalModeSelect.classList.add("hidden");
+      try {
+        await fetch("/api/mapping/start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ mode: "autonomous" }),
+        });
+      } catch (e) {
+        console.error("Failed to start autonomous mapping:", e);
+      }
+    });
+  }
+
+  if (btnStartManual) {
+    btnStartManual.addEventListener("click", async () => {
+      modalModeSelect.classList.add("hidden");
+      try {
+        await fetch("/api/mapping/start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ mode: "manual" }),
+        });
+      } catch (e) {
+        console.error("Failed to start manual mapping:", e);
+      }
+    });
+  }
+
 
   btnResetMap.addEventListener("click", () => {
     if (confirm("Reset current occupancy grid map and robot pose?")) {

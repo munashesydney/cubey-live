@@ -102,6 +102,44 @@
       </div>
     </main>
 
+    <!-- Mapping Mode Selector Modal -->
+    <div id="modal-mode-select" class="modal-backdrop hidden">
+      <div class="modal-card modal-card-wide glass-panel">
+        <div class="modal-header">
+          <h3>🗺️ Choose Mapping Mode</h3>
+          <button id="btn-close-mode-modal" class="btn-close">✕</button>
+        </div>
+        <p class="modal-subtitle">Select how Cubey will map the house floor plan:</p>
+
+        <div class="mode-cards-grid">
+          <!-- Autonomous Mode Card -->
+          <div class="mode-card auto-card" id="card-start-auto">
+            <div class="card-badge">✨ Recommended</div>
+            <div class="mode-icon">🤖</div>
+            <div class="mode-title">Autonomous Mapping</div>
+            <div class="mode-desc">
+              Cubey uses <strong>ROS 2 Jazzy & Nav2</strong> to autonomously explore rooms, dodge obstacles, and generate the 2D floorplan without any manual steering.
+            </div>
+            <button id="btn-start-auto" class="btn btn-primary btn-block">
+              ▶ Start Autonomous
+            </button>
+          </div>
+
+          <!-- Manual Mode Card -->
+          <div class="mode-card manual-card" id="card-start-manual">
+            <div class="mode-icon">🕹️</div>
+            <div class="mode-title">Manual Drive Mapping</div>
+            <div class="mode-desc">
+              Take full control. Drive Cubey manually using the on-screen joystick or keyboard (<strong>WASD</strong>) while tracking live LiDAR scans and SLAM odometry.
+            </div>
+            <button id="btn-start-manual" class="btn btn-secondary btn-block">
+              ▶ Start Manual
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Save Map Modal -->
     <div id="modal-save" class="modal-backdrop hidden">
       <div class="modal-card glass-panel">

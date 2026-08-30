@@ -1,0 +1,42 @@
+[workspace]
+name = "cubey-ros2-native"
+version = "0.1.0"
+description = "Native ROS 2 Jazzy + Nav2 Environment for Cubey Robot (Raspberry Pi 5)"
+authors = ["Sydney <sydney@cubey.ai>"]
+channels = ["https://prefix.dev/robostack-jazzy", "conda-forge"]
+platforms = ["linux-aarch64"]
+
+[dependencies]
+python = ">=3.11"
+pyserial = ">=3.5"
+fastapi = "*"
+uvicorn = "*"
+pydantic = "*"
+websockets = "*"
+sqlalchemy = "*"
+alembic = "*"
+python-multipart = "*"
+python-dotenv = "*"
+ros-jazzy-ros-base = "*"
+ros-jazzy-navigation2 = "*"
+ros-jazzy-nav2-bringup = "*"
+ros-jazzy-slam-toolbox = "*"
+ros-jazzy-rplidar-ros = "*"
+ros-jazzy-tf2-ros = "*"
+ros-jazzy-robot-state-publisher = "*"
+ros-jazzy-rosbridge-server = "*"
+numpy = "*"
+pyyaml = "*"
+
+
+[tasks]
+# Launch full autonomous navigation & mapping stack
+launch = "ros2 launch launch/cubey_bringup.launch.py"
+
+# Start the Cubey Live Web Application
+web = { cmd = "python -m src.main", cwd = ".." }
+
+# Individual testing tasks
+test-lidar = "ros2 run rplidar_ros rplidar_node --ros-args -p serial_port:=/dev/ttyUSB0 -p serial_baudrate:=460800 -p frame_id:=laser"
+test-bridge = "python nodes/cmd_vel_serial_bridge.py"
+

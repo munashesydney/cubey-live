@@ -25,6 +25,7 @@ from src.db.repositories.map_repository import delete_map, list_maps
 from src.services.lidar_service import get_lidar_service
 from src.services.mapping_service import get_mapping_service
 from src.services.wheels_service import get_wheels_service
+from src.services.navigation.cubey_nav_service import get_nav_service
 
 logger = logging.getLogger(__name__)
 
@@ -58,13 +59,12 @@ def verify_credentials(credentials: HTTPBasicCredentials = Depends(security)) ->
     expected_user = config.web_username or "admin"
     expected_pass = config.web_password or "cubey"
 
-    user_match = secrets.compare_digest(credentials.username, expected_user)
-    pass_match = secrets.compare_digest(credentials.password, expected_pass)
-
-    if not (user_match and pass_match):
+    correct_username = secrets.compare_digest(credentials.username, expected_user)
+    correct_password = secrets.compare_digest(credentials.password, expected_pass)
+    if not (correct_username and correct_password):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid username or password",
+            detail="Incorrect username or password",
             headers={"WWW-Authenticate": "Basic"},
         )
     return credentials.username
@@ -89,6 +89,16 @@ class DriveCommandRequest(BaseModel):
     continuous: Optional[bool] = False
 
 
+class StartMappingRequest(BaseModel):
+    mode: Optional[str] = "manual"  # "manual" or "autonomous"
+
+
+class NavGoalRequest(BaseModel):
+    x_m: float
+    y_m: float
+    theta_deg: Optional[float] = 0.0
+
+
 class SaveMapRequest(BaseModel):
     name: str = "House Floorplan"
 
@@ -109,6 +119,7 @@ async def get_system_status(_: str = Depends(verify_credentials)):
     lidar_svc = get_lidar_service()
     mapping_svc = get_mapping_service()
     wheels_svc = get_wheels_service()
+    nav_svc = get_nav_service()
 
     snapshot = mapping_svc.get_snapshot()
 
@@ -134,6 +145,7 @@ async def get_system_status(_: str = Depends(verify_credentials)):
             "explored_cells": snapshot.total_explored_cells,
             "pose": snapshot.pose.to_dict(),
         },
+        "navigation": nav_svc.telemetry.to_dict(),
     }
 
 
@@ -188,19 +200,43 @@ async def delete_saved_map(map_id: int, _: str = Depends(verify_credentials)):
 
 
 @app.post("/api/mapping/start")
-async def start_mapping_session(_: str = Depends(verify_credentials)):
-    """Start active 2D occupancy grid updates."""
-    mapping_svc = get_mapping_service()
-    mapping_svc.start_mapping()
-    return {"status": "mapping_started"}
+async def start_mapping_session(req: Optional[StartMappingRequest] = None, _: str = Depends(verify_credentials)):
+    """Start 2D mapping session in manual or autonomous mode."""
+    nav_svc = get_nav_service()
+    mode = (req.mode if req and req.mode else "manual").lower()
+
+    if mode == "autonomous":
+        nav_svc.start_exploration()
+    else:
+        nav_svc.start_manual_mapping()
+
+    return {"status": "mapping_started", "mode": mode}
 
 
 @app.post("/api/mapping/pause")
 async def pause_mapping_session(_: str = Depends(verify_credentials)):
-    """Pause 2D occupancy grid updates."""
+    """Pause 2D occupancy grid updates and stop autonomous motion."""
     mapping_svc = get_mapping_service()
+    nav_svc = get_nav_service()
+    nav_svc.stop_navigation()
     mapping_svc.pause_mapping()
     return {"status": "mapping_paused"}
+
+
+@app.post("/api/navigation/goal")
+async def send_navigation_goal(req: NavGoalRequest, _: str = Depends(verify_credentials)):
+    """Command robot to navigate toward a 2D floorplan coordinate."""
+    nav_svc = get_nav_service()
+    success = nav_svc.navigate_to(x_m=req.x_m, y_m=req.y_m, theta_deg=req.theta_deg or 0.0)
+    return {"status": "navigating" if success else "failed", "goal": req.dict()}
+
+
+@app.post("/api/navigation/stop")
+async def stop_navigation_command(_: str = Depends(verify_credentials)):
+    """Halt active autonomous navigation or exploration."""
+    nav_svc = get_nav_service()
+    nav_svc.stop_navigation()
+    return {"status": "navigation_stopped"}
 
 
 @app.post("/api/mapping/reset")
@@ -323,6 +359,7 @@ async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(
     mapping_svc = get_mapping_service()
     wheels_svc = get_wheels_service()
     lidar_svc = get_lidar_service()
+    nav_svc = get_nav_service()
 
     # Background streamer task for this client
     async def _stream_loop():
@@ -356,6 +393,8 @@ async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(
                     "battery_pct": wheels_svc.telemetry.battery_pct,
                     "motion": wheels_svc.telemetry.motion,
                     "lidar_rate_hz": lidar_svc.latest_scan.scan_rate_hz,
+                    "nav_state": nav_svc.telemetry.state,
+                    "nav_mode": nav_svc.telemetry.mode,
                     "timestamp": snapshot.timestamp,
                 }
                 await websocket.send_json(payload)
@@ -394,18 +433,31 @@ async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(
             elif mtype == "stop":
                 logger.info("WS Drive CMD: STOP")
                 wheels_svc.stop()
+                nav_svc.stop_navigation()
 
             elif mtype == "start_mapping":
-                mapping_svc.start_mapping()
+                mode = (msg.get("mode") or "manual").lower()
+                if mode == "autonomous":
+                    nav_svc.start_exploration()
+                else:
+                    nav_svc.start_manual_mapping()
 
-            elif mtype == "pause_mapping":
+            elif mtype in ("pause_mapping", "stop_mapping"):
+                nav_svc.stop_navigation()
                 mapping_svc.pause_mapping()
 
+            elif mtype == "nav_goal":
+                x = float(msg.get("x_m", 0.0))
+                y = float(msg.get("y_m", 0.0))
+                nav_svc.navigate_to(x_m=x, y_m=y)
+
             elif mtype == "reset_map":
+                nav_svc.stop_navigation()
                 mapping_svc.reset_map()
 
     except WebSocketDisconnect:
         pass
+
     finally:
         stream_task.cancel()
         ws_manager.disconnect(websocket)
