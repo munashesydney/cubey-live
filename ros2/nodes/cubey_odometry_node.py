@@ -56,12 +56,13 @@ class CubeyOdometryNode(Node):
         super().__init__("cubey_odometry_node")
 
         self.declare_parameter("odom_frame", "odom")
-        self.declare_parameter("base_frame", "base_footprint")
+        self.declare_parameter("base_frame", "base_link")
         self.declare_parameter("publish_tf", True)
         self.declare_parameter("freq", 15.0)
 
         self.odom_frame = self.get_parameter("odom_frame").value
         self.base_frame = self.get_parameter("base_frame").value
+
         self.publish_tf = bool(self.get_parameter("publish_tf").value)
         self.freq = float(self.get_parameter("freq").value)
 

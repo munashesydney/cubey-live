@@ -77,7 +77,7 @@ def generate_launch_description():
 
         # -----------------------------------------------------------------
         # 3. 2D Laser & Command Odometry (Cubey Odometry Node)
-        # Publishes /odom & (odom -> base_footprint TF)
+        # Publishes /odom & (odom -> base_link TF)
         # -----------------------------------------------------------------
         Node(
             executable="python3",
@@ -85,12 +85,13 @@ def generate_launch_description():
             name="cubey_odometry_node",
             parameters=[{
                 "odom_frame": "odom",
-                "base_frame": "base_footprint",
+                "base_frame": "base_link",
                 "publish_tf": True,
                 "freq": 15.0,
             }],
             output="screen",
         ),
+
 
         # -----------------------------------------------------------------
         # 4. SLAM Toolbox (2D Occupancy Grid Mapping & Loop Closure)
