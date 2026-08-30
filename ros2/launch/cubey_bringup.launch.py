@@ -16,6 +16,7 @@ def generate_launch_description():
     nav2_params_file = str(config_dir / "nav2_params.yaml")
     cmd_bridge_script = str(nodes_dir / "cmd_vel_serial_bridge.py")
     odom_script = str(nodes_dir / "cubey_odometry_node.py")
+    rplidar_script = str(nodes_dir / "rplidar_c1_node.py")
 
     # Launch Configurations
     use_sim_time = LaunchConfiguration("use_sim_time", default="false")
@@ -58,19 +59,18 @@ def generate_launch_description():
         ),
 
         # -----------------------------------------------------------------
-        # 2. RPLIDAR C1 Sensor Driver (/dev/ttyUSB0)
+        # 2. RPLIDAR C1 Sensor Driver (/dev/ttyUSB0 @ 460800)
         # -----------------------------------------------------------------
         Node(
-            package="rplidar_ros",
-            executable="rplidar_node",
+            executable="python3",
+            arguments=[rplidar_script],
             name="rplidar_c1_node",
             parameters=[{
                 "serial_port": lidar_port,
                 "serial_baudrate": lidar_baud,
                 "frame_id": "laser",
-                "inverted": False,
-                "angle_compensate": True,
-                "scan_mode": "Standard",
+                "min_range": 0.05,
+                "max_range": 12.0,
             }],
             output="screen",
         ),
