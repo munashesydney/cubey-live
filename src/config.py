@@ -111,26 +111,24 @@ class AppConfig:
         "LOCAL_MODEL_SYSTEM_PROMPT", _LOCAL_LLM_SYSTEM_PROMPT
     )
 
-    # Wake Word (sherpa-onnx keyword spotter) Parameters
+    # Custom openWakeWord Parameters
     enable_wake_word: bool = os.getenv(
         "WAKE_WORD_ENABLED", "true"
     ).strip().lower() not in {"0", "false", "no", "off"}
-    wake_words: str = os.getenv(
-        "WAKE_WORDS",
-        "HEY CUBEY, OK CUBEY, HI CUBEY, CUBEY, "
-        "YO CUBEY, SUP CUBEY, WHATS UP CUBEY, WHAT'S UP CUBEY, AYO CUBEY, WHAT'S GOOD CUBEY, WHATS GOOD CUBEY, "
-        "HELLO CUBEY, RISE AND SHINE, "
-        "HEY Q BEE, Q BEE, YO Q BEE, SUP Q BEE, HI Q BEE, AYO Q BEE, "
-        "HEY CUBE Y, CUBE Y, YO CUBE Y, "
-        "HEY CUBE EE, CUBE EE, YO CUBE EE, SUP CUBE EE",
+    wake_word_model_path: Path = field(
+        default_factory=lambda: Path(
+            os.getenv(
+                "OPENWAKEWORD_MODEL_PATH",
+                str(
+                    Path(__file__).resolve().parent
+                    / "assets"
+                    / "wakeword"
+                    / "cubey_multigreeting_v1.onnx"
+                ),
+            )
+        )
     )
-    wake_word_model_dir: Path = field(
-        default_factory=lambda: DEFAULT_DATA_DIR / "models" / "sherpa-onnx-kws"
-    )
-    wake_word_threshold: float = float(os.getenv("WAKE_WORD_THRESHOLD", "0.15"))
-    wake_word_score: float = float(os.getenv("WAKE_WORD_SCORE", "2.0"))
-    wake_word_gain: float = float(os.getenv("WAKE_WORD_GAIN", "2.0"))
-    wake_word_threads: int = int(os.getenv("WAKE_WORD_THREADS", "2"))
+    wake_word_threshold: float = float(os.getenv("OPENWAKEWORD_THRESHOLD", "0.5"))
 
     # Real-Time Camera & Multimodal Vision Parameters
     camera_device_index: int = int(os.getenv("CAMERA_DEVICE_INDEX", "0"))
