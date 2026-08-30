@@ -1,0 +1,321 @@
+/* ==========================================================================
+   CUBEY PORTAL — HOME DASHBOARD STYLES (Catppuccin Mocha Theme)
+   ========================================================================== */
+
+.home-container {
+  max-width: 1120px;
+  margin: 36px auto;
+  padding: 0 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 32px;
+}
+
+/* --------------------------------------------------------------------------
+   Hero Banner
+   -------------------------------------------------------------------------- */
+
+.hero-banner {
+  padding: 32px 36px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 24px;
+  background: linear-gradient(135deg, rgba(30, 30, 46, 0.95) 0%, rgba(49, 50, 68, 0.6) 100%);
+  border: 1px solid rgba(137, 180, 250, 0.25);
+  border-radius: 16px;
+  position: relative;
+  overflow: hidden;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.4);
+}
+
+.hero-banner::after {
+  content: "";
+  position: absolute;
+  top: -60%;
+  right: -20%;
+  width: 360px;
+  height: 360px;
+  background: radial-gradient(circle, rgba(137, 180, 250, 0.18) 0%, transparent 70%);
+  pointer-events: none;
+}
+
+.hero-content {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-width: 620px;
+  z-index: 1;
+}
+
+.hero-content h1 {
+  font-size: 30px;
+  font-weight: 700;
+  letter-spacing: -0.5px;
+  line-height: 1.2;
+  background: linear-gradient(135deg, #FFFFFF 20%, var(--lavender) 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.hero-content p {
+  color: var(--subtext);
+  font-size: 14.5px;
+  line-height: 1.6;
+}
+
+.hero-badges {
+  display: flex;
+  gap: 14px;
+  z-index: 1;
+  flex-shrink: 0;
+}
+
+.hero-stat-card {
+  background: rgba(17, 17, 27, 0.7);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 12px;
+  padding: 14px 20px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-width: 105px;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+.stat-val {
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--teal);
+  font-family: var(--font-mono);
+}
+
+.stat-lbl {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--overlay0);
+  margin-top: 4px;
+}
+
+/* --------------------------------------------------------------------------
+   Operation Launcher Cards Grid
+   -------------------------------------------------------------------------- */
+
+.section-title {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--text);
+  margin-bottom: 4px;
+  letter-spacing: -0.3px;
+}
+
+.section-subtitle {
+  font-size: 13.5px;
+  color: var(--subtext);
+  margin-bottom: 18px;
+}
+
+.features-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  gap: 22px;
+}
+
+.feature-card {
+  padding: 26px;
+  display: flex;
+  flex-direction: column;
+  text-decoration: none;
+  color: inherit;
+  background: rgba(30, 30, 46, 0.85);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 16px;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.35);
+  transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  position: relative;
+  overflow: hidden;
+}
+
+.feature-card::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 16px;
+  padding: 1.5px;
+  background: linear-gradient(135deg, transparent 40%, rgba(137, 180, 250, 0.35) 100%);
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  pointer-events: none;
+  opacity: 0.6;
+  transition: opacity 0.25s ease;
+}
+
+.feature-card:hover {
+  transform: translateY(-4px);
+  box-shadow: 0 14px 44px rgba(0, 0, 0, 0.5);
+  border-color: rgba(137, 180, 250, 0.45);
+}
+
+.feature-card:hover::before {
+  opacity: 1;
+}
+
+.card-icon-wrap {
+  width: 54px;
+  height: 54px;
+  border-radius: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 28px;
+  margin-bottom: 18px;
+}
+
+.icon-map {
+  background: rgba(137, 180, 250, 0.15);
+  border: 1px solid rgba(137, 180, 250, 0.35);
+}
+
+.icon-mic {
+  background: rgba(166, 227, 161, 0.15);
+  border: 1px solid rgba(166, 227, 161, 0.35);
+}
+
+.card-title {
+  font-size: 19px;
+  font-weight: 700;
+  color: var(--text);
+  margin-bottom: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.card-badge {
+  font-size: 11px;
+  font-weight: 700;
+  font-family: var(--font-mono);
+  padding: 3px 10px;
+  border-radius: 12px;
+  background: rgba(148, 226, 213, 0.15);
+  color: var(--teal);
+  border: 1px solid rgba(148, 226, 213, 0.3);
+}
+
+.card-desc {
+  font-size: 13.5px;
+  color: var(--subtext);
+  line-height: 1.55;
+  margin-bottom: 22px;
+  flex-grow: 1;
+}
+
+.card-action {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--blue);
+  transition: all 0.2s ease;
+}
+
+.feature-card:hover .card-action {
+  gap: 12px;
+  color: #FFFFFF;
+}
+
+/* --------------------------------------------------------------------------
+   Telemetry Strip (Bottom Grid)
+   -------------------------------------------------------------------------- */
+
+.telemetry-strip {
+  padding: 22px 28px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 20px;
+  background: rgba(30, 30, 46, 0.85);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+}
+
+.telemetry-item {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.telemetry-item-icon {
+  font-size: 24px;
+  width: 44px;
+  height: 44px;
+  border-radius: 10px;
+  background: rgba(17, 17, 27, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.telemetry-item-data {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.telemetry-item-label {
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--overlay0);
+}
+
+.telemetry-item-value {
+  font-size: 14px;
+  font-weight: 700;
+  font-family: var(--font-mono);
+  color: var(--text);
+}
+
+/* --------------------------------------------------------------------------
+   Responsive Layout
+   -------------------------------------------------------------------------- */
+
+@media (max-width: 768px) {
+  .home-container {
+    padding: 0 16px;
+    margin: 20px auto;
+  }
+
+  .hero-banner {
+    flex-direction: column;
+    align-items: flex-start;
+    padding: 24px;
+  }
+
+  .hero-badges {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .hero-stat-card {
+    flex: 1;
+    min-width: 0;
+    padding: 10px 12px;
+  }
+
+  .stat-val {
+    font-size: 18px;
+  }
+
+  .features-grid {
+    grid-template-columns: 1fr;
+  }
+}

@@ -1,0 +1,373 @@
+/* ==========================================================================
+   CUBEY PORTAL — MICROPHONE & DENOISER STUDIO STYLES
+   ========================================================================== */
+
+.studio-container {
+  max-width: 900px;
+  margin: 30px auto;
+  padding: 0 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.studio-header-card {
+  padding: 24px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.device-spec-tag {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--teal);
+  background: rgba(148, 226, 213, 0.12);
+  padding: 3px 10px;
+  border-radius: 6px;
+  display: inline-block;
+  margin-top: 4px;
+}
+
+/* Master Denoiser Switch Banner */
+.denoise-master-banner {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: linear-gradient(135deg, rgba(30, 30, 46, 0.9) 0%, rgba(49, 50, 68, 0.6) 100%);
+  border: 1px solid rgba(137, 180, 250, 0.25);
+  padding: 18px 24px;
+}
+
+.toggle-info {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.toggle-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.toggle-subtitle {
+  font-size: 12px;
+  color: var(--subtext);
+}
+
+/* iOS-style Switch Toggle */
+.switch-control {
+  position: relative;
+  display: inline-block;
+  width: 52px;
+  height: 28px;
+  flex-shrink: 0;
+}
+
+.switch-control input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.switch-slider {
+  position: absolute;
+  cursor: pointer;
+  inset: 0;
+  background-color: var(--surface1);
+  transition: 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  border-radius: 28px;
+  border: 1px solid var(--surface2);
+}
+
+.switch-slider:before {
+  position: absolute;
+  content: "";
+  height: 22px;
+  width: 22px;
+  left: 3px;
+  bottom: 2px;
+  background-color: white;
+  transition: 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  border-radius: 50%;
+  box-shadow: 0 2px 5px rgba(0, 0, 0, 0.4);
+}
+
+.switch-control input:checked + .switch-slider {
+  background: linear-gradient(135deg, var(--green) 0%, var(--teal) 100%);
+  border-color: var(--green);
+}
+
+.switch-control input:checked + .switch-slider:before {
+  transform: translateX(24px);
+}
+
+/* Dual VU Meters Comparison */
+.vu-meters-comparison-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+.vu-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 18px;
+}
+
+.raw-card {
+  border-left: 4px solid var(--peach);
+}
+
+.denoised-card {
+  border-left: 4px solid var(--green);
+}
+
+.vu-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.vu-card-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.vu-db-readout {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--subtext);
+}
+
+.vu-bar-track {
+  position: relative;
+  height: 18px;
+  background: rgba(17, 17, 27, 0.85);
+  border-radius: 6px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.vu-bar-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 5px;
+  transition: width 0.06s ease-out;
+}
+
+.raw-fill {
+  background: linear-gradient(90deg, #A6E3A1 0%, #F9E2AF 60%, #FAB387 85%, #F38BA8 100%);
+  box-shadow: 0 0 12px rgba(250, 179, 135, 0.4);
+}
+
+.denoised-fill {
+  background: linear-gradient(90deg, #94E2D5 0%, #A6E3A1 70%, #89B4FA 100%);
+  box-shadow: 0 0 12px rgba(166, 227, 161, 0.5);
+}
+
+.vu-peak-indicator {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: #FFFFFF;
+  opacity: 0.8;
+  left: 0%;
+  transition: left 0.15s ease-out;
+}
+
+.vu-scale-ticks {
+  display: flex;
+  justify-content: space-between;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  color: var(--overlay0);
+  margin-top: -4px;
+}
+
+.clip-tick {
+  color: var(--red);
+  font-weight: 700;
+}
+
+.vu-card-meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 12px;
+  color: var(--subtext);
+  margin-top: 4px;
+}
+
+.badge-raw-status {
+  font-size: 10px;
+  background: rgba(250, 179, 135, 0.15);
+  color: var(--peach);
+  padding: 2px 8px;
+  border-radius: 4px;
+}
+
+.badge-vad-status {
+  font-size: 10px;
+  background: rgba(166, 227, 161, 0.15);
+  color: var(--green);
+  padding: 2px 8px;
+  border-radius: 4px;
+}
+
+/* Oscilloscope Container */
+.oscilloscope-container {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 18px;
+}
+
+.oscilloscope-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.scope-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.scope-legend {
+  display: flex;
+  gap: 14px;
+  font-size: 11px;
+}
+
+.legend-chip {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.legend-chip .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.raw-chip { color: var(--peach); }
+.raw-chip .dot { background: var(--peach); }
+
+.den-chip { color: var(--green); }
+.den-chip .dot { background: var(--green); }
+
+#scope-canvas {
+  width: 100%;
+  height: 100px;
+  background: rgba(17, 17, 27, 0.85);
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+/* Auditory Interactive Grid */
+.audio-interactive-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+.interactive-box {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 18px;
+}
+
+.box-header {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.box-header strong {
+  font-size: 14px;
+  color: var(--text);
+}
+
+.sub-hint {
+  font-size: 11px;
+  color: var(--subtext);
+}
+
+.monitor-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.monitor-source-radios {
+  display: flex;
+  justify-content: space-around;
+  font-size: 12px;
+  color: var(--text);
+}
+
+.radio-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+
+.record-test-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.progress-wrap {
+  width: 100%;
+  height: 8px;
+  background: var(--surface0);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.progress-bar-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--blue), var(--teal));
+  transition: width 0.1s linear;
+}
+
+.playback-action-row {
+  display: flex;
+  gap: 10px;
+}
+
+.playback-action-row .btn-sm {
+  flex: 1;
+  padding: 8px 10px;
+  font-size: 12px;
+}
+
+.btn-success {
+  background: var(--green);
+  color: #11111B;
+  font-weight: 700;
+}
+.btn-success:hover {
+  background: #B4F5B0;
+}
+
+@media (max-width: 700px) {
+  .vu-meters-comparison-grid,
+  .audio-interactive-grid {
+    grid-template-columns: 1fr;
+  }
+}

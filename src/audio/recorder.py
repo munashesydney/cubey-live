@@ -56,8 +56,10 @@ class AudioRecorder:
         )
         self.on_level_change = on_level_change
         self.on_audio_chunk = on_audio_chunk
+        self.on_diagnostic_chunk: Optional[Callable[[bytes, bytes, bool], None]] = None
         
         self.is_recording = False
+
         self.is_muted = False
         self.is_live_active = False
         self.stream: Optional[sd.RawInputStream] = None
@@ -259,10 +261,19 @@ class AudioRecorder:
 
         # Apply noise suppression specifically for Gemini Live session streaming
         gemini_data = data
+        denoiser_on = bool(self.denoiser is not None and getattr(self.denoiser, "enabled", False))
         if self.denoiser is not None and not self.is_muted:
             gemini_data = self.denoiser.process(data)
 
+        # Feed real-time diagnostic stream for web microphone tester
+        if self.on_diagnostic_chunk and not self.is_muted:
+            try:
+                self.on_diagnostic_chunk(data, gemini_data, denoiser_on)
+            except Exception:
+                pass
+
         # Coalesce the cross-thread notification as well as bounding the final
+
         # asyncio queue. At most one drain callback can be pending, so an event
         # loop delay cannot create thousands of stale scheduled callbacks.
         schedule_drain = False

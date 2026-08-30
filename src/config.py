@@ -50,9 +50,10 @@ class AppConfig:
         "AUDIO_PREFER_LOW_LATENCY_DEVICE", "true"
     ).strip().lower() not in {"0", "false", "no", "off"}
     enable_noise_suppression: bool = os.getenv(
-        "AUDIO_ENABLE_NOISE_SUPPRESSION", "true"
-    ).strip().lower() not in {"0", "false", "no", "off"}
+        "AUDIO_ENABLE_NOISE_SUPPRESSION", "false"
+    ).strip().lower() in {"1", "true", "yes", "on"}
     gui_fullscreen: bool = os.getenv(
+
         "GUI_FULLSCREEN", "true"
     ).strip().lower() not in {"0", "false", "no", "off"}
     # Raspberry Pi-friendly face rendering. Animation physics remain time
