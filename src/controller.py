@@ -274,8 +274,15 @@ class ApplicationController:
                 on_audio_chunk=self._on_audio_chunk_captured,
             )
 
+            try:
+                from src.services.audio_test_service import get_audio_test_service
+                get_audio_test_service().attach_recorder(self.recorder)
+            except Exception as e:
+                logger.warning("Could not attach AudioTestService: %s", e)
+
             if self.gui:
                 self.gui.post_startup_progress(0.25, "✓ Audio pipeline & AEC calibrated.", 0)
+
 
             # --- Step 2: Custom Wake-Word Engine (45%) ---
             if self.gui:

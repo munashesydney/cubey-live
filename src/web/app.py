@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -26,6 +26,7 @@ from src.services.lidar_service import get_lidar_service
 from src.services.mapping_service import get_mapping_service
 from src.services.wheels_service import get_wheels_service
 from src.services.navigation.cubey_nav_service import get_nav_service
+from src.services.audio_test_service import get_audio_test_service
 
 logger = logging.getLogger(__name__)
 
@@ -84,13 +85,13 @@ def check_auth_token(token: Optional[str] = None) -> bool:
 
 class DriveCommandRequest(BaseModel):
     action: str  # forward, backward, strafeLeft, strafeRight, rotateLeft, rotateRight, stop
-    speed: Optional[int] = 180
-    duration_ms: Optional[int] = 250
-    continuous: Optional[bool] = False
+    speed: Optional[int] = None
+    duration_ms: Optional[int] = None
+    continuous: bool = False
 
 
 class StartMappingRequest(BaseModel):
-    mode: Optional[str] = "manual"  # "manual" or "autonomous"
+    mode: Optional[str] = "manual"  # "manual" | "autonomous"
 
 
 class NavGoalRequest(BaseModel):
@@ -101,6 +102,14 @@ class NavGoalRequest(BaseModel):
 
 class SaveMapRequest(BaseModel):
     name: str = "House Floorplan"
+
+
+class ToggleDenoiserRequest(BaseModel):
+    enabled: bool
+
+
+class RecordTestRequest(BaseModel):
+    duration_s: float = 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -286,6 +295,45 @@ async def stop_all_motors(_: str = Depends(verify_credentials)):
 
 
 # ---------------------------------------------------------------------------
+# Audio Diagnostics & Microphone Test Endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/audio/status")
+async def get_audio_test_status(_: str = Depends(verify_credentials)):
+    """Return real-time audio test diagnostics and denoiser telemetry."""
+    audio_test_svc = get_audio_test_service()
+    return audio_test_svc.snapshot.to_dict()
+
+
+@app.post("/api/audio/denoiser/toggle")
+async def toggle_audio_denoiser(req: ToggleDenoiserRequest, _: str = Depends(verify_credentials)):
+    """Enable or disable hardware noise suppression."""
+    audio_test_svc = get_audio_test_service()
+    success = audio_test_svc.set_denoiser_enabled(req.enabled)
+    return {"status": "ok", "is_denoiser_enabled": req.enabled, "applied": success}
+
+
+@app.post("/api/audio/test_recording/start")
+async def start_audio_test_recording(req: Optional[RecordTestRequest] = None, _: str = Depends(verify_credentials)):
+    """Start a test clip recording for auditory playback."""
+    audio_test_svc = get_audio_test_service()
+    dur = req.duration_s if req else 5.0
+    audio_test_svc.start_test_recording(duration_s=dur)
+    return {"status": "recording_started", "duration_s": dur}
+
+
+@app.get("/api/audio/test_recording/{kind}")
+async def download_audio_test_recording(kind: str, _: str = Depends(verify_credentials)):
+    """Download or stream the recorded raw or denoised test WAV file."""
+    audio_test_svc = get_audio_test_service()
+    wav_bytes = audio_test_svc.get_test_wav(kind=kind)
+    if not wav_bytes:
+        raise HTTPException(status_code=404, detail="No test recording available yet. Click 'Record 5s Clip' first.")
+    return Response(content=wav_bytes, media_type="audio/wav")
+
+
+
+# ---------------------------------------------------------------------------
 # Real-Time WebSocket Streaming
 # ---------------------------------------------------------------------------
 
@@ -461,6 +509,83 @@ async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(
     finally:
         stream_task.cancel()
         ws_manager.disconnect(websocket)
+
+
+@app.websocket("/ws/audio_test")
+async def websocket_audio_test(websocket: WebSocket, token: Optional[str] = Query(None)):
+    """
+    Real-time streaming WebSocket endpoint for live microphone testing:
+    - Streams dual VU meters (Raw vs Denoised), dB levels, VAD detection,
+      oscilloscope waveform points, and live audio chunks for browser monitoring.
+    """
+    expected_pass = config.web_password or "cubey"
+    cookie_token = websocket.cookies.get("cubey_auth")
+
+    is_authenticated = False
+    if token and secrets.compare_digest(token, expected_pass):
+        is_authenticated = True
+    elif cookie_token and secrets.compare_digest(cookie_token, expected_pass):
+        is_authenticated = True
+    else:
+        headers = dict(websocket.headers)
+        auth_header = headers.get("authorization", "")
+        if auth_header.startswith("Basic "):
+            try:
+                raw = base64.b64decode(auth_header[6:]).decode("utf-8")
+                user, pwd = raw.split(":", 1)
+                if (
+                    secrets.compare_digest(user, config.web_username or "admin")
+                    and secrets.compare_digest(pwd, expected_pass)
+                ):
+                    is_authenticated = True
+            except Exception:
+                pass
+
+    if config.web_password and not is_authenticated:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    await websocket.accept()
+    audio_test_svc = get_audio_test_service()
+    queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue(maxsize=15)
+    loop = asyncio.get_running_loop()
+
+    def _on_audio_telemetry(payload: Dict[str, Any]):
+        try:
+            loop.call_soon_threadsafe(
+                lambda: queue.put_nowait(payload) if not queue.full() else None
+            )
+        except Exception:
+            pass
+
+    audio_test_svc.add_listener(_on_audio_telemetry)
+
+    async def _send_loop():
+        while True:
+            try:
+                payload = await queue.get()
+                await websocket.send_json(payload)
+            except Exception:
+                break
+
+    send_task = asyncio.create_task(_send_loop())
+
+    try:
+        while True:
+            msg = await websocket.receive_json()
+            mtype = msg.get("type")
+            if mtype == "toggle_denoiser":
+                enabled = bool(msg.get("enabled", True))
+                audio_test_svc.set_denoiser_enabled(enabled)
+            elif mtype == "start_record_test":
+                dur = float(msg.get("duration_s", 5.0))
+                audio_test_svc.start_test_recording(duration_s=dur)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        send_task.cancel()
+        audio_test_svc.remove_listener(_on_audio_telemetry)
+
 
 
 # ---------------------------------------------------------------------------
