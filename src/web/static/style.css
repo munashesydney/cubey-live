@@ -1,0 +1,623 @@
+/* ==========================================================================
+   Catppuccin Mocha Dark Glassmorphism Design System for Cubey Web App
+   ========================================================================== */
+
+:root {
+  --base: #11111B;
+  --mantle: #181825;
+  --crust: #1E1E2E;
+  --surface0: #313244;
+  --surface1: #45475A;
+  --surface2: #585B70;
+  --overlay0: #6C7086;
+  --text: #CDD6F4;
+  --subtext: #BAC2DE;
+  --peach: #FAB387;
+  --green: #A6E3A1;
+  --red: #F38BA8;
+  --yellow: #F9E2AF;
+  --blue: #89B4FA;
+  --mauve: #CBA6F7;
+  --sky: #89DCEB;
+  --sapphire: #74C7EC;
+  
+  --font-main: 'Outfit', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'JetBrains Mono', Consolas, monospace;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+
+body, html {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background-color: var(--base);
+  color: var(--text);
+  font-family: var(--font-main);
+  font-size: 14px;
+}
+
+#app-container {
+  display: flex;
+  flex-direction: column;
+  width: 100vw;
+  height: 100vh;
+  position: relative;
+}
+
+/* --------------------------------------------------------------------------
+   Glassmorphic Header Navigation Bar
+   -------------------------------------------------------------------------- */
+.glass-nav {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  right: 12px;
+  height: 60px;
+  background: rgba(30, 30, 46, 0.75);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 18px;
+  z-index: 100;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+}
+
+.nav-left, .nav-center, .nav-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.brand-icon {
+  font-size: 24px;
+}
+
+.brand-text {
+  display: flex;
+  flex-direction: column;
+}
+
+.brand-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: #F5E0DC;
+  letter-spacing: 0.3px;
+}
+
+.brand-subtitle {
+  font-size: 11px;
+  color: var(--sky);
+  font-family: var(--font-mono);
+}
+
+.status-pill {
+  background: rgba(49, 50, 68, 0.6);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  padding: 5px 12px;
+  border-radius: 20px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-weight: 600;
+  font-size: 12px;
+  color: var(--subtext);
+}
+
+.live-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--overlay0);
+}
+
+.status-pill.active .live-dot {
+  background: var(--green);
+  box-shadow: 0 0 10px var(--green);
+  animation: pulse-dot 1.5s infinite;
+}
+
+.status-pill.active {
+  color: var(--green);
+  border-color: rgba(166, 227, 161, 0.3);
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.4; transform: scale(1.3); }
+}
+
+.telemetry-badge {
+  background: rgba(49, 50, 68, 0.4);
+  padding: 5px 10px;
+  border-radius: 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--subtext);
+}
+
+/* --------------------------------------------------------------------------
+   Buttons & Controls
+   -------------------------------------------------------------------------- */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 14px;
+  border-radius: 8px;
+  font-weight: 600;
+  font-size: 12px;
+  cursor: pointer;
+  border: none;
+  transition: all 0.18s ease;
+}
+
+.btn-primary {
+  background: var(--blue);
+  color: var(--base);
+}
+
+.btn-primary:hover {
+  background: #B4BEFE;
+  transform: translateY(-1px);
+}
+
+.btn-secondary {
+  background: var(--surface0);
+  color: var(--text);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.btn-secondary:hover {
+  background: var(--surface1);
+  color: #FFF;
+}
+
+.btn-danger-outline {
+  background: transparent;
+  color: var(--red);
+  border: 1px solid rgba(243, 139, 168, 0.4);
+}
+
+.btn-danger-outline:hover {
+  background: rgba(243, 139, 168, 0.15);
+}
+
+/* --------------------------------------------------------------------------
+   Main Map Viewport & Canvas
+   -------------------------------------------------------------------------- */
+#viewport {
+  width: 100%;
+  height: 100%;
+  position: relative;
+  overflow: hidden;
+  cursor: grab;
+}
+
+#viewport:active {
+  cursor: grabbing;
+}
+
+#map-canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+/* Floating Action Controls */
+.floating-controls {
+  position: absolute;
+  top: 86px;
+  left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 50;
+}
+
+.fab {
+  width: 38px;
+  height: 38px;
+  border-radius: 10px;
+  background: rgba(30, 30, 46, 0.85);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: var(--text);
+  font-size: 16px;
+  font-weight: bold;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s ease;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.fab:hover {
+  background: var(--surface0);
+  color: #FFF;
+  transform: scale(1.05);
+}
+
+.floating-legend {
+  position: absolute;
+  top: 86px;
+  right: 18px;
+  padding: 10px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--subtext);
+  z-index: 50;
+}
+
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.swatch {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+}
+
+.swatch.occupied { background: var(--sky); box-shadow: 0 0 6px var(--sky); }
+.swatch.free { background: var(--surface1); }
+.swatch.unknown { background: var(--base); border: 1px dashed var(--surface0); }
+.swatch.trail { background: var(--yellow); }
+
+/* --------------------------------------------------------------------------
+   Floating Remote Drive HUD & Virtual Joystick
+   -------------------------------------------------------------------------- */
+.glass-panel {
+  background: rgba(24, 24, 37, 0.85);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+}
+
+.floating-drive-hud {
+  position: absolute;
+  bottom: 20px;
+  right: 20px;
+  width: 260px;
+  padding: 14px;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.hud-header {
+  width: 100%;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+}
+
+.hud-title {
+  font-weight: 700;
+  font-size: 13px;
+  color: #F5E0DC;
+}
+
+.speed-label {
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--peach);
+}
+
+.joystick-wrapper {
+  width: 130px;
+  height: 130px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 10px;
+}
+
+#virtual-joystick {
+  width: 120px;
+  height: 120px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(49, 50, 68, 0.6) 0%, rgba(17, 17, 27, 0.9) 100%);
+  border: 2px solid var(--surface1);
+  position: relative;
+  touch-action: none;
+  cursor: pointer;
+  box-shadow: inset 0 0 12px rgba(0, 0, 0, 0.6);
+}
+
+#joystick-knob {
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--blue) 0%, #74C7EC 100%);
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.5), 0 0 12px rgba(137, 180, 250, 0.4);
+  pointer-events: none;
+  transition: transform 0.05s ease-out;
+}
+
+.drive-slider-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--subtext);
+}
+
+.drive-slider-row input[type="range"] {
+  flex: 1;
+  accent-color: var(--blue);
+}
+
+.drive-key-hint {
+  width: 100%;
+  margin-top: 8px;
+  font-size: 10px;
+  color: var(--overlay0);
+  text-align: center;
+}
+
+/* --------------------------------------------------------------------------
+   Modal Dialogs
+   -------------------------------------------------------------------------- */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(8px);
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.modal-backdrop.hidden {
+  display: none;
+}
+
+.modal-card {
+  width: 420px;
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.modal-card-wide {
+  width: 600px;
+  max-height: 80vh;
+}
+
+.modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.btn-close {
+  background: transparent;
+  border: none;
+  color: var(--subtext);
+  font-size: 18px;
+  cursor: pointer;
+}
+
+.modal-input {
+  width: 100%;
+  padding: 10px 14px;
+  border-radius: 8px;
+  background: var(--base);
+  border: 1px solid var(--surface1);
+  color: var(--text);
+  font-family: var(--font-main);
+  font-size: 14px;
+  outline: none;
+}
+
+.modal-input:focus {
+  border-color: var(--blue);
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 6px;
+}
+
+.maps-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow-y: auto;
+  max-height: 50vh;
+  padding-right: 4px;
+}
+
+.map-card-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 14px;
+  background: var(--crust);
+  border: 1px solid var(--surface0);
+  border-radius: 10px;
+}
+
+.map-card-title {
+  font-weight: 600;
+  color: #FFF;
+}
+
+.map-card-meta {
+  font-size: 11px;
+  color: var(--subtext);
+  font-family: var(--font-mono);
+}
+
+.map-card-actions {
+  display: flex;
+  gap: 6px;
+}
+
+/* --------------------------------------------------------------------------
+   Mobile Responsiveness
+   -------------------------------------------------------------------------- */
+@media (max-width: 768px) {
+  .glass-nav {
+    flex-wrap: wrap;
+    height: auto;
+    padding: 10px;
+    gap: 8px;
+  }
+  .nav-center {
+    display: none;
+  }
+  .floating-legend {
+    display: none;
+  }
+  .floating-drive-hud {
+    bottom: 12px;
+    right: 12px;
+    width: 200px;
+    padding: 10px;
+  }
+  .joystick-wrapper {
+    width: 100px;
+    height: 100px;
+  }
+  #virtual-joystick {
+    width: 90px;
+    height: 90px;
+  }
+  #joystick-knob {
+    width: 36px;
+    height: 36px;
+  }
+  .drive-key-hint {
+    display: none;
+  }
+}
+
+/* --------------------------------------------------------------------------
+   Mapping Mode Selector Modal Cards
+   -------------------------------------------------------------------------- */
+.modal-subtitle {
+  color: var(--subtext);
+  font-size: 13px;
+  margin-top: -6px;
+  margin-bottom: 8px;
+}
+
+.mode-cards-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+@media (max-width: 600px) {
+  .mode-cards-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.mode-card {
+  position: relative;
+  background: rgba(24, 24, 37, 0.6);
+  border: 1px solid var(--surface0);
+  border-radius: 12px;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  transition: all 0.25s ease;
+}
+
+.mode-card:hover {
+  transform: translateY(-3px);
+  border-color: var(--blue);
+  box-shadow: 0 8px 24px rgba(137, 180, 250, 0.15);
+}
+
+.auto-card {
+  border-color: rgba(137, 180, 250, 0.35);
+  background: radial-gradient(circle at top, rgba(137, 180, 250, 0.08) 0%, rgba(24, 24, 37, 0.7) 100%);
+}
+
+.auto-card:hover {
+  border-color: var(--blue);
+  box-shadow: 0 8px 28px rgba(137, 180, 250, 0.25);
+}
+
+.card-badge {
+  position: absolute;
+  top: -10px;
+  right: 14px;
+  background: linear-gradient(135deg, var(--green) 0%, var(--teal) 100%);
+  color: #11111B;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 10px;
+  box-shadow: 0 2px 8px rgba(166, 227, 161, 0.4);
+}
+
+.mode-icon {
+  font-size: 38px;
+  margin-bottom: 10px;
+}
+
+.mode-title {
+  font-weight: 700;
+  font-size: 16px;
+  color: var(--text);
+  margin-bottom: 8px;
+}
+
+.mode-desc {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--subtext);
+  margin-bottom: 18px;
+  flex-grow: 1;
+}
+
+.mode-desc strong {
+  color: var(--blue);
+}
+
+.btn-block {
+  width: 100%;
+  justify-content: center;
+}

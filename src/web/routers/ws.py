@@ -49,97 +49,92 @@ class WebSocketConnectionManager:
 ws_manager = WebSocketConnectionManager()
 
 
-def _is_ws_authenticated(websocket: WebSocket, token: Optional[str] = None) -> bool:
+@router.websocket("/ws/live_map")
+async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(None)):
+    """
+    Real-time bi-directional streaming endpoint:
+    - Server -> Client: 10 Hz broadcast of robot pose, trajectory, laser beam points,
+      compressed grid, and telemetry.
+    - Client -> Server: Teleoperation driving commands (joystick / WASD keys).
+    """
+    # Verify auth token, cookie, or basic auth header
     expected_pass = config.web_password or "cubey"
     cookie_token = websocket.cookies.get("cubey_auth")
 
+    is_authenticated = False
     if token and secrets.compare_digest(token, expected_pass):
-        return True
-    if cookie_token and secrets.compare_digest(cookie_token, expected_pass):
-        return True
+        is_authenticated = True
+    elif cookie_token and secrets.compare_digest(cookie_token, expected_pass):
+        is_authenticated = True
+    else:
+        # Fallback to Basic Auth header
+        headers = dict(websocket.headers)
+        auth_header = headers.get("authorization", "")
+        if auth_header.startswith("Basic "):
+            try:
+                raw = base64.b64decode(auth_header[6:]).decode("utf-8")
+                user, pwd = raw.split(":", 1)
+                if (
+                    secrets.compare_digest(user, config.web_username or "admin")
+                    and secrets.compare_digest(pwd, expected_pass)
+                ):
+                    is_authenticated = True
+            except Exception:
+                pass
 
-    headers = dict(websocket.headers)
-    auth_header = headers.get("authorization", "")
-    if auth_header.startswith("Basic "):
-        try:
-            raw = base64.b64decode(auth_header[6:]).decode("utf-8")
-            user, pwd = raw.split(":", 1)
-            if (
-                secrets.compare_digest(user, config.web_username or "admin")
-                and secrets.compare_digest(pwd, expected_pass)
-            ):
-                return True
-        except Exception:
-            pass
-
-    return not bool(config.web_password)
-
-
-@router.websocket("/ws/live_map")
-async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(None)):
-    """Real-time streaming WebSocket endpoint for 2D House Floorplan & Telemetry."""
-    if not _is_ws_authenticated(websocket, token):
+    if config.web_password and not is_authenticated:
+        logger.warning("Rejected unauthenticated WebSocket connection attempt.")
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
     await ws_manager.connect(websocket)
-
     mapping_svc = get_mapping_service()
-    lidar_svc = get_lidar_service()
     wheels_svc = get_wheels_service()
+    lidar_svc = get_lidar_service()
     nav_svc = get_nav_service()
 
-    async def _stream_telemetry_loop():
-        try:
-            while True:
+    # Background streamer task for this client
+    async def _stream_loop():
+        frame_counter = 0
+        while True:
+            try:
                 snapshot = mapping_svc.get_snapshot()
-                scan_data = lidar_svc.latest_scan
-                telemetry_payload = {
-                    "type": "telemetry",
-                    "pose": snapshot.pose.to_dict(),
-                    "battery": {
-                        "percentage": wheels_svc.telemetry.battery_pct,
-                        "voltage": wheels_svc.telemetry.battery_voltage,
-                        "is_charging": wheels_svc.telemetry.is_charging,
-                    },
-                    "motion": wheels_svc.telemetry.motion,
-                    "speed": wheels_svc.telemetry.speed,
-                    "lidar": {
-                        "is_connected": lidar_svc.is_connected,
-                        "is_scanning": lidar_svc.is_scanning,
-                        "is_mock": lidar_svc.is_mock,
-                        "scan_rate_hz": scan_data.scan_rate_hz,
-                        "min_front_mm": scan_data.min_front_dist_mm,
-                    },
-                    "mapping": {
-                        "is_mapping": mapping_svc.is_mapping,
-                        "map_name": mapping_svc.map_name,
-                        "active_map_id": mapping_svc.active_map_id,
-                        "explored_cells": snapshot.total_explored_cells,
-                    },
-                    "navigation": nav_svc.telemetry.to_dict(),
-                    "laser_scan": [
-                        {"dist_mm": pt.distance_mm, "angle_deg": pt.angle_deg, "quality": pt.quality}
-                        for pt in scan_data.points[::2]
-                    ] if scan_data.points else [],
-                    "grid_meta": {
-                        "width": snapshot.width,
-                        "height": snapshot.height,
-                        "resolution_m": snapshot.resolution_m,
-                        "origin_x_m": snapshot.origin_x_m,
-                        "origin_y_m": snapshot.origin_y_m,
-                        "version": snapshot.version,
-                    },
-                    "grid_compressed_b64": snapshot.compressed_grid_b64,
-                }
-                await websocket.send_json(telemetry_payload)
-                await asyncio.sleep(0.08)  # ~12.5 Hz
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.debug("Live map stream ended: %s", e)
+                frame_counter += 1
 
-    stream_task = asyncio.create_task(_stream_telemetry_loop())
+                # Send grid every 2nd frame (~5 Hz) to conserve bandwidth; send pose at 10 Hz
+                send_grid = (frame_counter % 2 == 0)
+                grid_b64 = (
+                    base64.b64encode(mapping_svc.get_compressed_grid()).decode("ascii")
+                    if send_grid
+                    else None
+                )
+
+                payload = {
+                    "type": "map_update",
+                    "pose": snapshot.pose.to_dict(),
+                    "trajectory": snapshot.trajectory,
+                    "laser_scan": snapshot.laser_scan,
+                    "grid_compressed_b64": grid_b64,
+                    "width": snapshot.width,
+                    "height": snapshot.height,
+                    "resolution_cm": snapshot.resolution_cm,
+                    "origin_x_m": snapshot.origin_x_m,
+                    "origin_y_m": snapshot.origin_y_m,
+                    "is_mapping": snapshot.is_mapping,
+                    "map_name": snapshot.map_name,
+                    "battery_pct": wheels_svc.telemetry.battery_pct,
+                    "motion": wheels_svc.telemetry.motion,
+                    "lidar_rate_hz": lidar_svc.latest_scan.scan_rate_hz,
+                    "nav_state": nav_svc.telemetry.state,
+                    "nav_mode": nav_svc.telemetry.mode,
+                    "timestamp": snapshot.timestamp,
+                }
+                await websocket.send_json(payload)
+                await asyncio.sleep(0.10)  # 10 Hz stream
+            except Exception:
+                break
+
+    stream_task = asyncio.create_task(_stream_loop())
 
     try:
         while True:
@@ -152,6 +147,14 @@ async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(
                 if not wheels_svc.is_connected:
                     wheels_svc.connect()
                 wheels_svc.set_speed(speed)
+                logger.info(
+                    "WS Drive CMD: %s (speed=%s, continuous=%s, wheels_connected=%s on %s)",
+                    action,
+                    speed,
+                    msg.get("continuous", False),
+                    wheels_svc.is_connected,
+                    wheels_svc.port,
+                )
                 if action == "stop":
                     wheels_svc.stop()
                 elif msg.get("continuous", False):
@@ -160,6 +163,7 @@ async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(
                     wheels_svc.pulse(action, msg.get("duration_ms", 250))
 
             elif mtype == "stop":
+                logger.info("WS Drive CMD: STOP")
                 wheels_svc.stop()
                 nav_svc.stop_navigation()
 
@@ -185,6 +189,7 @@ async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(
 
     except WebSocketDisconnect:
         pass
+
     finally:
         stream_task.cancel()
         ws_manager.disconnect(websocket)
@@ -193,7 +198,30 @@ async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(
 @router.websocket("/ws/audio_test")
 async def websocket_audio_test(websocket: WebSocket, token: Optional[str] = Query(None)):
     """Real-time streaming WebSocket endpoint for live microphone testing."""
-    if not _is_ws_authenticated(websocket, token):
+    expected_pass = config.web_password or "cubey"
+    cookie_token = websocket.cookies.get("cubey_auth")
+
+    is_authenticated = False
+    if token and secrets.compare_digest(token, expected_pass):
+        is_authenticated = True
+    elif cookie_token and secrets.compare_digest(cookie_token, expected_pass):
+        is_authenticated = True
+    else:
+        headers = dict(websocket.headers)
+        auth_header = headers.get("authorization", "")
+        if auth_header.startswith("Basic "):
+            try:
+                raw = base64.b64decode(auth_header[6:]).decode("utf-8")
+                user, pwd = raw.split(":", 1)
+                if (
+                    secrets.compare_digest(user, config.web_username or "admin")
+                    and secrets.compare_digest(pwd, expected_pass)
+                ):
+                    is_authenticated = True
+            except Exception:
+                pass
+
+    if config.web_password and not is_authenticated:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 

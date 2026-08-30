@@ -3,12 +3,13 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>🗺️ Cubey 2D House Mapper & Teleop</title>
-  <link rel="stylesheet" href="/static/css/base.css">
-  <link rel="stylesheet" href="/static/css/map.css">
+  <title>🤖 Cubey 2D House Mapper & Teleop</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <!-- Google Fonts for modern typography -->
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+  <!-- Pako for fast client-side zlib decompression -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"></script>
 </head>
 <body>
@@ -16,20 +17,14 @@
     <!-- Top Floating Navbar -->
     <header class="glass-nav">
       <div class="nav-left">
-        <a href="/" class="brand">
+        <div class="brand">
           <span class="brand-icon">🤖</span>
           <div class="brand-text">
             <span class="brand-title">Cubey Mapper</span>
             <span class="brand-subtitle" id="lbl-active-map-name">Live Floorplan</span>
           </div>
-        </a>
+        </div>
       </div>
-
-      <nav class="nav-links">
-        <a href="/" class="nav-link"><span>🏠</span> Home</a>
-        <a href="/map" class="nav-link active"><span>🗺️</span> 2D Mapping</a>
-        <a href="/mic-test" class="nav-link"><span>🎙️</span> Mic Studio</a>
-      </nav>
 
       <div class="nav-center">
         <div class="status-pill" id="pill-status">
@@ -119,10 +114,11 @@
         <div class="mode-cards-grid">
           <!-- Autonomous Mode Card -->
           <div class="mode-card auto-card" id="card-start-auto">
+            <div class="card-badge">✨ Recommended</div>
             <div class="mode-icon">🤖</div>
             <div class="mode-title">Autonomous Mapping</div>
             <div class="mode-desc">
-              Cubey uses <strong>360° Vector Potential Field SLAM</strong> to autonomously explore rooms, dodge obstacles, and generate the 2D floorplan.
+              Cubey uses <strong>ROS 2 Jazzy & Nav2</strong> to autonomously explore rooms, dodge obstacles, and generate the 2D floorplan without any manual steering.
             </div>
             <button id="btn-start-auto" class="btn btn-primary btn-block">
               ▶ Start Autonomous
@@ -134,7 +130,7 @@
             <div class="mode-icon">🕹️</div>
             <div class="mode-title">Manual Drive Mapping</div>
             <div class="mode-desc">
-              Take full control. Drive Cubey manually using the on-screen joystick or keyboard (<strong>WASD</strong>) while tracking live LiDAR scans.
+              Take full control. Drive Cubey manually using the on-screen joystick or keyboard (<strong>WASD</strong>) while tracking live LiDAR scans and SLAM odometry.
             </div>
             <button id="btn-start-manual" class="btn btn-secondary btn-block">
               ▶ Start Manual
@@ -171,6 +167,6 @@
     </div>
   </div>
 
-  <script src="/static/js/map_app.js"></script>
+  <script src="/static/app.js"></script>
 </body>
 </html>
