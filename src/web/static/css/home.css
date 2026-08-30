@@ -1,0 +1,240 @@
+/* ==========================================================================
+   CUBEY PORTAL — HOME DASHBOARD STYLES
+   ========================================================================== */
+
+.home-container {
+  max-width: 1100px;
+  margin: 30px auto;
+  padding: 0 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+}
+
+/* --------------------------------------------------------------------------
+   Hero Section
+   -------------------------------------------------------------------------- */
+
+.hero-banner {
+  padding: 30px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: linear-gradient(135deg, rgba(30, 30, 46, 0.9) 0%, rgba(49, 50, 68, 0.5) 100%);
+  border: 1px solid rgba(137, 180, 250, 0.2);
+  position: relative;
+  overflow: hidden;
+}
+
+.hero-banner::after {
+  content: "";
+  position: absolute;
+  top: -50%;
+  right: -20%;
+  width: 300px;
+  height: 300px;
+  background: radial-gradient(circle, rgba(137, 180, 250, 0.15) 0%, transparent 70%);
+  pointer-events: none;
+}
+
+.hero-content h1 {
+  font-size: 28px;
+  font-weight: 700;
+  margin-bottom: 8px;
+  background: linear-gradient(135deg, #FFFFFF 0%, var(--lavender) 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.hero-content p {
+  color: var(--subtext);
+  font-size: 14px;
+  max-width: 600px;
+  line-height: 1.5;
+}
+
+.hero-badges {
+  display: flex;
+  gap: 12px;
+}
+
+.hero-stat-card {
+  background: rgba(17, 17, 27, 0.6);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  padding: 12px 18px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-width: 100px;
+}
+
+.stat-val {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--text);
+  font-family: var(--font-mono);
+}
+
+.stat-lbl {
+  font-size: 11px;
+  color: var(--overlay0);
+  margin-top: 2px;
+}
+
+/* --------------------------------------------------------------------------
+   Feature Cards Grid (Portal Launchers)
+   -------------------------------------------------------------------------- */
+
+.section-title {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text);
+  margin-bottom: 4px;
+}
+
+.section-subtitle {
+  font-size: 13px;
+  color: var(--subtext);
+  margin-bottom: 16px;
+}
+
+.features-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 20px;
+}
+
+.feature-card {
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  text-decoration: none;
+  color: inherit;
+  transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  position: relative;
+}
+
+.feature-card:hover {
+  transform: translateY(-4px);
+  border-color: rgba(137, 180, 250, 0.4);
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.5);
+}
+
+.card-icon-wrap {
+  width: 52px;
+  height: 52px;
+  border-radius: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 26px;
+  margin-bottom: 16px;
+}
+
+.icon-map {
+  background: rgba(137, 180, 250, 0.15);
+  border: 1px solid rgba(137, 180, 250, 0.3);
+}
+
+.icon-mic {
+  background: rgba(166, 227, 161, 0.15);
+  border: 1px solid rgba(166, 227, 161, 0.3);
+}
+
+.icon-health {
+  background: rgba(203, 166, 247, 0.15);
+  border: 1px solid rgba(203, 166, 247, 0.3);
+}
+
+.card-title {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text);
+  margin-bottom: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.card-badge {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: rgba(148, 226, 213, 0.15);
+  color: var(--teal);
+}
+
+.card-desc {
+  font-size: 13px;
+  color: var(--subtext);
+  line-height: 1.5;
+  margin-bottom: 20px;
+  flex-grow: 1;
+}
+
+.card-action {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--blue);
+  transition: gap 0.2s ease;
+}
+
+.feature-card:hover .card-action {
+  gap: 10px;
+  color: #FFFFFF;
+}
+
+/* --------------------------------------------------------------------------
+   Live Telemetry Strip
+   -------------------------------------------------------------------------- */
+
+.telemetry-strip {
+  padding: 20px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 16px;
+}
+
+.telemetry-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.telemetry-item-icon {
+  font-size: 22px;
+}
+
+.telemetry-item-data {
+  display: flex;
+  flex-direction: column;
+}
+
+.telemetry-item-label {
+  font-size: 11px;
+  color: var(--overlay0);
+}
+
+.telemetry-item-value {
+  font-size: 13px;
+  font-weight: 600;
+  font-family: var(--font-mono);
+  color: var(--text);
+}
+
+@media (max-width: 768px) {
+  .hero-banner {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 20px;
+  }
+  .hero-badges {
+    width: 100%;
+    justify-content: space-between;
+  }
+}

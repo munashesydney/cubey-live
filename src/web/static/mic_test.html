@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>🎙️ Cubey Microphone & Denoiser Studio</title>
+  <link rel="stylesheet" href="/static/css/base.css">
+  <link rel="stylesheet" href="/static/css/audio_studio.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+  <div id="app-container">
+    <!-- Top Global Navbar -->
+    <header class="glass-nav">
+      <div class="nav-left">
+        <a href="/" class="brand">
+          <span class="brand-icon">🤖</span>
+          <div class="brand-text">
+            <span class="brand-title">Audio Studio</span>
+            <span class="brand-subtitle">Diagnostics & Denoiser</span>
+          </div>
+        </a>
+      </div>
+
+      <nav class="nav-links">
+        <a href="/" class="nav-link"><span>🏠</span> Home</a>
+        <a href="/map" class="nav-link"><span>🗺️</span> 2D Mapping</a>
+        <a href="/mic-test" class="nav-link active"><span>🎙️</span> Mic Studio</a>
+      </nav>
+
+      <div class="nav-center">
+        <div class="status-pill" id="pill-status">
+          <span class="dot live-dot"></span>
+          <span id="lbl-mapping-state">Mic Active</span>
+        </div>
+        <div class="telemetry-badge" id="badge-battery">
+          <span class="icon">🔋</span> <span id="lbl-battery-pct">--%</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- Main Audio Studio Layout -->
+    <main class="studio-container">
+      <!-- Studio Header Card -->
+      <div class="studio-header-card glass-panel">
+        <div>
+          <h2>🎙️ Microphone Diagnostics & Live Denoise Test</h2>
+          <span class="device-spec-tag" id="lbl-audio-device-spec">PipeWire AEC · 16,000 Hz Mono</span>
+        </div>
+        <a href="/" class="btn btn-secondary">← Back to Home</a>
+      </div>
+
+      <!-- Master Denoiser Switch Banner -->
+      <div class="denoise-master-banner glass-panel">
+        <div class="toggle-info">
+          <div class="toggle-title">
+            <span>🧠</span>
+            <strong>Hardware Noise Suppression (RNNoise + Highpass)</strong>
+          </div>
+          <div class="toggle-subtitle">
+            Suppresses motor hums, fan whines, and ambient room noise before feeding Gemini AI.
+          </div>
+        </div>
+        <label class="switch-control">
+          <input type="checkbox" id="chk-toggle-denoiser" checked>
+          <span class="switch-slider"></span>
+        </label>
+      </div>
+
+      <!-- Dual Live VU Meters Comparison -->
+      <div class="vu-meters-comparison-grid">
+        <!-- Raw Mic Stream Card -->
+        <div class="vu-card raw-card glass-panel">
+          <div class="vu-card-header">
+            <span class="vu-card-title">🔊 Raw Input (Without Denoiser)</span>
+            <span class="vu-db-readout" id="lbl-raw-db">-60.0 dB</span>
+          </div>
+          <div class="vu-bar-track">
+            <div class="vu-bar-fill raw-fill" id="bar-raw-fill" style="width: 0%;"></div>
+            <div class="vu-peak-indicator" id="ind-raw-peak"></div>
+          </div>
+          <div class="vu-scale-ticks">
+            <span>-60dB</span>
+            <span>-40dB</span>
+            <span>-20dB</span>
+            <span>-6dB</span>
+            <span class="clip-tick">0dB</span>
+          </div>
+          <div class="vu-card-meta">
+            <span>RMS Energy: <strong id="lbl-raw-rms-pct">0%</strong></span>
+            <span class="badge-raw-status">Unfiltered Mic</span>
+          </div>
+        </div>
+
+        <!-- Denoised Clean Stream Card -->
+        <div class="vu-card denoised-card glass-panel">
+          <div class="vu-card-header">
+            <span class="vu-card-title">✨ Denoised (To Gemini AI)</span>
+            <span class="vu-db-readout" id="lbl-denoised-db">-60.0 dB</span>
+          </div>
+          <div class="vu-bar-track">
+            <div class="vu-bar-fill denoised-fill" id="bar-denoised-fill" style="width: 0%;"></div>
+            <div class="vu-peak-indicator" id="ind-denoised-peak"></div>
+          </div>
+          <div class="vu-scale-ticks">
+            <span>-60dB</span>
+            <span>-40dB</span>
+            <span>-20dB</span>
+            <span>-6dB</span>
+            <span class="clip-tick">0dB</span>
+          </div>
+          <div class="vu-card-meta">
+            <span>Noise Cut: <strong id="lbl-noise-reduction-db">0.0 dB</strong></span>
+            <span class="badge-vad-status" id="badge-vad">🤫 Silence</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Live Oscilloscope Waveform Canvas -->
+      <div class="oscilloscope-container glass-panel">
+        <div class="oscilloscope-header">
+          <span class="scope-title">📊 Live Multi-Trace Oscilloscope</span>
+          <div class="scope-legend">
+            <span class="legend-chip raw-chip"><span class="dot"></span> Raw Wave</span>
+            <span class="legend-chip den-chip"><span class="dot"></span> Denoised Wave</span>
+          </div>
+        </div>
+        <canvas id="scope-canvas" width="840" height="100"></canvas>
+      </div>
+
+      <!-- Auditory Test & Browser Playback Studio -->
+      <div class="audio-interactive-grid">
+        <!-- Live Browser Speaker Monitor -->
+        <div class="interactive-box glass-panel">
+          <div class="box-header">
+            <strong>🎧 Live Browser Monitor</strong>
+            <span class="sub-hint">Listen through your PC/Phone speakers</span>
+          </div>
+          <div class="monitor-controls">
+            <button id="btn-toggle-live-monitor" class="btn btn-secondary btn-block">
+              <span id="lbl-monitor-icon">▶</span> <span id="lbl-monitor-text">Start Live Audio Monitor</span>
+            </button>
+            <div class="monitor-source-radios">
+              <label class="radio-label">
+                <input type="radio" name="monitor-source" value="denoised" checked>
+                <span>Hear Denoised</span>
+              </label>
+              <label class="radio-label">
+                <input type="radio" name="monitor-source" value="raw">
+                <span>Hear Raw</span>
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <!-- 5-Second Test Clip Recording -->
+        <div class="interactive-box glass-panel">
+          <div class="box-header">
+            <strong>⏺️ 5-Second Speech Clip Test</strong>
+            <span class="sub-hint">Speak to Cubey and review playback</span>
+          </div>
+          <div class="record-test-controls">
+            <button id="btn-start-record-test" class="btn btn-primary btn-block">
+              <span class="btn-icon">🎙️</span> <span id="lbl-record-test-text">Record 5s Test Clip</span>
+            </button>
+            <div id="record-progress-bar-wrap" class="progress-wrap hidden">
+              <div id="record-progress-bar" class="progress-bar-fill" style="width: 0%;"></div>
+            </div>
+            <div id="test-playback-row" class="playback-action-row hidden">
+              <button id="btn-play-denoised-clip" class="btn btn-sm btn-success">
+                ▶ Play Denoised Clip
+              </button>
+              <button id="btn-play-raw-clip" class="btn btn-sm btn-secondary">
+                ▶ Play Raw Clip
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Audio Element for Clip Playback -->
+      <audio id="test-audio-player" class="hidden"></audio>
+    </main>
+  </div>
+
+  <script src="/static/js/shared.js"></script>
+  <script src="/static/js/audio_studio.js"></script>
+</body>
+</html>

@@ -125,6 +125,20 @@ class LivePage(ctk.CTkFrame):
         )
         self.mute_switch.pack(side="left", padx=6)
 
+        # Denoiser Noise Suppression Switch
+        self.denoiser_switch = ctk.CTkSwitch(
+            controls_box,
+            text="🧠 Denoise",
+            command=self._handle_denoiser_toggle,
+            font=ctk.CTkFont(size=12),
+            progress_color="#A6E3A1",
+        )
+        if getattr(self.app_config, "enable_noise_suppression", True):
+            self.denoiser_switch.select()
+        else:
+            self.denoiser_switch.deselect()
+        self.denoiser_switch.pack(side="left", padx=6)
+
         # Camera Vision Switch
         self.camera_switch = ctk.CTkSwitch(
             controls_box,
@@ -136,6 +150,7 @@ class LivePage(ctk.CTkFrame):
         if self.is_camera_active:
             self.camera_switch.select()
         self.camera_switch.pack(side="left", padx=6)
+
 
         # Session Start/Stop Button
         self.session_button = ctk.CTkButton(
@@ -533,7 +548,25 @@ class LivePage(ctk.CTkFrame):
                 pass
         super().destroy()
 
+    def _handle_mute_toggle(self) -> None:
+        """Handler for Mute Mic toggle switch."""
+        is_muted = bool(self.mute_switch.get())
+        if self.on_toggle_mute:
+            self.on_toggle_mute(is_muted)
+
+    def _handle_denoiser_toggle(self) -> None:
+        """Handler for Noise Suppression toggle switch (persists for all new sessions)."""
+        enabled = bool(self.denoiser_switch.get())
+        self.app_config.enable_noise_suppression = enabled
+        try:
+            from src.services.audio_test_service import get_audio_test_service
+            get_audio_test_service().set_denoiser_enabled(enabled)
+        except Exception:
+            pass
+        logger.info("LivePage: Noise suppression for upcoming sessions set to %s", enabled)
+
     def _handle_camera_switch_toggle(self) -> None:
+
         """Handler for Camera toggle switch in top header bar."""
         desired_state = bool(self.camera_switch.get())
         if self.on_toggle_camera:
