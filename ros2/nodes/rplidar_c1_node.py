@@ -152,10 +152,13 @@ class RPLidarC1Node(Node):
                     accumulated_points = []
 
                 if dist_m > 0:
-                    # In ROS standard frame: angle 0 = front (+X), angle counter-clockwise
-                    # RPLIDAR C1 outputs clockwise angles starting from front notch.
-                    # Convert to ROS standard REP 103 (counter-clockwise rads):
-                    rad = math.radians(360.0 - angle_deg) if angle_deg > 0 else 0.0
+                    # RPLIDAR C1: 0 deg = front, angles increase clockwise
+                    # ROS REP 103: 0 rad = front, angles increase counter-clockwise, range [-pi, pi]
+                    rad = -math.radians(angle_deg)
+                    while rad <= -math.pi:
+                        rad += 2.0 * math.pi
+                    while rad > math.pi:
+                        rad -= 2.0 * math.pi
                     accumulated_points.append((rad, dist_m, quality))
 
             except Exception as e:
@@ -169,12 +172,9 @@ class RPLidarC1Node(Node):
         if not points:
             return
 
-        # Sort points by angle
-        points.sort(key=lambda p: p[0])
-
         num_readings = 360
-        angle_min = 0.0
-        angle_max = 2.0 * math.pi
+        angle_min = -math.pi
+        angle_max = math.pi
         angle_increment = (angle_max - angle_min) / num_readings
 
         ranges = [float("inf")] * num_readings
@@ -182,7 +182,7 @@ class RPLidarC1Node(Node):
 
         for angle_rad, dist_m, quality in points:
             if self.min_range <= dist_m <= self.max_range:
-                idx = int(angle_rad / angle_increment)
+                idx = int((angle_rad - angle_min) / angle_increment)
                 if 0 <= idx < num_readings:
                     if dist_m < ranges[idx]:
                         ranges[idx] = dist_m
@@ -202,6 +202,7 @@ class RPLidarC1Node(Node):
         msg.intensities = intensities
 
         self.pub_scan.publish(msg)
+
 
     def destroy_node(self):
         self._running = False
