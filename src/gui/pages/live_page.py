@@ -133,11 +133,12 @@ class LivePage(ctk.CTkFrame):
             font=ctk.CTkFont(size=12),
             progress_color="#A6E3A1",
         )
-        if getattr(self.app_config, "enable_noise_suppression", True):
+        if getattr(self.app_config, "enable_noise_suppression", False):
             self.denoiser_switch.select()
         else:
             self.denoiser_switch.deselect()
         self.denoiser_switch.pack(side="left", padx=6)
+
 
         # Camera Vision Switch
         self.camera_switch = ctk.CTkSwitch(
