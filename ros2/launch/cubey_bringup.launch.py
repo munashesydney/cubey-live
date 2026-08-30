@@ -26,13 +26,12 @@ def generate_launch_description():
     serial_port = LaunchConfiguration("serial_port", default="/dev/ttyAMA0")
 
     lifecycle_nodes = [
+        "slam_toolbox",
         "controller_server",
         "planner_server",
         "behavior_server",
         "bt_navigator",
     ]
-
-
 
     return LaunchDescription([
         # Set unbuffered output
@@ -136,10 +135,12 @@ def generate_launch_description():
             parameters=[{
                 "use_sim_time": use_sim_time,
                 "autostart": True,
+                "bond_timeout": 0.0,
                 "node_names": lifecycle_nodes,
             }],
             output="screen",
         ),
+
 
         # -----------------------------------------------------------------
         # 6. ESP32 Serial cmd_vel Bridge (/dev/ttyAMA0)
