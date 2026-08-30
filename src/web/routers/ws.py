@@ -49,48 +49,44 @@ class WebSocketConnectionManager:
 ws_manager = WebSocketConnectionManager()
 
 
-@router.websocket("/ws/live_map")
-async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(None)):
-    """
-    Real-time bi-directional streaming endpoint:
-    - Server -> Client: 10 Hz broadcast of robot pose, trajectory, laser beam points,
-      compressed grid, and telemetry.
-    - Client -> Server: Teleoperation driving commands (joystick / WASD keys).
-    """
-    # Verify auth token, cookie, or basic auth header
+def _is_ws_authenticated(websocket: WebSocket, token: Optional[str] = None) -> bool:
     expected_pass = config.web_password or "cubey"
     cookie_token = websocket.cookies.get("cubey_auth")
 
-    is_authenticated = False
     if token and secrets.compare_digest(token, expected_pass):
-        is_authenticated = True
-    elif cookie_token and secrets.compare_digest(cookie_token, expected_pass):
-        is_authenticated = True
-    else:
-        # Fallback to Basic Auth header
-        headers = dict(websocket.headers)
-        auth_header = headers.get("authorization", "")
-        if auth_header.startswith("Basic "):
-            try:
-                raw = base64.b64decode(auth_header[6:]).decode("utf-8")
-                user, pwd = raw.split(":", 1)
-                if (
-                    secrets.compare_digest(user, config.web_username or "admin")
-                    and secrets.compare_digest(pwd, expected_pass)
-                ):
-                    is_authenticated = True
-            except Exception:
-                pass
+        return True
+    if cookie_token and secrets.compare_digest(cookie_token, expected_pass):
+        return True
 
-    if config.web_password and not is_authenticated:
-        logger.warning("Rejected unauthenticated WebSocket connection attempt.")
+    headers = dict(websocket.headers)
+    auth_header = headers.get("authorization", "")
+    if auth_header.startswith("Basic "):
+        try:
+            raw = base64.b64decode(auth_header[6:]).decode("utf-8")
+            user, pwd = raw.split(":", 1)
+            if (
+                secrets.compare_digest(user, config.web_username or "admin")
+                and secrets.compare_digest(pwd, expected_pass)
+            ):
+                return True
+        except Exception:
+            pass
+
+    return not bool(config.web_password)
+
+
+@router.websocket("/ws/live_map")
+async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(None)):
+    """Real-time streaming WebSocket endpoint for 2D House Floorplan & Telemetry."""
+    if not _is_ws_authenticated(websocket, token):
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
     await ws_manager.connect(websocket)
+
     mapping_svc = get_mapping_service()
-    wheels_svc = get_wheels_service()
     lidar_svc = get_lidar_service()
+    wheels_svc = get_wheels_service()
     nav_svc = get_nav_service()
 
     # Background streamer task for this client
@@ -136,6 +132,7 @@ async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(
 
     stream_task = asyncio.create_task(_stream_loop())
 
+
     try:
         while True:
             msg = await websocket.receive_json()
@@ -147,14 +144,6 @@ async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(
                 if not wheels_svc.is_connected:
                     wheels_svc.connect()
                 wheels_svc.set_speed(speed)
-                logger.info(
-                    "WS Drive CMD: %s (speed=%s, continuous=%s, wheels_connected=%s on %s)",
-                    action,
-                    speed,
-                    msg.get("continuous", False),
-                    wheels_svc.is_connected,
-                    wheels_svc.port,
-                )
                 if action == "stop":
                     wheels_svc.stop()
                 elif msg.get("continuous", False):
@@ -163,7 +152,6 @@ async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(
                     wheels_svc.pulse(action, msg.get("duration_ms", 250))
 
             elif mtype == "stop":
-                logger.info("WS Drive CMD: STOP")
                 wheels_svc.stop()
                 nav_svc.stop_navigation()
 
@@ -189,7 +177,6 @@ async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(
 
     except WebSocketDisconnect:
         pass
-
     finally:
         stream_task.cancel()
         ws_manager.disconnect(websocket)
@@ -198,30 +185,7 @@ async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(
 @router.websocket("/ws/audio_test")
 async def websocket_audio_test(websocket: WebSocket, token: Optional[str] = Query(None)):
     """Real-time streaming WebSocket endpoint for live microphone testing."""
-    expected_pass = config.web_password or "cubey"
-    cookie_token = websocket.cookies.get("cubey_auth")
-
-    is_authenticated = False
-    if token and secrets.compare_digest(token, expected_pass):
-        is_authenticated = True
-    elif cookie_token and secrets.compare_digest(cookie_token, expected_pass):
-        is_authenticated = True
-    else:
-        headers = dict(websocket.headers)
-        auth_header = headers.get("authorization", "")
-        if auth_header.startswith("Basic "):
-            try:
-                raw = base64.b64decode(auth_header[6:]).decode("utf-8")
-                user, pwd = raw.split(":", 1)
-                if (
-                    secrets.compare_digest(user, config.web_username or "admin")
-                    and secrets.compare_digest(pwd, expected_pass)
-                ):
-                    is_authenticated = True
-            except Exception:
-                pass
-
-    if config.web_password and not is_authenticated:
+    if not _is_ws_authenticated(websocket, token):
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 

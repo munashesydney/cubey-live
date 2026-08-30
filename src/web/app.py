@@ -63,11 +63,16 @@ if STATIC_DIR.exists():
         return response
 
     @app.get("/")
-    @app.get("/map")
-    async def serve_map_interface(_: str = Depends(verify_credentials)):
-        """Serve the 2D SLAM House Mapping & Remote Control interface."""
+    async def serve_home(_: str = Depends(verify_credentials)):
+        """Serve the Home Dashboard portal."""
         index_path = STATIC_DIR / "index.html"
         return _auth_response(index_path)
+
+    @app.get("/map")
+    async def serve_map_page(_: str = Depends(verify_credentials)):
+        """Serve the dedicated 2D SLAM House Mapping & Remote Control page."""
+        map_path = STATIC_DIR / "map.html"
+        return _auth_response(map_path)
 
     @app.get("/mic-test")
     async def serve_mic_test_page(_: str = Depends(verify_credentials)):
