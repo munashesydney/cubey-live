@@ -159,7 +159,7 @@ from openwakeword.model import Model  # noqa: F401
 
 asset_dir = project_root / "src" / "assets" / "wakeword"
 required = (
-    asset_dir / "cubey_multigreeting_v1.onnx",
+    asset_dir / "cubey_multigreeting_v2.onnx",
     asset_dir / "melspectrogram.onnx",
     asset_dir / "embedding_model.onnx",
 )

@@ -15,7 +15,7 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 _ASSET_DIR = Path(__file__).resolve().parents[1] / "assets" / "wakeword"
-DEFAULT_MODEL_PATH = _ASSET_DIR / "cubey_multigreeting_v1.onnx"
+DEFAULT_MODEL_PATH = _ASSET_DIR / "cubey_multigreeting_v2.onnx"
 DEFAULT_MELSPEC_MODEL_PATH = _ASSET_DIR / "melspectrogram.onnx"
 DEFAULT_EMBEDDING_MODEL_PATH = _ASSET_DIR / "embedding_model.onnx"
 
