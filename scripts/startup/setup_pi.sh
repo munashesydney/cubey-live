@@ -80,6 +80,10 @@ fi
 echo "==> Installing Python dependencies..."
 "${VENV}/bin/pip" install --upgrade pip setuptools wheel
 "${VENV}/bin/pip" install -r "${PROJECT_ROOT}/requirements.txt"
+# openWakeWord's Linux metadata unconditionally pulls tflite-runtime, which
+# has no Python 3.13/aarch64 wheel. The application uses ONNX exclusively and
+# its runtime dependencies are pinned explicitly in requirements.txt.
+"${VENV}/bin/pip" install --no-deps "openwakeword==0.6.0"
 
 # ---------------------------------------------------------------------------
 # .env (API key)
