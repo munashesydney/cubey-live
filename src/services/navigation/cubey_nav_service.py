@@ -196,6 +196,9 @@ class CubeyNavService:
         wheels_svc = get_wheels_service()
         lidar_svc = get_lidar_service()
 
+        if not wheels_svc.is_connected:
+            wheels_svc.connect()
+
         OBSTACLE_THRESHOLD_MM = 380  # Stop & turn threshold
         CLEAR_THRESHOLD_MM = 550     # Clear forward path threshold
 
@@ -210,14 +213,14 @@ class CubeyNavService:
                 # Check if path in front is clear
                 if front > CLEAR_THRESHOLD_MM:
                     # Move forward smoothly
-                    wheels_svc.send_command("forward")
+                    wheels_svc.move("forward")
                     time.sleep(0.35)
                 elif front > OBSTACLE_THRESHOLD_MM:
                     # Approaching obstacle — nudge slightly toward clearest side
                     if left > right:
-                        wheels_svc.send_command("forwardLeft")
+                        wheels_svc.move("forwardLeft")
                     else:
-                        wheels_svc.send_command("forwardRight")
+                        wheels_svc.move("forwardRight")
                     time.sleep(0.30)
                 else:
                     # Obstacle detected in front! Stop and evade
@@ -227,21 +230,21 @@ class CubeyNavService:
                     # Turn or strafe toward the side with more open space
                     if left > right and left > OBSTACLE_THRESHOLD_MM:
                         self._emit_log("Obstacle ahead: rotating left to explore open space...")
-                        wheels_svc.send_command("rotateLeft")
+                        wheels_svc.move("rotateLeft")
                         time.sleep(0.40)
                     elif right > OBSTACLE_THRESHOLD_MM:
                         self._emit_log("Obstacle ahead: rotating right to explore open space...")
-                        wheels_svc.send_command("rotateRight")
+                        wheels_svc.move("rotateRight")
                         time.sleep(0.40)
                     elif back > OBSTACLE_THRESHOLD_MM:
                         self._emit_log("Corner/dead-end detected: reversing out...")
-                        wheels_svc.send_command("backward")
+                        wheels_svc.move("backward")
                         time.sleep(0.35)
-                        wheels_svc.send_command("rotateRight")
+                        wheels_svc.move("rotateRight")
                         time.sleep(0.45)
                     else:
                         # Full 180 spin if trapped in a tight space
-                        wheels_svc.send_command("rotateRight")
+                        wheels_svc.move("rotateRight")
                         time.sleep(0.60)
 
                     wheels_svc.stop()
@@ -263,6 +266,9 @@ class CubeyNavService:
         wheels_svc = get_wheels_service()
         mapping_svc = get_mapping_service()
         lidar_svc = get_lidar_service()
+
+        if not wheels_svc.is_connected:
+            wheels_svc.connect()
 
         GOAL_TOLERANCE_M = 0.20
         OBSTACLE_AVOID_MM = 350
@@ -306,21 +312,21 @@ class CubeyNavService:
                     wheels_svc.stop()
                     time.sleep(0.1)
                     if scan.min_left_dist_mm > scan.min_right_dist_mm:
-                        wheels_svc.send_command("strafeLeft")
+                        wheels_svc.move("strafeLeft")
                     else:
-                        wheels_svc.send_command("strafeRight")
+                        wheels_svc.move("strafeRight")
                     time.sleep(0.35)
                     continue
 
                 # Align heading or drive forward
                 if abs(heading_err) > 25:
                     if heading_err > 0:
-                        wheels_svc.send_command("rotateRight")
+                        wheels_svc.move("rotateRight")
                     else:
-                        wheels_svc.send_command("rotateLeft")
+                        wheels_svc.move("rotateLeft")
                     time.sleep(0.20)
                 else:
-                    wheels_svc.send_command("forward")
+                    wheels_svc.move("forward")
                     time.sleep(0.30)
 
                 wheels_svc.stop()
@@ -334,6 +340,7 @@ class CubeyNavService:
             wheels_svc.stop()
         except Exception:
             pass
+
 
     def _emit_telemetry(self) -> None:
         if self.on_telemetry:
