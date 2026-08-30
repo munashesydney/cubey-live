@@ -1,0 +1,168 @@
+import os
+from pathlib import Path
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, GroupAction, IncludeLaunchDescription, SetEnvironmentVariable
+from launch.conditions import IfCondition
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch_ros.actions import Node, LifecycleNode
+from launch_ros.substitutions import FindPackageShare
+
+
+def generate_launch_description():
+    # Base directory for ros2 workspace configs
+    ros2_dir = Path(__file__).resolve().parent.parent
+    config_dir = ros2_dir / "config"
+    nodes_dir = ros2_dir / "nodes"
+
+    slam_params_file = str(config_dir / "slam_toolbox_params.yaml")
+    nav2_params_file = str(config_dir / "nav2_params.yaml")
+    cmd_bridge_script = str(nodes_dir / "cmd_vel_serial_bridge.py")
+
+    # Launch Configurations
+    use_sim_time = LaunchConfiguration("use_sim_time", default="false")
+    autostart = LaunchConfiguration("autostart", default="true")
+    lidar_port = LaunchConfiguration("lidar_port", default="/dev/ttyUSB0")
+    lidar_baud = LaunchConfiguration("lidar_baud", default="460800")
+    serial_port = LaunchConfiguration("serial_port", default="/dev/ttyAMA0")
+
+    lifecycle_nodes = [
+        "controller_server",
+        "planner_server",
+        "behavior_server",
+        "bt_navigator",
+    ]
+
+    return LaunchDescription([
+        # Set unbuffered output
+        SetEnvironmentVariable("RCUTILS_LOGGING_BUFFERED_STREAM", "0"),
+        SetEnvironmentVariable("RCUTILS_COLORIZED_OUTPUT", "1"),
+
+        # -----------------------------------------------------------------
+        # 1. Coordinate Transforms (TF)
+        # -----------------------------------------------------------------
+        # base_footprint -> base_link
+        Node(
+            package="tf2_ros",
+            executable="static_transform_publisher",
+            name="base_footprint_to_base_link",
+            arguments=["--x", "0.0", "--y", "0.0", "--z", "0.0", "--yaw", "0.0", "--pitch", "0.0", "--roll", "0.0", "--frame-id", "base_footprint", "--child-frame-id", "base_link"],
+            output="screen",
+        ),
+
+        # base_link -> laser
+        # LiDAR position: Centered left/right (Y=0.0), shifted 35mm rearward (X=-0.035m), Z=0.10m
+        Node(
+            package="tf2_ros",
+            executable="static_transform_publisher",
+            name="base_link_to_laser",
+            arguments=["--x", "-0.035", "--y", "0.0", "--z", "0.10", "--yaw", "0.0", "--pitch", "0.0", "--roll", "0.0", "--frame-id", "base_link", "--child-frame-id", "laser"],
+            output="screen",
+        ),
+
+        # -----------------------------------------------------------------
+        # 2. RPLIDAR C1 Sensor Driver (/dev/ttyUSB0)
+        # -----------------------------------------------------------------
+        Node(
+            package="rplidar_ros",
+            executable="rplidar_node",
+            name="rplidar_c1_node",
+            parameters=[{
+                "serial_port": lidar_port,
+                "serial_baudrate": lidar_baud,
+                "frame_id": "laser",
+                "inverted": False,
+                "angle_compensate": True,
+                "scan_mode": "Standard",
+            }],
+            output="screen",
+        ),
+
+        # -----------------------------------------------------------------
+        # 3. 2D Laser Odometry (rf2o) - Provides /odom & odom->base_link TF
+        # -----------------------------------------------------------------
+        Node(
+            package="rf2o_laser_odometry",
+            executable="rf2o_laser_odometry_node",
+            name="rf2o_laser_odometry",
+            parameters=[{
+                "laser_scan_topic": "/scan",
+                "odom_topic": "/odom",
+                "publish_tf": True,
+                "base_frame_id": "base_link",
+                "odom_frame_id": "odom",
+                "init_pose_from_topic": "",
+                "freq": 10.0,
+                "verbose": False,
+            }],
+            output="screen",
+        ),
+
+        # -----------------------------------------------------------------
+        # 4. SLAM Toolbox (2D Occupancy Grid Mapping & Loop Closure)
+        # -----------------------------------------------------------------
+        Node(
+            package="slam_toolbox",
+            executable="async_slam_toolbox_node",
+            name="slam_toolbox",
+            parameters=[slam_params_file, {"use_sim_time": use_sim_time}],
+            output="screen",
+        ),
+
+        # -----------------------------------------------------------------
+        # 5. Nav2 Navigation Stack
+        # -----------------------------------------------------------------
+        Node(
+            package="nav2_controller",
+            executable="controller_server",
+            name="controller_server",
+            parameters=[nav2_params_file, {"use_sim_time": use_sim_time}],
+            remappings=[("/cmd_vel", "/cmd_vel")],
+            output="screen",
+        ),
+        Node(
+            package="nav2_planner",
+            executable="planner_server",
+            name="planner_server",
+            parameters=[nav2_params_file, {"use_sim_time": use_sim_time}],
+            output="screen",
+        ),
+        Node(
+            package="nav2_behaviors",
+            executable="behavior_server",
+            name="behavior_server",
+            parameters=[nav2_params_file, {"use_sim_time": use_sim_time}],
+            output="screen",
+        ),
+        Node(
+            package="nav2_bt_navigator",
+            executable="bt_navigator",
+            name="bt_navigator",
+            parameters=[nav2_params_file, {"use_sim_time": use_sim_time}],
+            output="screen",
+        ),
+        Node(
+            package="nav2_lifecycle_manager",
+            executable="lifecycle_manager",
+            name="lifecycle_manager_navigation",
+            parameters=[{
+                "use_sim_time": use_sim_time,
+                "autostart": True,
+                "node_names": lifecycle_nodes,
+            }],
+            output="screen",
+        ),
+
+        # -----------------------------------------------------------------
+        # 6. ESP32 Serial cmd_vel Bridge (/dev/ttyAMA0)
+        # -----------------------------------------------------------------
+        Node(
+            executable="python3",
+            arguments=[cmd_bridge_script],
+            name="cubey_cmd_vel_bridge",
+            parameters=[{
+                "serial_port": serial_port,
+                "baudrate": 115200,
+            }],
+            output="screen",
+        ),
+    ])
