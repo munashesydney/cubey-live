@@ -9,6 +9,10 @@ platforms = ["linux-aarch64"]
 [dependencies]
 python = ">=3.11"
 pyserial = ">=3.5"
+fastapi = "*"
+uvicorn = "*"
+pydantic = "*"
+websockets = "*"
 ros-jazzy-ros-base = "*"
 ros-jazzy-navigation2 = "*"
 ros-jazzy-nav2-bringup = "*"
@@ -24,6 +28,10 @@ pyyaml = "*"
 # Launch full autonomous navigation & mapping stack
 launch = "ros2 launch launch/cubey_bringup.launch.py"
 
+# Start the Cubey Live Web Application
+web = { cmd = "python -m src.main", cwd = ".." }
+
 # Individual testing tasks
 test-lidar = "ros2 run rplidar_ros rplidar_node --ros-args -p serial_port:=/dev/ttyUSB0 -p serial_baudrate:=460800 -p frame_id:=laser"
 test-bridge = "python nodes/cmd_vel_serial_bridge.py"
+
