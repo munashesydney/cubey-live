@@ -190,103 +190,140 @@ class CubeyNavService:
 
     def _autonomous_exploration_loop(self):
         """
-        Autonomous wandering loop combining LiDAR proximity telemetry and
-        gentle mecanum drive maneuvers to map the environment without bumping.
+        Autonomous Vector Potential Field navigation loop.
+        Computes continuous attractive (forward exploration) and repulsive (obstacle avoidance)
+        force vectors directly from 360° LiDAR pointclouds, with SLAM-based stall recovery.
         """
         wheels_svc = get_wheels_service()
         lidar_svc = get_lidar_service()
+        mapping_svc = get_mapping_service()
 
         if not wheels_svc.is_connected:
             wheels_svc.connect()
 
-        # Set low, gentle speed for smooth mapping & low wheel slippage
         AUTONOMOUS_SPEED = 110
         wheels_svc.set_speed(AUTONOMOUS_SPEED)
 
-        SAFE_STOP_DIST_MM = 220   # Stop threshold (22 cm)
-        SLOW_WARN_DIST_MM = 340   # Approaching obstacle threshold (34 cm)
+        # SLAM Stall Detection tracking
+        last_tracked_x = mapping_svc.pose.x_m
+        last_tracked_y = mapping_svc.pose.y_m
+        last_tracked_th = mapping_svc.pose.theta_deg
+        last_stall_check_time = time.time()
+        last_explored_cells = 0
+        last_cell_change_time = time.time()
 
-        consecutive_turns = 0
-        last_turn_dir = "rotateRight"
+        self._emit_log(f"🤖 Vector Potential Field Exploration active (speed {AUTONOMOUS_SPEED}).")
+        logger.info("Vector Potential Field Exploration loop started at speed %d", AUTONOMOUS_SPEED)
 
-        self._emit_log(f"🤖 Autonomous Exploration active at speed {AUTONOMOUS_SPEED}.")
-        logger.info("Autonomous Exploration loop started at speed %d", AUTONOMOUS_SPEED)
+        SAFETY_RADIUS_M = 0.55  # 55cm repulsive boundary
+        CRITICAL_STOP_M = 0.22  # 22cm emergency stop distance
 
         while self._is_exploring:
             try:
                 scan = lidar_svc.latest_scan
-                front = scan.min_front_dist_mm if scan.min_front_dist_mm > 0 else 9999
-                left = scan.min_left_dist_mm if scan.min_left_dist_mm > 0 else 9999
-                right = scan.min_right_dist_mm if scan.min_right_dist_mm > 0 else 9999
-                back = scan.min_back_dist_mm if scan.min_back_dist_mm > 0 else 9999
+                points = scan.points if scan else []
 
+                # --- 1. Vector Potential Field Calculation ---
+                # Repulsive force vector (pushing away from nearby obstacles)
+                repulse_x = 0.0  # lateral (+ pushes right, - pushes left)
+                repulse_y = 0.0  # longitudinal (+ pushes forward, - pushes backward)
+                min_obstacle_dist = 999.0
+
+                for pt in points:
+                    dist_m = pt.distance_mm / 1000.0
+                    if dist_m < 0.15 or dist_m > SAFETY_RADIUS_M or pt.quality <= 5:
+                        continue
+
+                    if dist_m < min_obstacle_dist:
+                        min_obstacle_dist = dist_m
+
+                    angle_rad = math.radians(pt.angle_deg)
+                    # Sensor local frame: 0° fwd, 90° right, 180° back, 270° left
+                    px = dist_m * math.sin(angle_rad)
+                    py = dist_m * math.cos(angle_rad) - 0.035  # LiDAR offset
+
+                    # Inverse square repulsive force
+                    force = (1.0 / max(dist_m, 0.18) - 1.0 / SAFETY_RADIUS_M) ** 2
+                    repulse_x -= (px / dist_m) * force
+                    repulse_y -= (py / dist_m) * force
+
+                # Attractive forward exploration bias
+                FORWARD_ATTRACTIVE_FORCE = 2.2
+                target_vy = FORWARD_ATTRACTIVE_FORCE + repulse_y
+                target_vx = repulse_x
+
+                # --- 2. Action Selection based on Resultant Force Vector ---
                 action = "forward"
+                duration = 0.22
 
-                # 1. Clear forward path
-                if front > SLOW_WARN_DIST_MM:
-                    action = "forward"
-                    consecutive_turns = 0
-                    wheels_svc.move("forward")
-                    time.sleep(0.24)
+                if min_obstacle_dist < CRITICAL_STOP_M or target_vy < -0.2:
+                    # Trapped or head-on obstacle: stop and evade laterally/rotationally
+                    wheels_svc.stop()
+                    time.sleep(0.06)
 
-                # 2. Approaching obstacle — nudge slightly toward clearest side
-                elif front > SAFE_STOP_DIST_MM:
-                    if left > right:
-                        action = "forwardLeft"
+                    if abs(target_vx) > 0.8:
+                        action = "strafeRight" if target_vx > 0 else "strafeLeft"
+                        duration = 0.24
                     else:
-                        action = "forwardRight"
-                    consecutive_turns = 0
+                        action = "rotateRight" if target_vx >= 0 else "rotateLeft"
+                        duration = 0.20
+                    wheels_svc.move(action)
+                    time.sleep(duration)
+                elif abs(target_vx) > 1.2:
+                    # Strong side repulsion: steer diagonally
+                    action = "forwardRight" if target_vx > 0 else "forwardLeft"
                     wheels_svc.move(action)
                     time.sleep(0.20)
-
-                # 3. Obstacle detected in front! Stop and evade intelligently
                 else:
-                    wheels_svc.stop()
-                    time.sleep(0.08)
-                    consecutive_turns += 1
+                    # Clear path ahead: glide forward
+                    action = "forward"
+                    wheels_svc.move("forward")
+                    time.sleep(0.22)
 
-                    # If stuck in a corner / dead-end, back up first
-                    if consecutive_turns >= 3 and back > SAFE_STOP_DIST_MM:
-                        action = "backward"
-                        self._emit_log(f"Corner detected (turns={consecutive_turns}): backing up...")
-                        wheels_svc.move("backward")
-                        time.sleep(0.25)
-                        wheels_svc.stop()
-                        time.sleep(0.05)
-                        consecutive_turns = 0
-
-                    # Prefer strafing sideways if space allows (mecanum omni advantage!)
-                    if left > 280 and left >= right:
-                        action = "strafeLeft"
-                        wheels_svc.move("strafeLeft")
-                        time.sleep(0.25)
-                    elif right > 280:
-                        action = "strafeRight"
-                        wheels_svc.move("strafeRight")
-                        time.sleep(0.25)
-                    elif left > right:
-                        action = "rotateLeft"
-                        last_turn_dir = "rotateLeft"
-                        wheels_svc.move("rotateLeft")
-                        time.sleep(0.18)
-                    else:
-                        action = "rotateRight"
-                        last_turn_dir = "rotateRight"
-                        wheels_svc.move("rotateRight")
-                        time.sleep(0.18)
-
-                # Brief settling pause between pulses for crisp LiDAR scan integration
                 wheels_svc.stop()
-                time.sleep(0.08)
+                time.sleep(0.06)
 
-                # Log decision
+                # --- 3. SLAM-Based Stall & Slip Detection ---
+                now = time.time()
+                if now - last_stall_check_time >= 0.9:
+                    curr_pose = mapping_svc.pose
+                    dist_moved = math.hypot(curr_pose.x_m - last_tracked_x, curr_pose.y_m - last_tracked_y)
+                    th_moved = abs(curr_pose.theta_deg - last_tracked_th)
+
+                    if dist_moved < 0.02 and th_moved < 4.0:
+                        # STALL DETECTED: Motors commanding motion but SLAM pose stationary
+                        logger.warning("🤖 [AutoNav] Stall detected! Executing Recovery Behavior (BackUp & Spin)...")
+                        self._emit_log("⚠️ Obstacle stall detected: executing recovery back-off...")
+                        wheels_svc.move("backward")
+                        time.sleep(0.30)
+                        wheels_svc.move("rotateRight" if target_vx >= 0 else "rotateLeft")
+                        time.sleep(0.35)
+                        wheels_svc.stop()
+                        time.sleep(0.08)
+
+                    last_tracked_x = curr_pose.x_m
+                    last_tracked_y = curr_pose.y_m
+                    last_tracked_th = curr_pose.theta_deg
+                    last_stall_check_time = now
+
+                # --- 4. Auto-Completion Check (Frontier Exploration) ---
+                curr_explored = int(np.count_nonzero(mapping_svc._grid != -1))
+                if curr_explored != last_explored_cells:
+                    last_explored_cells = curr_explored
+                    last_cell_change_time = now
+                elif now - last_cell_change_time > 60.0 and curr_explored > 500:
+                    # No new cells discovered for 60 seconds across a mapped room -> Complete!
+                    self._emit_log(f"🎉 Floorplan exploration complete! Mapped {curr_explored} cells.")
+                    logger.info("Exploration complete — auto stopping.")
+                    break
+
                 logger.info(
-                    "🤖 [AutoNav] F: %d mm, L: %d mm, R: %d mm, B: %d mm -> Action: %s (turns=%d)",
-                    front, left, right, back, action, consecutive_turns
+                    "🤖 [AutoNav-PF] Force=(vx=%.2f, vy=%.2f) MinObs=%.2fm -> Action: %s",
+                    target_vx, target_vy, min_obstacle_dist, action
                 )
 
             except Exception as e:
-                logger.error("Error in autonomous navigation loop: %s", e)
+                logger.error("Error in potential field exploration loop: %s", e)
                 time.sleep(0.2)
 
         try:
@@ -294,6 +331,7 @@ class CubeyNavService:
             wheels_svc.set_speed(180)  # restore teleop speed
         except Exception:
             pass
+
 
     def _waypoint_navigation_loop(self, goal: NavGoal):
         """
