@@ -103,6 +103,7 @@ local_costmap:
       global_frame: odom
       robot_base_frame: base_link
       use_sim_time: false
+      transform_tolerance: 0.5
       rolling_window: true
       width: 3
       height: 3
@@ -135,6 +136,7 @@ global_costmap:
       global_frame: map
       robot_base_frame: base_link
       use_sim_time: false
+      transform_tolerance: 0.5
       robot_radius: 0.14
       resolution: 0.05
       track_unknown_space: true
@@ -159,6 +161,7 @@ global_costmap:
         cost_scaling_factor: 3.0
         inflation_radius: 0.30
       always_send_full_costmap: True
+
 
 planner_server:
   ros__parameters:
