@@ -1,11 +1,9 @@
 import os
 from pathlib import Path
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, GroupAction, IncludeLaunchDescription, SetEnvironmentVariable
-from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
-from launch_ros.actions import Node, LifecycleNode
-from launch_ros.substitutions import FindPackageShare
+from launch.actions import DeclareLaunchArgument, SetEnvironmentVariable
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node
 
 
 def generate_launch_description():
@@ -17,10 +15,10 @@ def generate_launch_description():
     slam_params_file = str(config_dir / "slam_toolbox_params.yaml")
     nav2_params_file = str(config_dir / "nav2_params.yaml")
     cmd_bridge_script = str(nodes_dir / "cmd_vel_serial_bridge.py")
+    odom_script = str(nodes_dir / "cubey_odometry_node.py")
 
     # Launch Configurations
     use_sim_time = LaunchConfiguration("use_sim_time", default="false")
-    autostart = LaunchConfiguration("autostart", default="true")
     lidar_port = LaunchConfiguration("lidar_port", default="/dev/ttyUSB0")
     lidar_baud = LaunchConfiguration("lidar_baud", default="460800")
     serial_port = LaunchConfiguration("serial_port", default="/dev/ttyAMA0")
@@ -78,21 +76,18 @@ def generate_launch_description():
         ),
 
         # -----------------------------------------------------------------
-        # 3. 2D Laser Odometry (rf2o) - Provides /odom & odom->base_link TF
+        # 3. 2D Laser & Command Odometry (Cubey Odometry Node)
+        # Publishes /odom & (odom -> base_footprint TF)
         # -----------------------------------------------------------------
         Node(
-            package="rf2o_laser_odometry",
-            executable="rf2o_laser_odometry_node",
-            name="rf2o_laser_odometry",
+            executable="python3",
+            arguments=[odom_script],
+            name="cubey_odometry_node",
             parameters=[{
-                "laser_scan_topic": "/scan",
-                "odom_topic": "/odom",
+                "odom_frame": "odom",
+                "base_frame": "base_footprint",
                 "publish_tf": True,
-                "base_frame_id": "base_link",
-                "odom_frame_id": "odom",
-                "init_pose_from_topic": "",
-                "freq": 10.0,
-                "verbose": False,
+                "freq": 15.0,
             }],
             output="screen",
         ),

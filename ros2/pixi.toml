@@ -1,4 +1,4 @@
-[project]
+[workspace]
 name = "cubey-ros2-native"
 version = "0.1.0"
 description = "Native ROS 2 Jazzy + Nav2 Environment for Cubey Robot (Raspberry Pi 5)"
@@ -14,7 +14,6 @@ ros-jazzy-navigation2 = "*"
 ros-jazzy-nav2-bringup = "*"
 ros-jazzy-slam-toolbox = "*"
 ros-jazzy-rplidar-ros = "*"
-ros-jazzy-rf2o-laser-odometry = "*"
 ros-jazzy-tf2-ros = "*"
 ros-jazzy-robot-state-publisher = "*"
 ros-jazzy-rosbridge-server = "*"
@@ -27,5 +26,4 @@ launch = "ros2 launch launch/cubey_bringup.launch.py"
 
 # Individual testing tasks
 test-lidar = "ros2 run rplidar_ros rplidar_node --ros-args -p serial_port:=/dev/ttyUSB0 -p serial_baudrate:=460800 -p frame_id:=laser"
-test-odom = "ros2 run rf2o_laser_odometry rf2o_laser_odometry_node --ros-args -p laser_scan_topic:=/scan -p odom_topic:=/odom -p base_frame_id:=base_link -p odom_frame_id:=odom -p freq:=10.0"
 test-bridge = "python nodes/cmd_vel_serial_bridge.py"
