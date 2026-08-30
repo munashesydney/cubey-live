@@ -26,11 +26,13 @@ def generate_launch_description():
     serial_port = LaunchConfiguration("serial_port", default="/dev/ttyAMA0")
 
     lifecycle_nodes = [
+        "slam_toolbox",
         "controller_server",
         "planner_server",
         "behavior_server",
         "bt_navigator",
     ]
+
 
     return LaunchDescription([
         # Set unbuffered output
