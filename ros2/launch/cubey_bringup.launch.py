@@ -1,4 +1,5 @@
 import os
+import sys
 from pathlib import Path
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, SetEnvironmentVariable
@@ -39,15 +40,6 @@ def generate_launch_description():
         # -----------------------------------------------------------------
         # 1. Coordinate Transforms (TF)
         # -----------------------------------------------------------------
-        # base_footprint -> base_link
-        Node(
-            package="tf2_ros",
-            executable="static_transform_publisher",
-            name="base_footprint_to_base_link",
-            arguments=["--x", "0.0", "--y", "0.0", "--z", "0.0", "--yaw", "0.0", "--pitch", "0.0", "--roll", "0.0", "--frame-id", "base_footprint", "--child-frame-id", "base_link"],
-            output="screen",
-        ),
-
         # base_link -> laser
         # LiDAR position: Centered left/right (Y=0.0), shifted 35mm rearward (X=-0.035m), Z=0.10m
         Node(
@@ -62,7 +54,7 @@ def generate_launch_description():
         # 2. RPLIDAR C1 Sensor Driver (/dev/ttyUSB0 @ 460800)
         # -----------------------------------------------------------------
         Node(
-            executable="python3",
+            executable=sys.executable,
             arguments=["-u", rplidar_script],
             name="rplidar_c1_node",
             parameters=[{
@@ -80,7 +72,7 @@ def generate_launch_description():
         # Publishes /odom & (odom -> base_link TF)
         # -----------------------------------------------------------------
         Node(
-            executable="python3",
+            executable=sys.executable,
             arguments=["-u", odom_script],
             name="cubey_odometry_node",
             parameters=[{
@@ -151,7 +143,7 @@ def generate_launch_description():
         # 6. ESP32 Serial cmd_vel Bridge (/dev/ttyAMA0)
         # -----------------------------------------------------------------
         Node(
-            executable="python3",
+            executable=sys.executable,
             arguments=["-u", cmd_bridge_script],
             name="cubey_cmd_vel_bridge",
             parameters=[{
@@ -162,3 +154,4 @@ def generate_launch_description():
         ),
 
     ])
+
