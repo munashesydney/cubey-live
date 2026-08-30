@@ -528,3 +528,96 @@ body, html {
     display: none;
   }
 }
+
+/* --------------------------------------------------------------------------
+   Mapping Mode Selector Modal Cards
+   -------------------------------------------------------------------------- */
+.modal-subtitle {
+  color: var(--subtext);
+  font-size: 13px;
+  margin-top: -6px;
+  margin-bottom: 8px;
+}
+
+.mode-cards-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+@media (max-width: 600px) {
+  .mode-cards-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.mode-card {
+  position: relative;
+  background: rgba(24, 24, 37, 0.6);
+  border: 1px solid var(--surface0);
+  border-radius: 12px;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  transition: all 0.25s ease;
+}
+
+.mode-card:hover {
+  transform: translateY(-3px);
+  border-color: var(--blue);
+  box-shadow: 0 8px 24px rgba(137, 180, 250, 0.15);
+}
+
+.auto-card {
+  border-color: rgba(137, 180, 250, 0.35);
+  background: radial-gradient(circle at top, rgba(137, 180, 250, 0.08) 0%, rgba(24, 24, 37, 0.7) 100%);
+}
+
+.auto-card:hover {
+  border-color: var(--blue);
+  box-shadow: 0 8px 28px rgba(137, 180, 250, 0.25);
+}
+
+.card-badge {
+  position: absolute;
+  top: -10px;
+  right: 14px;
+  background: linear-gradient(135deg, var(--green) 0%, var(--teal) 100%);
+  color: #11111B;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 10px;
+  box-shadow: 0 2px 8px rgba(166, 227, 161, 0.4);
+}
+
+.mode-icon {
+  font-size: 38px;
+  margin-bottom: 10px;
+}
+
+.mode-title {
+  font-weight: 700;
+  font-size: 16px;
+  color: var(--text);
+  margin-bottom: 8px;
+}
+
+.mode-desc {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--subtext);
+  margin-bottom: 18px;
+  flex-grow: 1;
+}
+
+.mode-desc strong {
+  color: var(--blue);
+}
+
+.btn-block {
+  width: 100%;
+  justify-content: center;
+}
