@@ -63,7 +63,7 @@ def generate_launch_description():
         # -----------------------------------------------------------------
         Node(
             executable="python3",
-            arguments=[rplidar_script],
+            arguments=["-u", rplidar_script],
             name="rplidar_c1_node",
             parameters=[{
                 "serial_port": lidar_port,
@@ -81,7 +81,7 @@ def generate_launch_description():
         # -----------------------------------------------------------------
         Node(
             executable="python3",
-            arguments=[odom_script],
+            arguments=["-u", odom_script],
             name="cubey_odometry_node",
             parameters=[{
                 "odom_frame": "odom",
@@ -91,7 +91,6 @@ def generate_launch_description():
             }],
             output="screen",
         ),
-
 
         # -----------------------------------------------------------------
         # 4. SLAM Toolbox (2D Occupancy Grid Mapping & Loop Closure)
@@ -153,7 +152,7 @@ def generate_launch_description():
         # -----------------------------------------------------------------
         Node(
             executable="python3",
-            arguments=[cmd_bridge_script],
+            arguments=["-u", cmd_bridge_script],
             name="cubey_cmd_vel_bridge",
             parameters=[{
                 "serial_port": serial_port,
@@ -161,4 +160,5 @@ def generate_launch_description():
             }],
             output="screen",
         ),
+
     ])
