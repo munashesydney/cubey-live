@@ -14,9 +14,12 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import numpy as np
+
 from src.services.lidar_service import get_lidar_service
 from src.services.wheels_service import get_wheels_service
 from src.services.mapping_service import get_mapping_service
+
 
 logger = logging.getLogger(__name__)
 
