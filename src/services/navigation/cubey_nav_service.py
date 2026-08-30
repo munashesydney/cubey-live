@@ -292,19 +292,43 @@ class CubeyNavService:
 
                     if dist_moved < 0.02 and th_moved < 4.0:
                         # STALL DETECTED: Motors commanding motion but SLAM pose stationary
-                        logger.warning("🤖 [AutoNav] Stall detected! Executing Recovery Behavior (BackUp & Spin)...")
-                        self._emit_log("⚠️ Obstacle stall detected: executing recovery back-off...")
-                        wheels_svc.move("backward")
-                        time.sleep(0.30)
-                        wheels_svc.move("rotateRight" if target_vx >= 0 else "rotateLeft")
-                        time.sleep(0.35)
-                        wheels_svc.stop()
-                        time.sleep(0.08)
+                        logger.warning("🤖 [AutoNav] Stall detected! Executing Committed 3-Phase Escape Sequence...")
+                        self._emit_log("⚠️ Obstacle stall: executing 3-phase escape maneuver...")
 
-                    last_tracked_x = curr_pose.x_m
-                    last_tracked_y = curr_pose.y_m
-                    last_tracked_th = curr_pose.theta_deg
-                    last_stall_check_time = now
+                        # Phase 1: Full reverse back (20-25 cm)
+                        wheels_svc.stop()
+                        time.sleep(0.05)
+                        wheels_svc.move("backward")
+                        time.sleep(0.42)
+                        wheels_svc.stop()
+                        time.sleep(0.06)
+
+                        # Phase 2: Rotate 90°-120° away from the obstruction
+                        escape_turn = "rotateRight" if target_vx >= 0 else "rotateLeft"
+                        wheels_svc.move(escape_turn)
+                        time.sleep(0.45)
+                        wheels_svc.stop()
+                        time.sleep(0.06)
+
+                        # Phase 3: Drive forward into clear open space to exit furniture zone
+                        wheels_svc.move("forward")
+                        time.sleep(0.70)
+                        wheels_svc.stop()
+                        time.sleep(0.06)
+
+                        # Re-sync tracking pose after escape
+                        new_pose = mapping_svc.pose
+                        last_tracked_x = new_pose.x_m
+                        last_tracked_y = new_pose.y_m
+                        last_tracked_th = new_pose.theta_deg
+                        last_stall_check_time = time.time()
+                        continue
+                    else:
+                        last_tracked_x = curr_pose.x_m
+                        last_tracked_y = curr_pose.y_m
+                        last_tracked_th = curr_pose.theta_deg
+                        last_stall_check_time = now
+
 
                 # --- 4. Auto-Completion Check (Frontier Exploration) ---
                 curr_explored = int(np.count_nonzero(mapping_svc._grid != -1))
