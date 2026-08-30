@@ -143,38 +143,26 @@ print("Local LLM model ready.")
 PY
 
 # ---------------------------------------------------------------------------
-# Pre-download Wake Word model (Sherpa-ONNX Zipformer KWS ~15MB)
+# Validate bundled custom openWakeWord model assets
 # ---------------------------------------------------------------------------
-echo "==> Pre-downloading open-vocabulary Wake Word model (Sherpa-ONNX)..."
+echo "==> Validating bundled Cubey openWakeWord model..."
 "${VENV}/bin/python" - "${PROJECT_ROOT}" <<'PY'
 import sys
-import os
-import tarfile
-import urllib.request
 from pathlib import Path
 
 project_root = Path(sys.argv[1])
-kws_dir = project_root / "data" / "models" / "sherpa-onnx-kws"
-kws_dir.mkdir(parents=True, exist_ok=True)
+from openwakeword.model import Model  # noqa: F401
 
-model_name = "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01"
-url = f"https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/{model_name}.tar.bz2"
-tar_dest = kws_dir / f"{model_name}.tar.bz2"
-
-has_onnx = any(kws_dir.glob("*.onnx")) or any(kws_dir.glob("*/*.onnx"))
-if not has_onnx:
-    print(f"Downloading {model_name} from {url}...")
-    urllib.request.urlretrieve(url, tar_dest)
-    print(f"Extracting {model_name}...")
-    with tarfile.open(tar_dest, "r:bz2") as tar:
-        tar.extractall(path=kws_dir)
-    try:
-        tar_dest.unlink()
-    except Exception:
-        pass
-    print("Wake word model ready.")
-else:
-    print("Wake word model already present.")
+asset_dir = project_root / "src" / "assets" / "wakeword"
+required = (
+    asset_dir / "cubey_multigreeting_v1.onnx",
+    asset_dir / "melspectrogram.onnx",
+    asset_dir / "embedding_model.onnx",
+)
+missing = [str(path) for path in required if not path.is_file()]
+if missing:
+    raise SystemExit("Missing bundled wake-word asset(s): " + ", ".join(missing))
+print("Cubey openWakeWord runtime and model assets are ready.")
 PY
 
 # ---------------------------------------------------------------------------

@@ -182,7 +182,7 @@ class ApplicationController:
 
     def _run_startup_diagnostics_and_prewarm(self) -> None:
         """
-        Background routine that initializes hardware and pre-warms AI models (FastEmbed, Sherpa-ONNX),
+        Background routine that initializes hardware and pre-warms AI models (FastEmbed, openWakeWord),
         dispatching real-time progress updates to the StartupPage.
         """
         try:
@@ -277,27 +277,25 @@ class ApplicationController:
             if self.gui:
                 self.gui.post_startup_progress(0.25, "✓ Audio pipeline & AEC calibrated.", 0)
 
-            # --- Step 2: Neural Wake-Word Engine (45%) ---
+            # --- Step 2: Custom Wake-Word Engine (45%) ---
             if self.gui:
-                self.gui.post_startup_progress(0.35, "🎙️ Initializing Sherpa-ONNX neural wake-word engine...", 1)
+                self.gui.post_startup_progress(0.35, "🎙️ Loading Cubey wake-word model...", 1)
 
             if self.config.enable_wake_word:
-                logger.info("Initializing offline open-vocabulary Wake Word Service (Sherpa-ONNX)...")
+                logger.info("Initializing custom openWakeWord service...")
                 self.wake_word_service = WakeWordService(
-                    model_dir=self.config.wake_word_model_dir,
-                    wake_words=self.config.wake_words,
+                    model_path=self.config.wake_word_model_path,
                     threshold=self.config.wake_word_threshold,
-                    score=self.config.wake_word_score,
-                    gain=self.config.wake_word_gain,
-                    num_threads=self.config.wake_word_threads,
                     on_wake_word=self._on_wake_word_detected,
                 )
-                self.wake_word_service.start()
-                if not self.recorder.is_recording and self.async_loop:
+                wake_word_started = self.wake_word_service.start()
+                if wake_word_started and not self.recorder.is_recording and self.async_loop:
                     self.recorder.start(self.async_loop)
+                if not wake_word_started:
+                    self.wake_word_service = None
 
             if self.gui:
-                self.gui.post_startup_progress(0.50, "✓ Neural wake-word spotter active.", 1)
+                self.gui.post_startup_progress(0.50, "✓ Cubey wake-word model ready.", 1)
 
             # --- Step 3: Semantic Vector Memory (70%) ---
             if self.gui:
@@ -443,7 +441,7 @@ class ApplicationController:
 
     def _on_wake_word_detected(self, keyword: str) -> None:
         """
-        Callback from Sherpa-ONNX when a wake-up phrase is recognized.
+        Callback from openWakeWord when a wake-up phrase is recognized.
         Triggers listening eye animation, HUD indicator, and auto-starts Gemini Live with wake-up interrupt.
         """
         logger.info("🎯 Wake word recognized: '%s'! Waking up and starting Gemini Live...", keyword)

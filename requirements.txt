@@ -23,9 +23,8 @@ pyserial>=3.5
 # Neural Noise Suppression (RNNoise)
 pyrnnoise>=0.1.0
 
-# Open-vocabulary Wake Word / Keyword Spotting (Next-gen Kaldi / Sherpa-ONNX)
-sherpa-onnx>=1.10.0
-sentencepiece>=0.1.99
+# Custom offline wake-word inference
+openwakeword==0.6.0
 
 # Web Server & Real-Time Map Remote Control
 fastapi>=0.110.0
