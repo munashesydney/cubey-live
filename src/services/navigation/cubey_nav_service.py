@@ -191,7 +191,7 @@ class CubeyNavService:
     def _autonomous_exploration_loop(self):
         """
         Autonomous wandering loop combining LiDAR proximity telemetry and
-        smooth mecanum drive maneuvers to map the environment without bumping.
+        gentle mecanum drive maneuvers to map the environment without bumping.
         """
         wheels_svc = get_wheels_service()
         lidar_svc = get_lidar_service()
@@ -199,8 +199,18 @@ class CubeyNavService:
         if not wheels_svc.is_connected:
             wheels_svc.connect()
 
-        OBSTACLE_THRESHOLD_MM = 380  # Stop & turn threshold
-        CLEAR_THRESHOLD_MM = 550     # Clear forward path threshold
+        # Set low, gentle speed for smooth mapping & low wheel slippage
+        AUTONOMOUS_SPEED = 110
+        wheels_svc.set_speed(AUTONOMOUS_SPEED)
+
+        SAFE_STOP_DIST_MM = 220   # Stop threshold (22 cm)
+        SLOW_WARN_DIST_MM = 340   # Approaching obstacle threshold (34 cm)
+
+        consecutive_turns = 0
+        last_turn_dir = "rotateRight"
+
+        self._emit_log(f"🤖 Autonomous Exploration active at speed {AUTONOMOUS_SPEED}.")
+        logger.info("Autonomous Exploration loop started at speed %d", AUTONOMOUS_SPEED)
 
         while self._is_exploring:
             try:
@@ -210,45 +220,70 @@ class CubeyNavService:
                 right = scan.min_right_dist_mm if scan.min_right_dist_mm > 0 else 9999
                 back = scan.min_back_dist_mm if scan.min_back_dist_mm > 0 else 9999
 
-                # Check if path in front is clear
-                if front > CLEAR_THRESHOLD_MM:
-                    # Move forward smoothly
+                action = "forward"
+
+                # 1. Clear forward path
+                if front > SLOW_WARN_DIST_MM:
+                    action = "forward"
+                    consecutive_turns = 0
                     wheels_svc.move("forward")
-                    time.sleep(0.35)
-                elif front > OBSTACLE_THRESHOLD_MM:
-                    # Approaching obstacle — nudge slightly toward clearest side
+                    time.sleep(0.24)
+
+                # 2. Approaching obstacle — nudge slightly toward clearest side
+                elif front > SAFE_STOP_DIST_MM:
                     if left > right:
-                        wheels_svc.move("forwardLeft")
+                        action = "forwardLeft"
                     else:
-                        wheels_svc.move("forwardRight")
-                    time.sleep(0.30)
+                        action = "forwardRight"
+                    consecutive_turns = 0
+                    wheels_svc.move(action)
+                    time.sleep(0.20)
+
+                # 3. Obstacle detected in front! Stop and evade intelligently
                 else:
-                    # Obstacle detected in front! Stop and evade
                     wheels_svc.stop()
-                    time.sleep(0.10)
+                    time.sleep(0.08)
+                    consecutive_turns += 1
 
-                    # Turn or strafe toward the side with more open space
-                    if left > right and left > OBSTACLE_THRESHOLD_MM:
-                        self._emit_log("Obstacle ahead: rotating left to explore open space...")
-                        wheels_svc.move("rotateLeft")
-                        time.sleep(0.40)
-                    elif right > OBSTACLE_THRESHOLD_MM:
-                        self._emit_log("Obstacle ahead: rotating right to explore open space...")
-                        wheels_svc.move("rotateRight")
-                        time.sleep(0.40)
-                    elif back > OBSTACLE_THRESHOLD_MM:
-                        self._emit_log("Corner/dead-end detected: reversing out...")
+                    # If stuck in a corner / dead-end, back up first
+                    if consecutive_turns >= 3 and back > SAFE_STOP_DIST_MM:
+                        action = "backward"
+                        self._emit_log(f"Corner detected (turns={consecutive_turns}): backing up...")
                         wheels_svc.move("backward")
-                        time.sleep(0.35)
-                        wheels_svc.move("rotateRight")
-                        time.sleep(0.45)
-                    else:
-                        # Full 180 spin if trapped in a tight space
-                        wheels_svc.move("rotateRight")
-                        time.sleep(0.60)
+                        time.sleep(0.25)
+                        wheels_svc.stop()
+                        time.sleep(0.05)
+                        consecutive_turns = 0
 
-                    wheels_svc.stop()
-                    time.sleep(0.10)
+                    # Prefer strafing sideways if space allows (mecanum omni advantage!)
+                    if left > 280 and left >= right:
+                        action = "strafeLeft"
+                        wheels_svc.move("strafeLeft")
+                        time.sleep(0.25)
+                    elif right > 280:
+                        action = "strafeRight"
+                        wheels_svc.move("strafeRight")
+                        time.sleep(0.25)
+                    elif left > right:
+                        action = "rotateLeft"
+                        last_turn_dir = "rotateLeft"
+                        wheels_svc.move("rotateLeft")
+                        time.sleep(0.18)
+                    else:
+                        action = "rotateRight"
+                        last_turn_dir = "rotateRight"
+                        wheels_svc.move("rotateRight")
+                        time.sleep(0.18)
+
+                # Brief settling pause between pulses for crisp LiDAR scan integration
+                wheels_svc.stop()
+                time.sleep(0.08)
+
+                # Log decision
+                logger.info(
+                    "🤖 [AutoNav] F: %d mm, L: %d mm, R: %d mm, B: %d mm -> Action: %s (turns=%d)",
+                    front, left, right, back, action, consecutive_turns
+                )
 
             except Exception as e:
                 logger.error("Error in autonomous navigation loop: %s", e)
@@ -256,6 +291,7 @@ class CubeyNavService:
 
         try:
             wheels_svc.stop()
+            wheels_svc.set_speed(180)  # restore teleop speed
         except Exception:
             pass
 
@@ -270,8 +306,11 @@ class CubeyNavService:
         if not wheels_svc.is_connected:
             wheels_svc.connect()
 
+        WAYPOINT_SPEED = 115
+        wheels_svc.set_speed(WAYPOINT_SPEED)
+
         GOAL_TOLERANCE_M = 0.20
-        OBSTACLE_AVOID_MM = 350
+        OBSTACLE_AVOID_MM = 220
 
         while self._is_navigating_goal:
             try:
@@ -310,12 +349,13 @@ class CubeyNavService:
                     # Temporary avoidance nudge
                     self._emit_log("Waypoint path blocked by obstacle: evading...")
                     wheels_svc.stop()
-                    time.sleep(0.1)
+                    time.sleep(0.08)
                     if scan.min_left_dist_mm > scan.min_right_dist_mm:
                         wheels_svc.move("strafeLeft")
                     else:
                         wheels_svc.move("strafeRight")
-                    time.sleep(0.35)
+                    time.sleep(0.22)
+                    wheels_svc.stop()
                     continue
 
                 # Align heading or drive forward
@@ -324,13 +364,13 @@ class CubeyNavService:
                         wheels_svc.move("rotateRight")
                     else:
                         wheels_svc.move("rotateLeft")
-                    time.sleep(0.20)
+                    time.sleep(0.16)
                 else:
                     wheels_svc.move("forward")
-                    time.sleep(0.30)
+                    time.sleep(0.22)
 
                 wheels_svc.stop()
-                time.sleep(0.05)
+                time.sleep(0.06)
 
             except Exception as e:
                 logger.error("Error in waypoint navigation loop: %s", e)
@@ -338,8 +378,10 @@ class CubeyNavService:
 
         try:
             wheels_svc.stop()
+            wheels_svc.set_speed(180)
         except Exception:
             pass
+
 
 
     def _emit_telemetry(self) -> None:
