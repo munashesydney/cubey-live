@@ -170,7 +170,7 @@ planner_server:
     planner_plugins: ["GridBased"]
     GridBased:
       plugin: "nav2_navfn_planner::NavfnPlanner"
-      tolerance: 0.10
+      tolerance: 0.45
       use_astar: true
       allow_unknown: true
 
