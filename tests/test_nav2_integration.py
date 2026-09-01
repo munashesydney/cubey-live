@@ -1,5 +1,7 @@
+import re
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -14,6 +16,13 @@ from src.services.navigation.cubey_nav_service import CubeyNavService
 
 
 class Nav2IntegrationTests(unittest.TestCase):
+    def test_dwb_angular_samples_include_zero_velocity(self):
+        params = Path("ros2/config/nav2_params.yaml").read_text(encoding="utf-8")
+        match = re.search(r"^\s*vtheta_samples:\s*(\d+)\s*$", params, re.MULTILINE)
+
+        self.assertIsNotNone(match)
+        self.assertEqual(int(match.group(1)) % 2, 1)
+
     def test_motor_floor_scales_weak_nav2_vector_without_changing_direction(self):
         self.assertEqual(
             apply_minimum_effective_command(100, -50, 25, 390),
