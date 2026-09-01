@@ -412,14 +412,24 @@ class CubeyFrontierExplorerNode(Node):
             # Pick highest-utility frontier
             best_x, best_y, best_size = frontiers[0]
             robot_x, robot_y = self.robot_pose[:2] if self.robot_pose else (0.0, 0.0)
+
+            # Pull goal 20cm back toward robot into confirmed free space
+            dist_to_robot = math.hypot(best_x - robot_x, best_y - robot_y)
+            if dist_to_robot > 0.35:
+                pull_back = min(0.20, dist_to_robot * 0.35)
+                nav_target_x = best_x - ((best_x - robot_x) / dist_to_robot) * pull_back
+                nav_target_y = best_y - ((best_y - robot_y) / dist_to_robot) * pull_back
+            else:
+                nav_target_x, nav_target_y = best_x, best_y
+
             # Orient robot heading toward the frontier centroid
             target_yaw = math.atan2(best_y - robot_y, best_x - robot_x)
 
             self.get_logger().info(
-                f"🤖 [AutoNav] Dispatching Nav2 Goal -> ({best_x:.2f}m, {best_y:.2f}m, "
-                f"Cluster: {best_size} cells). Remaining frontiers: {len(frontiers)}"
+                f"🤖 [AutoNav] Dispatching Nav2 Goal -> ({nav_target_x:.2f}m, {nav_target_y:.2f}m, "
+                f"Frontier: [{best_x:.2f}, {best_y:.2f}], Cluster: {best_size} cells). Remaining frontiers: {len(frontiers)}"
             )
-            self._send_nav2_goal(best_x, best_y, target_yaw)
+            self._send_nav2_goal(nav_target_x, nav_target_y, target_yaw)
 
     # ------------------------------------------------------------------
     # 4-Phase Auto-Stop Execution
