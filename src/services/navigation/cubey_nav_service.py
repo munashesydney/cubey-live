@@ -176,8 +176,9 @@ class CubeyNavService:
                         last_state = st
                         self._emit_log(f"🤖 [Nav2] Exploration State: {st}")
 
+                    completed = st in ("COMPLETED", "COMPLETED_AWAY_FROM_DOCK")
                     with self._lock:
-                        self.telemetry.state = st if st != "COMPLETED" else "IDLE"
+                        self.telemetry.state = "IDLE" if completed else st
                         self.telemetry.distance_remaining_m = float(data.get("distance_remaining_m", 0.0))
                         gx = data.get("goal_x")
                         gy = data.get("goal_y")
@@ -186,8 +187,15 @@ class CubeyNavService:
 
                     self._emit_telemetry()
 
-                    if st == "COMPLETED":
-                        self._emit_log("🎉 Nav2 room exploration, return-to-dock, and map save complete!")
+                    if completed:
+                        if st == "COMPLETED":
+                            self._emit_log(
+                                "🎉 Nav2 room exploration, return-to-dock, and map save complete!"
+                            )
+                        else:
+                            self._emit_log(
+                                "⚠️ Nav2 saved the map and stopped safely, but could not return to dock."
+                            )
                         mapping_svc.pause_mapping()
                         with self._lock:
                             self._is_exploring = False

@@ -82,8 +82,10 @@ class CubeyFrontierExplorerNode(Node):
         self.map_save_dir = str(self.get_parameter("map_save_dir").value)
 
         # State tracking
-        # States: IDLE, EXPLORING, RETURNING_TO_DOCK, FINALIZING_MAP, COMPLETED
+        # States: IDLE, EXPLORING, RETURNING_TO_DOCK, FINALIZING_MAP,
+        # COMPLETED, COMPLETED_AWAY_FROM_DOCK
         self.state = "IDLE"
+        self.finalization_at_dock: bool = False
         self.exploration_start_time: float = 0.0
         self.robot_pose: Optional[Tuple[float, float, float]] = None  # map-frame x, y, theta_rad
         self.odom_pose: Optional[Tuple[float, float, float]] = None
@@ -263,6 +265,7 @@ class CubeyFrontierExplorerNode(Node):
         self.blacklist.clear()
         self.zero_frontier_cycles = 0
         self.total_frontiers_mapped = 0
+        self.finalization_at_dock = False
 
         try:
             os.remove("/tmp/cubey_nav2_live_map.json")
@@ -778,7 +781,7 @@ class CubeyFrontierExplorerNode(Node):
                 if self.current_frontier_coord:
                     self._blacklist_coord(self.current_frontier_coord)
             elif self.state == "RETURNING_TO_DOCK":
-                self._initiate_map_finalization()
+                self._initiate_map_finalization(at_dock=True)
             elif self.state == "NAVIGATING":
                 self.state = "REACHED"
             else:
@@ -924,13 +927,19 @@ class CubeyFrontierExplorerNode(Node):
         self.get_logger().info(f"Navigating back to dock origin: ({dock_x:.2f}m, {dock_y:.2f}m)...")
         self._send_nav2_goal(dock_x, dock_y, dock_yaw)
 
-    def _initiate_map_finalization(self):
+    def _initiate_map_finalization(self, at_dock: bool = False):
         """Phase 3 & 4: Pause SLAM scan matching, trigger loop closure, and save map."""
-        if self.state in ("FINALIZING_MAP", "COMPLETED"):
+        if self.state in ("FINALIZING_MAP", "COMPLETED", "COMPLETED_AWAY_FROM_DOCK"):
             return
+        self.finalization_at_dock = at_dock
         self.state = "FINALIZING_MAP"
         self.get_logger().info("=========================================================")
-        self.get_logger().info("🏁 Robot arrived safely at dock. Finalizing SLAM map...")
+        if at_dock:
+            self.get_logger().info("🏁 Robot arrived safely at dock. Finalizing SLAM map...")
+        else:
+            self.get_logger().warn(
+                "Robot could not reach the dock. Finalizing the map at its current safe position."
+            )
         self.get_logger().info("=========================================================")
 
         os.makedirs(self.map_save_dir, exist_ok=True)
@@ -969,10 +978,14 @@ class CubeyFrontierExplorerNode(Node):
         self._complete_mapping()
 
     def _complete_mapping(self):
-
-        self.state = "COMPLETED"
+        self.state = "COMPLETED" if self.finalization_at_dock else "COMPLETED_AWAY_FROM_DOCK"
         self.get_logger().info("=========================================================")
-        self.get_logger().info("✅ ROOM MAPPING & AUTO-STOP MISSION FULLY COMPLETE!")
+        if self.finalization_at_dock:
+            self.get_logger().info("✅ ROOM MAPPING, RETURN-TO-DOCK & AUTO-STOP FULLY COMPLETE!")
+        else:
+            self.get_logger().warn(
+                "⚠️ ROOM MAPPING SAVED & ROBOT STOPPED AWAY FROM DOCK."
+            )
         self.get_logger().info("=========================================================")
 
     # ------------------------------------------------------------------

@@ -25,6 +25,12 @@ class Nav2IntegrationTests(unittest.TestCase):
         )
         self.assertIn("desired_linear_vel: 0.12", params)
 
+    def test_slam_processes_scans_at_pi_safe_rate(self):
+        params = Path("ros2/config/slam_toolbox_params.yaml").read_text(encoding="utf-8")
+
+        self.assertIn("throttle_scans: 2", params)
+        self.assertIn("minimum_time_interval: 0.18", params)
+
     def test_motor_floor_scales_weak_nav2_vector_without_changing_direction(self):
         self.assertEqual(
             apply_minimum_effective_command(100, -50, 25, 390),
@@ -160,7 +166,7 @@ class Nav2IntegrationTests(unittest.TestCase):
             dtype=np.float32,
         )
 
-        dx, dy, _ = node._correlate_scans(
+        dx, dy, dyaw = node._correlate_scans(
             points,
             points,
             0.20,
@@ -171,6 +177,64 @@ class Nav2IntegrationTests(unittest.TestCase):
 
         self.assertEqual(dx, 0.0)
         self.assertEqual(dy, 0.0)
+        self.assertEqual(dyaw, 0.0)
+
+    def test_scan_match_accepts_rotation_only_when_lidar_confirms_it(self):
+        node = object.__new__(CubeyOdometryNode)
+        previous = np.array(
+            [[1.0, 0.0], [0.35, 1.15], [-0.9, 0.25], [-0.2, -1.1], [1.4, 0.7]],
+            dtype=np.float32,
+        )
+        angle = 0.08
+        cosine = np.cos(angle)
+        sine = np.sin(angle)
+        current = np.column_stack(
+            (
+                previous[:, 0] * cosine + previous[:, 1] * sine,
+                -previous[:, 0] * sine + previous[:, 1] * cosine,
+            )
+        )
+
+        dx, dy, dyaw = node._correlate_scans(
+            previous,
+            current,
+            0.0,
+            0.0,
+            angle,
+            lock_translation=True,
+        )
+
+        self.assertEqual(dx, 0.0)
+        self.assertEqual(dy, 0.0)
+        self.assertAlmostEqual(dyaw, angle, places=5)
+
+    def test_stale_lidar_scan_is_ignored_after_odometry_reset(self):
+        node = object.__new__(CubeyOdometryNode)
+        node.last_scan_time = 42.0
+        now = MagicMock()
+        now.nanoseconds = int(100.0 * 1e9)
+        clock = MagicMock()
+        clock.now.return_value = now
+        node.get_clock = MagicMock(return_value=clock)
+        scan = MagicMock()
+        scan.header.stamp.sec = 99
+        scan.header.stamp.nanosec = 0
+
+        node._on_laser_scan(scan)
+
+        self.assertEqual(node.last_scan_time, 42.0)
+
+    def test_mapping_completion_distinguishes_dock_failure(self):
+        explorer = object.__new__(CubeyFrontierExplorerNode)
+        explorer.get_logger = MagicMock(return_value=MagicMock())
+
+        explorer.finalization_at_dock = True
+        explorer._complete_mapping()
+        self.assertEqual(explorer.state, "COMPLETED")
+
+        explorer.finalization_at_dock = False
+        explorer._complete_mapping()
+        self.assertEqual(explorer.state, "COMPLETED_AWAY_FROM_DOCK")
 
     def test_stale_heartbeat_is_not_ready(self):
         service = CubeyNavService()
