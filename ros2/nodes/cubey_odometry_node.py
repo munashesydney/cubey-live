@@ -198,8 +198,11 @@ class CubeyOdometryNode(Node):
         dt = (now - self.last_update_time).nanoseconds / 1e9
         self.last_update_time = now
 
-        # Integrate velocity if no recent scan update occurred
-        if dt > 0 and dt < 0.2:
+        # Scan matching already integrates commanded motion on every LiDAR frame.
+        # Fall back to open-loop integration only if scans have actually stopped;
+        # integrating here during normal scans would count every movement twice.
+        scan_age = time.time() - self.last_scan_time if self.last_scan_time > 0 else float("inf")
+        if scan_age > 0.2 and dt > 0 and dt < 0.2:
             self.x += (self.vx * math.cos(self.yaw) - self.vy * math.sin(self.yaw)) * dt
             self.y += (self.vx * math.sin(self.yaw) + self.vy * math.cos(self.yaw)) * dt
             self.yaw += self.wz * dt
