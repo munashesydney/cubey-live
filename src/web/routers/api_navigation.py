@@ -4,7 +4,7 @@ SLAM mapping sessions, waypoint navigation, and teleoperation motor drive endpoi
 
 import logging
 from typing import Optional
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from src.services.mapping_service import get_mapping_service
@@ -41,9 +41,15 @@ async def start_mapping_session(req: Optional[StartMappingRequest] = None, _: st
     mode = (req.mode if req and req.mode else "manual").lower()
 
     if mode == "autonomous":
-        nav_svc.start_exploration()
+        started = nav_svc.start_exploration()
     else:
-        nav_svc.start_manual_mapping()
+        started = nav_svc.start_manual_mapping()
+
+    if not started:
+        raise HTTPException(
+            status_code=503,
+            detail="ROS 2 Nav2/SLAM is not ready; mapping was not started.",
+        )
 
     return {"status": "mapping_started", "mode": mode}
 

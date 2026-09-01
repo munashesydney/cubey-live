@@ -226,6 +226,17 @@ class LidarService:
             self._emit_connection_change(True, f"Mock Mode ({self.port})")
             return True
 
+        # On Linux robot, RPLiDAR is owned exclusively by ROS 2 rplidar_c1_node
+        if platform.system().lower() == "linux":
+            self._is_mock = False
+            self._is_connected = True
+            self._running = True
+            self._motor_enabled = True
+            self._emit_log("LiDAR managed exclusively by ROS 2 rplidar_c1_node")
+            self._emit_connection_change(True, "Connected (ROS 2)")
+            logger.info("LiDAR managed exclusively by ROS 2 rplidar_c1_node.")
+            return True
+
         try:
             self._serial = serial.Serial(
                 port=self.port,
@@ -275,6 +286,12 @@ class LidarService:
         """Safely stop scanning, disable motor, and close serial port."""
         self.stop_scan()
         self._running = False
+
+        if platform.system().lower() == "linux":
+            self._is_connected = False
+            self._emit_log("Disconnected from LiDAR.")
+            self._emit_connection_change(False, "Disconnected")
+            return
 
         if self._serial:
             try:

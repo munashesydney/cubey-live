@@ -7,10 +7,14 @@ velocities to normalized [-1000..1000] integer space, and dispatches TWIST packe
 to the ESP32 (cubey_wheels) over hardware UART (/dev/ttyAMA0 @ 115200 baud).
 """
 
-import sys
-import time
-import threading
+import json
 import logging
+import os
+import select
+import socket
+import sys
+import threading
+import time
 from typing import Optional
 
 try:
@@ -80,6 +84,17 @@ class CmdVelSerialBridgeNode(Node):
         self._reader_thread = threading.Thread(target=self._read_telemetry_loop, daemon=True)
         self._reader_thread.start()
 
+        # Background UDP listener for Python application layer (teleop, web joystick, Gemini voice)
+        self._udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            self._udp_sock.bind(("127.0.0.1", 9876))
+            self._udp_sock.setblocking(False)
+            self._udp_thread = threading.Thread(target=self._udp_listener_loop, daemon=True)
+            self._udp_thread.start()
+            self.get_logger().info("UDP IPC Command Listener active on 127.0.0.1:9876")
+        except Exception as e:
+            self.get_logger().warn(f"Could not bind UDP 9876: {e}")
+
         self.get_logger().info(f"Cubey cmd_vel Serial Bridge started on {self.port} @ {self.baudrate} baud")
 
     def _connect_serial(self):
@@ -145,8 +160,90 @@ class CmdVelSerialBridgeNode(Node):
             except Exception as e:
                 self.get_logger().error(f"Serial write error: {e}")
 
+    def _udp_listener_loop(self):
+        """Listens for commands from wheels_service.py on localhost:9876."""
+        while self._running:
+            try:
+                ready, _, _ = select.select([self._udp_sock], [], [], 0.5)
+                if not ready:
+                    continue
+                data, _ = self._udp_sock.recvfrom(4096)
+                if not data:
+                    continue
+                text = data.decode("utf-8", errors="ignore").strip()
+                if not text:
+                    continue
+
+                if text.startswith("{"):
+                    try:
+                        cmd = json.loads(text)
+                        action = cmd.get("action")
+                        speed = int(cmd.get("speed", 180))
+                        norm = int(max(0, min(1000, (speed / 255.0) * 1000)))
+                        if action == "forward":
+                            self.target_forward = norm
+                            self.target_left = 0
+                            self.target_ccw = 0
+                        elif action == "backward":
+                            self.target_forward = -norm
+                            self.target_left = 0
+                            self.target_ccw = 0
+                        elif action == "strafeLeft":
+                            self.target_forward = 0
+                            self.target_left = norm
+                            self.target_ccw = 0
+                        elif action == "strafeRight":
+                            self.target_forward = 0
+                            self.target_left = -norm
+                            self.target_ccw = 0
+                        elif action == "rotateLeft":
+                            self.target_forward = 0
+                            self.target_left = 0
+                            self.target_ccw = norm
+                        elif action == "rotateRight":
+                            self.target_forward = 0
+                            self.target_left = 0
+                            self.target_ccw = -norm
+                        elif action == "forwardLeft":
+                            self.target_forward = norm
+                            self.target_left = norm // 2
+                            self.target_ccw = 0
+                        elif action == "forwardRight":
+                            self.target_forward = norm
+                            self.target_left = -norm // 2
+                            self.target_ccw = 0
+                        elif action == "stop":
+                            self.target_forward = 0
+                            self.target_left = 0
+                            self.target_ccw = 0
+                        elif "vx" in cmd or "wz" in cmd:
+                            vx = float(cmd.get("vx", 0.0))
+                            vy = float(cmd.get("vy", 0.0))
+                            wz = float(cmd.get("wz", 0.0))
+                            self.target_forward = int(max(-1.0, min(1.0, vx / self.max_vx)) * 1000) if self.max_vx > 0 else 0
+                            self.target_left = int(max(-1.0, min(1.0, vy / self.max_vy)) * 1000) if self.max_vy > 0 else 0
+                            self.target_ccw = int(max(-1.0, min(1.0, wz / self.max_wz)) * 1000) if self.max_wz > 0 else 0
+                        self.last_cmd_time = time.time()
+                        self.is_active = True
+                    except Exception:
+                        pass
+                else:
+                    # Raw ASCII line (e.g. "CMD:forward", "CMD:stop", "SPEED:180", "PING")
+                    if text.lower() == "cmd:stop":
+                        self.target_forward = 0
+                        self.target_left = 0
+                        self.target_ccw = 0
+                        self.last_cmd_time = time.time()
+                        self.is_active = True
+                        self._send_raw("TWIST:0,0,0\n")
+                    self._send_raw(f"{text}\n")
+            except Exception:
+                time.sleep(0.05)
+
     def _read_telemetry_loop(self):
         """Reads incoming telemetry from ESP32."""
+        tmp_telemetry = "/tmp/cubey_wheels_telemetry.txt"
+        tmp_w = "/tmp/cubey_wheels_telemetry.txt.tmp"
         while self._running:
             if not self.serial_conn or not self.serial_conn.is_open:
                 time.sleep(1.0)
@@ -154,14 +251,23 @@ class CmdVelSerialBridgeNode(Node):
                 continue
             try:
                 line = self.serial_conn.readline().decode("utf-8", errors="ignore").strip()
-                if line and "TELEMETRY:" in line:
-                    # Telemetry received from ESP32
-                    pass
+                if line:
+                    try:
+                        with open(tmp_w, "w") as f:
+                            f.write(line + "\n")
+                        os.replace(tmp_w, tmp_telemetry)
+                    except Exception:
+                        pass
             except Exception:
                 time.sleep(0.1)
 
     def destroy_node(self):
         self._running = False
+        if hasattr(self, "_udp_sock") and self._udp_sock:
+            try:
+                self._udp_sock.close()
+            except Exception:
+                pass
         if self.serial_conn and self.serial_conn.is_open:
             try:
                 self._send_raw("TWIST:0,0,0\nCMD:stop\n")

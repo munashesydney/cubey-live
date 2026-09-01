@@ -17,7 +17,11 @@ import base64
 import json
 import math
 import os
+import queue
+import select
+import socket
 import sys
+import threading
 import time
 import zlib
 from collections import deque
@@ -33,9 +37,10 @@ try:
     from nav_msgs.msg import OccupancyGrid, Odometry
     from geometry_msgs.msg import PoseStamped
     from std_msgs.msg import String
-    from std_srvs.srv import SetBool, Trigger
+    from std_srvs.srv import Trigger
     from nav2_msgs.action import NavigateToPose
     from action_msgs.msg import GoalStatus
+    from slam_toolbox.srv import Pause, SaveMap
 except ImportError as e:
     print(f"Error: ROS 2 dependencies missing: {e}. Run inside Pixi environment.", file=sys.stderr)
     Node = object
@@ -50,11 +55,11 @@ class CubeyFrontierExplorerNode(Node):
 
         # Declare parameters
         self.declare_parameter("autostart", True)
-        self.declare_parameter("min_frontier_size", 4)          # At 5cm/cell, 4 cells = 20cm
-        self.declare_parameter("robot_radius_m", 0.22)          # Safety inflation boundary
+        self.declare_parameter("min_frontier_size", 2)          # 2 cells = 10cm minimum frontier
+        self.declare_parameter("robot_radius_m", 0.12)          # Obstacle buffer
         self.declare_parameter("update_interval_sec", 2.0)      # Rate to re-evaluate frontiers
         self.declare_parameter("goal_timeout_sec", 35.0)        # Max time before replanning a goal
-        self.declare_parameter("min_goal_distance_m", 0.35)     # Ignore frontiers too close to robot
+        self.declare_parameter("min_goal_distance_m", 0.15)     # Accept close frontiers
         self.declare_parameter("max_goal_distance_m", 15.0)     # Max exploration horizon
         self.declare_parameter("map_save_dir", "/home/cubey/Desktop/cubey-live/data/maps")
 
@@ -70,6 +75,7 @@ class CubeyFrontierExplorerNode(Node):
         # State tracking
         # States: IDLE, EXPLORING, RETURNING_TO_DOCK, FINALIZING_MAP, COMPLETED
         self.state = "IDLE"
+        self.exploration_start_time: float = 0.0
         self.robot_pose: Optional[Tuple[float, float, float]] = None  # x, y, theta_rad
         self.start_pose: Tuple[float, float, float] = (0.0, 0.0, 0.0)
         self.latest_map: Optional[OccupancyGrid] = None
@@ -118,6 +124,8 @@ class CubeyFrontierExplorerNode(Node):
 
         # Nav2 NavigateToPose Action Client
         self.nav_client = ActionClient(self, NavigateToPose, "navigate_to_pose")
+        self.pause_slam_client = self.create_client(Pause, "/slam_toolbox/pause_new_measurements")
+        self.save_map_client = self.create_client(SaveMap, "/slam_toolbox/save_map")
 
         # Main supervision timer (e.g. 1-2 Hz)
         self.timer = self.create_timer(self.update_interval, self._supervision_loop)
@@ -125,11 +133,93 @@ class CubeyFrontierExplorerNode(Node):
         # Fast status publish timer (2 Hz)
         self.status_timer = self.create_timer(0.5, self._publish_status)
 
+        # UDP only transports commands; ROS work is executed on the node thread.
+        self._command_queue: queue.Queue[Dict[str, object]] = queue.Queue()
+        self.command_timer = self.create_timer(0.1, self._process_pending_commands)
+
+        # Background UDP listener for start/stop triggers from Python application layer
+        self._running = True
+        self._udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            self._udp_sock.bind(("127.0.0.1", 9877))
+            self._udp_sock.setblocking(False)
+            self._udp_thread = threading.Thread(target=self._udp_trigger_loop, daemon=True)
+            self._udp_thread.start()
+            self.get_logger().info("Explorer UDP trigger listener active on 127.0.0.1:9877")
+        except Exception as e:
+            self.get_logger().warn(f"Could not bind UDP 9877: {e}")
+
         self.get_logger().info("Cubey Frontier Explorer & Auto-Stop Supervisor initialized.")
 
         if self.autostart:
             self.get_logger().info("Autostart enabled. Waiting for /map and Nav2 action server...")
             self.state = "EXPLORING"
+
+    def _udp_trigger_loop(self):
+        """Listens for {"command": "start"} or {"command": "stop"} on 127.0.0.1:9877."""
+        while self._running:
+            try:
+                ready, _, _ = select.select([self._udp_sock], [], [], 0.5)
+                if not ready:
+                    continue
+                data, _ = self._udp_sock.recvfrom(1024)
+                if not data:
+                    continue
+                text = data.decode("utf-8", errors="ignore").strip()
+                if not text:
+                    continue
+                try:
+                    command = json.loads(text) if text.startswith("{") else {"command": text.lower()}
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(command, dict):
+                    self._command_queue.put(command)
+            except Exception:
+                time.sleep(0.05)
+
+    def _process_pending_commands(self):
+        """Execute app commands inside the rclpy executor thread."""
+        while True:
+            try:
+                message = self._command_queue.get_nowait()
+            except queue.Empty:
+                return
+
+            command = str(message.get("command", "")).lower()
+            if command == "start":
+                self._start_exploration()
+            elif command == "stop":
+                self._stop_exploration()
+            elif command == "navigate":
+                try:
+                    x_m = float(message["x_m"])
+                    y_m = float(message["y_m"])
+                    theta_rad = math.radians(float(message.get("theta_deg", 0.0)))
+                except (KeyError, TypeError, ValueError):
+                    self.get_logger().warn("Ignored invalid NavigateToPose command from app.")
+                    continue
+                self._cancel_active_nav_goal()
+                self.state = "NAVIGATING"
+                self._send_nav2_goal(x_m, y_m, theta_rad)
+
+    def _start_exploration(self):
+        self._cancel_active_nav_goal()
+        self.state = "EXPLORING"
+        self.exploration_start_time = time.time()
+        self.zero_frontier_cycles = 0
+        self.total_frontiers_mapped = 0
+        self.blacklist.clear()
+        self.current_goal_coord = None
+        self.trajectory = []
+        if self.robot_pose:
+            self.start_pose = self.robot_pose
+        self.get_logger().info("Native Nav2 autonomous exploration started.")
+
+    def _stop_exploration(self):
+        self._cancel_active_nav_goal()
+        self.state = "IDLE"
+        self.current_goal_coord = None
+        self.get_logger().info("Native Nav2 navigation stopped.")
 
     # ------------------------------------------------------------------
     # Telemetry & Callbacks
@@ -183,22 +273,13 @@ class CubeyFrontierExplorerNode(Node):
             pass
 
     def _handle_start_exploration(self, request, response):
-        self.state = "EXPLORING"
-        self.zero_frontier_cycles = 0
-        self.blacklist.clear()
-        self.current_goal_coord = None
-        if self.robot_pose:
-            self.start_pose = self.robot_pose
-        self.get_logger().info("Manual start received: exploration activated.")
+        self._start_exploration()
         response.success = True
         response.message = "Autonomous exploration started."
         return response
 
     def _handle_stop_exploration(self, request, response):
-        self._cancel_active_nav_goal()
-        self.state = "IDLE"
-        self.current_goal_coord = None
-        self.get_logger().info("Stop command received: exploration halted.")
+        self._stop_exploration()
         response.success = True
         response.message = "Exploration stopped."
         return response
@@ -241,10 +322,10 @@ class CubeyFrontierExplorerNode(Node):
         raw_frontier = free & has_unknown_neighbor
 
         # Obstacle buffer safety: avoid frontiers within robot radius of an obstacle
-        safety_cells = max(2, int(self.robot_radius_m / res))
+        safety_cells = max(1, int(self.robot_radius_m / res))
         if np.any(obstacle):
-            # Dilate obstacle mask by safety_cells
-            for _ in range(safety_cells):
+            # Dilate obstacle mask by safety_cells (1-2 cells)
+            for _ in range(min(2, safety_cells)):
                 obstacle[:-1, :] |= obstacle[1:, :]
                 obstacle[1:, :]  |= obstacle[:-1, :]
                 obstacle[:, :-1] |= obstacle[:, 1:]
@@ -330,6 +411,11 @@ class CubeyFrontierExplorerNode(Node):
         """Dispatches an action goal to Nav2 bt_navigator."""
         if not self.nav_client.wait_for_server(timeout_sec=2.0):
             self.get_logger().warn("Nav2 navigate_to_pose action server not yet ready.")
+            if self.state == "NAVIGATING":
+                self.state = "ERROR"
+            elif self.state == "RETURNING_TO_DOCK":
+                self.get_logger().warn("Dock goal could not start; saving the map at the current safe position.")
+                self._initiate_map_finalization()
             return
 
         goal_msg = NavigateToPose.Goal()
@@ -359,6 +445,10 @@ class CubeyFrontierExplorerNode(Node):
             if self.current_goal_coord and self.latest_map:
                 self._blacklist_coord(self.current_goal_coord)
             self.current_goal_coord = None
+            if self.state == "NAVIGATING":
+                self.state = "BLOCKED"
+            elif self.state == "RETURNING_TO_DOCK":
+                self._initiate_map_finalization()
             return
 
         self.active_goal_handle = goal_handle
@@ -376,13 +466,21 @@ class CubeyFrontierExplorerNode(Node):
 
         if status == GoalStatus.STATUS_SUCCEEDED:
             self.get_logger().info("🎯 Reached frontier waypoint successfully!")
-            self.total_frontiers_mapped += 1
             if self.state == "RETURNING_TO_DOCK":
                 self._initiate_map_finalization()
+            elif self.state == "NAVIGATING":
+                self.state = "REACHED"
+            else:
+                self.total_frontiers_mapped += 1
         else:
             self.get_logger().warn(f"Nav2 goal terminated with status: {status}. Blacklisting coordinate.")
             if self.current_goal_coord:
                 self._blacklist_coord(self.current_goal_coord)
+            if self.state == "RETURNING_TO_DOCK":
+                self.get_logger().warn("Return-to-dock failed; saving the map at the current safe position.")
+                self._initiate_map_finalization()
+            elif self.state == "NAVIGATING":
+                self.state = "BLOCKED"
 
         self.current_goal_coord = None
 
@@ -422,6 +520,11 @@ class CubeyFrontierExplorerNode(Node):
         if self.current_goal_coord and (time.time() - self.goal_start_time > self.goal_timeout_sec):
             self.get_logger().warn("Active frontier goal timed out (>35s). Cancelling and selecting new frontier.")
             self._cancel_active_nav_goal()
+            if self.state == "RETURNING_TO_DOCK":
+                self.get_logger().warn("Return-to-dock timed out; saving the map at the current safe position.")
+                self._initiate_map_finalization()
+            elif self.state == "NAVIGATING":
+                self.state = "BLOCKED"
             return
 
         # -------------------------------------------------------------
@@ -430,16 +533,29 @@ class CubeyFrontierExplorerNode(Node):
         if self.state == "EXPLORING":
             frontiers = self._extract_frontiers(self.latest_map)
 
+            # Check explored map extent
+            grid_data = np.array(self.latest_map.data, dtype=np.int8)
+            explored_cells = int(np.count_nonzero(grid_data != -1))
+            time_exploring = (time.time() - self.exploration_start_time) if self.exploration_start_time > 0 else 0.0
+
             # AUTO-STOP TRIGGER CHECK:
             if len(frontiers) == 0:
                 self.zero_frontier_cycles += 1
                 self.get_logger().info(
-                    f"Frontiers empty (cycle {self.zero_frontier_cycles}/2). Checking for map completion...",
+                    f"Frontiers empty (cycle {self.zero_frontier_cycles}/4, explored={explored_cells}, elapsed={time_exploring:.1f}s)...",
                     throttle_duration_sec=2.0
                 )
-                # Confirm 0 frontiers across 2 consecutive updates to prevent sensor flicker triggers
-                if self.zero_frontier_cycles >= 2:
+                # Only auto-stop if exploration has run for at least 30s AND mapped at least 250 cells (or completed frontiers)
+                can_auto_stop = (time_exploring > 30.0 and (self.total_frontiers_mapped > 0 or explored_cells > 250))
+                if can_auto_stop and self.zero_frontier_cycles >= 4:
                     self._trigger_auto_stop_sequence()
+                elif self.zero_frontier_cycles >= 2 and self.current_goal_coord is None:
+                    # Still in early exploration: survey surroundings by gently rotating to discover frontiers
+                    self.get_logger().info("Surveying room with exploratory turn to discover frontiers...")
+                    robot_x, robot_y = self.robot_pose[:2] if self.robot_pose else (0.0, 0.0)
+                    robot_yaw = self.robot_pose[2] if self.robot_pose else 0.0
+                    survey_yaw = robot_yaw + math.radians(90.0)
+                    self._send_nav2_goal(robot_x, robot_y, survey_yaw)
                 return
             else:
                 self.zero_frontier_cycles = 0
@@ -491,6 +607,8 @@ class CubeyFrontierExplorerNode(Node):
 
     def _initiate_map_finalization(self):
         """Phase 3 & 4: Pause SLAM scan matching, trigger loop closure, and save map."""
+        if self.state in ("FINALIZING_MAP", "COMPLETED"):
+            return
         self.state = "FINALIZING_MAP"
         self.get_logger().info("=========================================================")
         self.get_logger().info("🏁 Robot arrived safely at dock. Finalizing SLAM map...")
@@ -500,28 +618,38 @@ class CubeyFrontierExplorerNode(Node):
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         final_map_base = os.path.join(self.map_save_dir, f"cubey_floorplan_{timestamp_str}")
 
-        # 1. Pause SLAM Toolbox measurements
-        try:
-            pause_client = self.create_client(SetBool, "/slam_toolbox/pause_new_measurements")
-            if pause_client.wait_for_service(timeout_sec=2.0):
-                req = SetBool.Request()
-                req.data = True
-                pause_client.call_async(req)
-                self.get_logger().info("SLAM measurements paused for map lock.")
-        except Exception as e:
-            self.get_logger().warn(f"Could not pause slam_toolbox: {e}")
+        # Pause first, then save after the pause service responds.
+        if self.pause_slam_client.wait_for_service(timeout_sec=2.0):
+            pause_future = self.pause_slam_client.call_async(Pause.Request())
+            pause_future.add_done_callback(lambda _: self._save_final_map(final_map_base))
+            self.get_logger().info("SLAM pause requested for final map lock.")
+        else:
+            self.get_logger().warn("SLAM pause service unavailable; attempting map save anyway.")
+            self._save_final_map(final_map_base)
 
-        # 2. Trigger SLAM Toolbox Save Map service
+    def _save_final_map(self, final_map_base: str):
+        if not self.save_map_client.wait_for_service(timeout_sec=2.0):
+            self.get_logger().error("SLAM save_map service unavailable; map remains available live but was not written to disk.")
+            self._complete_mapping()
+            return
+
+        request = SaveMap.Request()
+        request.name.data = final_map_base
+        save_future = self.save_map_client.call_async(request)
+        save_future.add_done_callback(lambda future: self._on_map_saved(future, final_map_base))
+
+    def _on_map_saved(self, future, final_map_base: str):
         try:
-            from slam_toolbox.srv import SaveMap
-            save_client = self.create_client(SaveMap, "/slam_toolbox/save_map")
-            if save_client.wait_for_service(timeout_sec=2.0):
-                req = SaveMap.Request()
-                req.name.data = final_map_base
-                save_client.call_async(req)
-                self.get_logger().info(f"💾 Map saved via slam_toolbox to: {final_map_base}")
+            response = future.result()
+            if response.result == SaveMap.Response.RESULT_SUCCESS:
+                self.get_logger().info(f"💾 Map saved via SLAM Toolbox to: {final_map_base}")
+            else:
+                self.get_logger().error(f"SLAM Toolbox map save failed with result code {response.result}.")
         except Exception as e:
-            self.get_logger().warn(f"Error calling /slam_toolbox/save_map: {e}")
+            self.get_logger().error(f"SLAM Toolbox map save failed: {e}")
+        self._complete_mapping()
+
+    def _complete_mapping(self):
 
         self.state = "COMPLETED"
         self.get_logger().info("=========================================================")
@@ -563,6 +691,15 @@ class CubeyFrontierExplorerNode(Node):
             os.replace(tmp_write, tmp_file)
         except Exception:
             pass
+
+    def destroy_node(self):
+        self._running = False
+        if hasattr(self, "_udp_sock") and self._udp_sock:
+            try:
+                self._udp_sock.close()
+            except Exception:
+                pass
+        super().destroy_node()
 
 
 def main(args=None):

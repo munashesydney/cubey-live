@@ -4,7 +4,9 @@ Real-time WebSocket streaming endpoints for Live 2D SLAM Maps and Microphone Aud
 
 import asyncio
 import base64
+import json
 import logging
+import os
 import secrets
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
@@ -125,6 +127,27 @@ async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(
                     "nav_mode": nav_svc.telemetry.mode,
                     "timestamp": snapshot.timestamp,
                 }
+
+                # If ROS 2 SLAM Toolbox live map is exported to IPC, overlay it seamlessly
+                nav2_map_file = "/tmp/cubey_nav2_live_map.json"
+                if os.path.exists(nav2_map_file):
+                    try:
+                        with open(nav2_map_file, "r") as f:
+                            nav2_data = json.load(f)
+                        if "pose" in nav2_data and nav2_data["pose"]:
+                            payload["pose"] = nav2_data["pose"]
+                        if "trajectory" in nav2_data and nav2_data["trajectory"]:
+                            payload["trajectory"] = nav2_data["trajectory"]
+                        if send_grid and "grid_compressed_b64" in nav2_data and nav2_data["grid_compressed_b64"]:
+                            payload["grid_compressed_b64"] = nav2_data["grid_compressed_b64"]
+                            payload["width"] = nav2_data.get("width", payload["width"])
+                            payload["height"] = nav2_data.get("height", payload["height"])
+                            payload["resolution_cm"] = nav2_data.get("resolution_cm", payload["resolution_cm"])
+                            payload["origin_x_m"] = nav2_data.get("origin_x_m", payload["origin_x_m"])
+                            payload["origin_y_m"] = nav2_data.get("origin_y_m", payload["origin_y_m"])
+                    except Exception:
+                        pass
+
                 await websocket.send_json(payload)
                 await asyncio.sleep(0.10)  # 10 Hz stream
             except Exception:

@@ -3,6 +3,7 @@ Unit tests for FastAPI Web Server & Auth endpoints.
 """
 
 import unittest
+from unittest.mock import MagicMock, patch
 from fastapi.testclient import TestClient
 
 from src.config import config
@@ -44,14 +45,28 @@ class WebServerApiTests(unittest.TestCase):
         self.assertEqual(save_res.json().get("status"), "saved")
 
     def test_mapping_lifecycle_endpoints(self):
-        res_start = self.client.post("/api/mapping/start", auth=self.auth)
-        self.assertEqual(res_start.status_code, 200)
+        nav_service = MagicMock()
+        nav_service.start_manual_mapping.return_value = True
+        with patch("src.web.routers.api_navigation.get_nav_service", return_value=nav_service):
+            res_start = self.client.post("/api/mapping/start", auth=self.auth)
+            self.assertEqual(res_start.status_code, 200)
 
         res_pause = self.client.post("/api/mapping/pause", auth=self.auth)
         self.assertEqual(res_pause.status_code, 200)
 
         res_reset = self.client.post("/api/mapping/reset", auth=self.auth)
         self.assertEqual(res_reset.status_code, 200)
+
+    def test_autonomous_mapping_returns_503_when_nav2_is_down(self):
+        nav_service = MagicMock()
+        nav_service.start_exploration.return_value = False
+        with patch("src.web.routers.api_navigation.get_nav_service", return_value=nav_service):
+            response = self.client.post(
+                "/api/mapping/start",
+                json={"mode": "autonomous"},
+                auth=self.auth,
+            )
+        self.assertEqual(response.status_code, 503)
 
     def test_drive_control_endpoint(self):
         res = self.client.post(

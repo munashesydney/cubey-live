@@ -348,8 +348,8 @@
 
     ctx.save();
     ctx.translate(rx, ry);
-    // Rotate by heading: theta_deg (0° is North / -Y in canvas coords)
-    ctx.rotate((robotPose.theta_deg * Math.PI) / 180.0);
+    // Rotate by heading: theta_deg (0° points along Cartesian +X / East, counter-clockwise)
+    ctx.rotate((-robotPose.theta_deg * Math.PI) / 180.0);
 
     // Robot body circle
     ctx.fillStyle = "#89B4FA";
@@ -360,12 +360,12 @@
     ctx.lineWidth = 2;
     ctx.stroke();
 
-    // Direction pointer triangle (pointing forward UP in local frame)
+    // Direction pointer triangle (pointing forward along +X in local robot frame)
     ctx.fillStyle = "#F5E0DC";
     ctx.beginPath();
-    ctx.moveTo(0, -rRadius - 6);
-    ctx.lineTo(-rRadius * 0.6, 0);
-    ctx.lineTo(rRadius * 0.6, 0);
+    ctx.moveTo(rRadius + 7, 0);
+    ctx.lineTo(rRadius * 0.1, -rRadius * 0.55);
+    ctx.lineTo(rRadius * 0.1, rRadius * 0.55);
     ctx.closePath();
     ctx.fill();
 
@@ -639,13 +639,18 @@
     btnStartAuto.addEventListener("click", async () => {
       modalModeSelect.classList.add("hidden");
       try {
-        await fetch("/api/mapping/start", {
+        const response = await fetch("/api/mapping/start", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ mode: "autonomous" }),
         });
+        if (!response.ok) {
+          const error = await response.json().catch(() => ({}));
+          throw new Error(error.detail || "Nav2 mapping failed to start");
+        }
       } catch (e) {
         console.error("Failed to start autonomous mapping:", e);
+        alert(`Autonomous mapping did not start: ${e.message}`);
       }
     });
   }
@@ -654,13 +659,18 @@
     btnStartManual.addEventListener("click", async () => {
       modalModeSelect.classList.add("hidden");
       try {
-        await fetch("/api/mapping/start", {
+        const response = await fetch("/api/mapping/start", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ mode: "manual" }),
         });
+        if (!response.ok) {
+          const error = await response.json().catch(() => ({}));
+          throw new Error(error.detail || "SLAM mapping failed to start");
+        }
       } catch (e) {
         console.error("Failed to start manual mapping:", e);
+        alert(`Manual mapping did not start: ${e.message}`);
       }
     });
   }
