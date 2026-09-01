@@ -28,17 +28,22 @@ class Nav2IntegrationTests(unittest.TestCase):
         )
 
     def test_motor_pulse_filter_preserves_weak_command_average(self):
-        command_filter = MinimumEffectiveCommandPulseFilter(390)
+        command_filter = MinimumEffectiveCommandPulseFilter(390, pulse_frames=3)
 
-        outputs = [command_filter.apply(78, -39, 0) for _ in range(10)]
+        outputs = [command_filter.apply(78, -39, 0) for _ in range(32)]
 
-        self.assertEqual(sum(output[0] for output in outputs), 780)
-        self.assertEqual(sum(output[1] for output in outputs), -390)
+        self.assertEqual(sum(output[0] for output in outputs), 2340)
+        self.assertEqual(sum(output[1] for output in outputs), -1170)
         self.assertEqual(sum(output[2] for output in outputs), 0)
-        self.assertEqual(sum(output != (0, 0, 0) for output in outputs), 2)
+        self.assertEqual(sum(output != (0, 0, 0) for output in outputs), 6)
+
+        pulse_indexes = [
+            index for index, output in enumerate(outputs) if output != (0, 0, 0)
+        ]
+        self.assertEqual(pulse_indexes, [14, 15, 16, 29, 30, 31])
 
     def test_motor_pulse_filter_resets_pending_pulse_on_direction_reversal(self):
-        command_filter = MinimumEffectiveCommandPulseFilter(390)
+        command_filter = MinimumEffectiveCommandPulseFilter(390, pulse_frames=1)
         for _ in range(3):
             self.assertEqual(command_filter.apply(100, 0, 0), (0, 0, 0))
 
@@ -47,8 +52,16 @@ class Nav2IntegrationTests(unittest.TestCase):
         self.assertEqual(command_filter.apply(-100, 0, 0), (0, 0, 0))
         self.assertEqual(command_filter.apply(-100, 0, 0), (-390, 0, 0))
 
+    def test_motor_pulse_filter_cancels_active_burst_on_reversal(self):
+        command_filter = MinimumEffectiveCommandPulseFilter(390, pulse_frames=3)
+        for _ in range(11):
+            self.assertEqual(command_filter.apply(100, 0, 0), (0, 0, 0))
+        self.assertEqual(command_filter.apply(100, 0, 0), (390, 0, 0))
+
+        self.assertEqual(command_filter.apply(-100, 0, 0), (0, 0, 0))
+
     def test_motor_pulse_filter_preserves_stop_and_strong_commands(self):
-        command_filter = MinimumEffectiveCommandPulseFilter(390)
+        command_filter = MinimumEffectiveCommandPulseFilter(390, pulse_frames=3)
 
         self.assertEqual(command_filter.apply(900, 0, -450), (900, 0, -450))
         self.assertEqual(command_filter.apply(0, 0, 0), (0, 0, 0))

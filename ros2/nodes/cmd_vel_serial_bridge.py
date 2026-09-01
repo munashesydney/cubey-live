@@ -59,13 +59,16 @@ def apply_minimum_effective_command(
 class MinimumEffectiveCommandPulseFilter:
     """Preserve weak command averages using short, motor-effective pulses."""
 
-    def __init__(self, minimum: int):
+    def __init__(self, minimum: int, pulse_frames: int = 3):
         self.minimum = max(0, min(1000, int(minimum)))
+        self.pulse_frames = max(1, int(pulse_frames))
         self._accumulator = 0
+        self._pulse_frames_remaining = 0
         self._last_command: Optional[tuple[int, int, int]] = None
 
     def reset(self):
         self._accumulator = 0
+        self._pulse_frames_remaining = 0
         self._last_command = None
 
     def apply(
@@ -94,16 +97,23 @@ class MinimumEffectiveCommandPulseFilter:
             )
             if direction_dot <= 0:
                 self._accumulator = 0
+                self._pulse_frames_remaining = 0
         self._last_command = command
 
         # Integer pulse-density modulation: over time, the emitted command's
         # average equals Nav2's requested magnitude, while each nonzero pulse
         # reaches the drivetrain's usable static-friction threshold.
         self._accumulator += peak
-        if self._accumulator < self.minimum:
+        if self._pulse_frames_remaining > 0:
+            self._pulse_frames_remaining -= 1
+            return apply_minimum_effective_command(*command, self.minimum)
+
+        pulse_threshold = self.minimum * self.pulse_frames
+        if self._accumulator < pulse_threshold:
             return (0, 0, 0)
 
-        self._accumulator -= self.minimum
+        self._accumulator -= pulse_threshold
+        self._pulse_frames_remaining = self.pulse_frames - 1
         return apply_minimum_effective_command(*command, self.minimum)
 
 
@@ -123,6 +133,7 @@ class CmdVelSerialBridgeNode(Node):
         # 390 therefore produces about 70 PWM, the firmware's proven minimum
         # useful motor-test power. Lower values only make Cubey's motors buzz.
         self.declare_parameter("minimum_effective_command", 390)
+        self.declare_parameter("minimum_effective_pulse_frames", 3)
         self.declare_parameter("command_timeout_sec", 0.40)
         self.declare_parameter("publish_rate_hz", 20.0)
 
@@ -134,6 +145,9 @@ class CmdVelSerialBridgeNode(Node):
         self.minimum_effective_command = int(
             self.get_parameter("minimum_effective_command").value
         )
+        self.minimum_effective_pulse_frames = int(
+            self.get_parameter("minimum_effective_pulse_frames").value
+        )
         self.timeout_sec = float(self.get_parameter("command_timeout_sec").value)
         self.publish_rate = float(self.get_parameter("publish_rate_hz").value)
 
@@ -144,7 +158,8 @@ class CmdVelSerialBridgeNode(Node):
         self.target_left = 0
         self.target_ccw = 0
         self.command_filter = MinimumEffectiveCommandPulseFilter(
-            self.minimum_effective_command
+            self.minimum_effective_command,
+            self.minimum_effective_pulse_frames,
         )
         self.last_cmd_time = time.time()
         self.is_active = False
