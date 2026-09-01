@@ -13,10 +13,13 @@ and executes an autonomous 4-stage Auto-Stop protocol:
   4. Optimizes pose graph and saves map (/slam_toolbox/save_map).
 """
 
+import base64
+import json
 import math
 import os
 import sys
 import time
+import zlib
 from collections import deque
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
@@ -70,6 +73,7 @@ class CubeyFrontierExplorerNode(Node):
         self.robot_pose: Optional[Tuple[float, float, float]] = None  # x, y, theta_rad
         self.start_pose: Tuple[float, float, float] = (0.0, 0.0, 0.0)
         self.latest_map: Optional[OccupancyGrid] = None
+        self.trajectory: List[List[float]] = []
 
         # Goal & Frontier Management
         self.current_goal_coord: Optional[Tuple[float, float]] = None
@@ -140,8 +144,43 @@ class CubeyFrontierExplorerNode(Node):
         yaw = math.atan2(siny_cosp, cosy_cosp)
         self.robot_pose = (pos.x, pos.y, yaw)
 
+        # Track trajectory for web canvas
+        if not self.trajectory or math.hypot(pos.x - self.trajectory[-1][0], pos.y - self.trajectory[-1][1]) > 0.05:
+            self.trajectory.append([round(pos.x, 3), round(pos.y, 3)])
+            if len(self.trajectory) > 5000:
+                self.trajectory = self.trajectory[-4000:]
+
     def _on_map(self, msg: OccupancyGrid):
         self.latest_map = msg
+
+        # Export live map & pose directly for Cubey Web Panel Canvas
+        try:
+            raw_bytes = bytes(np.array(msg.data, dtype=np.int8))
+            compressed = zlib.compress(raw_bytes, level=6)
+            grid_b64 = base64.b64encode(compressed).decode("ascii")
+
+            map_payload = {
+                "grid_compressed_b64": grid_b64,
+                "width": msg.info.width,
+                "height": msg.info.height,
+                "resolution_cm": round(msg.info.resolution * 100.0, 1),
+                "origin_x_m": round(msg.info.origin.position.x, 3),
+                "origin_y_m": round(msg.info.origin.position.y, 3),
+                "pose": {
+                    "x_m": round(self.robot_pose[0], 3) if self.robot_pose else 0.0,
+                    "y_m": round(self.robot_pose[1], 3) if self.robot_pose else 0.0,
+                    "theta_deg": round(math.degrees(self.robot_pose[2]), 1) if self.robot_pose else 0.0,
+                },
+                "trajectory": self.trajectory,
+                "timestamp": time.time(),
+            }
+            tmp_map = "/tmp/cubey_nav2_live_map.json"
+            tmp_w = "/tmp/cubey_nav2_live_map.json.tmp"
+            with open(tmp_w, "w") as f:
+                json.dump(map_payload, f)
+            os.replace(tmp_w, tmp_map)
+        except Exception:
+            pass
 
     def _handle_start_exploration(self, request, response):
         self.state = "EXPLORING"

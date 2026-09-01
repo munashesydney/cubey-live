@@ -4,8 +4,11 @@ Real-time WebSocket streaming endpoints for Live 2D SLAM Maps and Microphone Aud
 
 import asyncio
 import base64
+import json
 import logging
+import os
 import secrets
+import time
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
 
@@ -94,6 +97,40 @@ async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(
         frame_counter = 0
         while True:
             try:
+                # 1. If Native Nav2 is active, stream its live map directly to the canvas!
+                nav2_map_file = "/tmp/cubey_nav2_live_map.json"
+                if os.path.exists(nav2_map_file):
+                    try:
+                        with open(nav2_map_file, "r") as f:
+                            nav2_data = json.load(f)
+                        if time.time() - nav2_data.get("timestamp", 0) < 5.0:
+                            payload = {
+                                "type": "map_update",
+                                "pose": nav2_data.get("pose", {"x_m": 0.0, "y_m": 0.0, "theta_deg": 0.0}),
+                                "trajectory": nav2_data.get("trajectory", []),
+                                "laser_scan": [],
+                                "grid_compressed_b64": nav2_data.get("grid_compressed_b64"),
+                                "width": nav2_data.get("width", 100),
+                                "height": nav2_data.get("height", 100),
+                                "resolution_cm": nav2_data.get("resolution_cm", 5.0),
+                                "origin_x_m": nav2_data.get("origin_x_m", -2.5),
+                                "origin_y_m": nav2_data.get("origin_y_m", -2.5),
+                                "is_mapping": True,
+                                "map_name": "Nav2 SLAM Live",
+                                "battery_pct": wheels_svc.telemetry.battery_pct,
+                                "motion": wheels_svc.telemetry.motion,
+                                "lidar_rate_hz": 10.0,
+                                "nav_state": nav_svc.telemetry.state,
+                                "nav_mode": "autonomous",
+                                "timestamp": nav2_data.get("timestamp", time.time()),
+                            }
+                            await websocket.send_json(payload)
+                            await asyncio.sleep(0.10)
+                            continue
+                    except Exception:
+                        pass
+
+                # 2. Otherwise stream the standalone mapping_service snapshot
                 snapshot = mapping_svc.get_snapshot()
                 frame_counter += 1
 
