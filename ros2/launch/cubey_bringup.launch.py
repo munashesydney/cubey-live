@@ -18,12 +18,14 @@ def generate_launch_description():
     cmd_bridge_script = str(nodes_dir / "cmd_vel_serial_bridge.py")
     odom_script = str(nodes_dir / "cubey_odometry_node.py")
     rplidar_script = str(nodes_dir / "rplidar_c1_node.py")
+    explorer_script = str(nodes_dir / "cubey_frontier_explorer_node.py")
 
     # Launch Configurations
     use_sim_time = LaunchConfiguration("use_sim_time", default="false")
     lidar_port = LaunchConfiguration("lidar_port", default="/dev/ttyUSB0")
     lidar_baud = LaunchConfiguration("lidar_baud", default="460800")
     serial_port = LaunchConfiguration("serial_port", default="/dev/ttyAMA0")
+    explore = LaunchConfiguration("explore", default="false")
 
     lifecycle_nodes = [
         "slam_toolbox",
@@ -152,6 +154,20 @@ def generate_launch_description():
             parameters=[{
                 "serial_port": serial_port,
                 "baudrate": 115200,
+            }],
+            output="screen",
+        ),
+
+        # -----------------------------------------------------------------
+        # 7. Frontier Exploration & Auto-Stop Supervisor
+        # -----------------------------------------------------------------
+        Node(
+            executable=sys.executable,
+            arguments=["-u", explorer_script],
+            name="cubey_frontier_explorer",
+            parameters=[{
+                "autostart": explore,
+                "map_save_dir": str(ros2_dir.parent / "data" / "maps"),
             }],
             output="screen",
         ),
