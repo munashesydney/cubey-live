@@ -47,15 +47,17 @@ class WebServerApiTests(unittest.TestCase):
     def test_mapping_lifecycle_endpoints(self):
         nav_service = MagicMock()
         nav_service.start_manual_mapping.return_value = True
+        nav_service.reset_mapping.return_value = True
         with patch("src.web.routers.api_navigation.get_nav_service", return_value=nav_service):
             res_start = self.client.post("/api/mapping/start", auth=self.auth)
             self.assertEqual(res_start.status_code, 200)
 
-        res_pause = self.client.post("/api/mapping/pause", auth=self.auth)
-        self.assertEqual(res_pause.status_code, 200)
+            res_pause = self.client.post("/api/mapping/pause", auth=self.auth)
+            self.assertEqual(res_pause.status_code, 200)
 
-        res_reset = self.client.post("/api/mapping/reset", auth=self.auth)
-        self.assertEqual(res_reset.status_code, 200)
+            res_reset = self.client.post("/api/mapping/reset", auth=self.auth)
+            self.assertEqual(res_reset.status_code, 200)
+            nav_service.reset_mapping.assert_called_once_with()
 
     def test_autonomous_mapping_returns_503_when_nav2_is_down(self):
         nav_service = MagicMock()

@@ -66,9 +66,13 @@ async def pause_mapping_session(_: str = Depends(verify_credentials)):
 
 @router.post("/mapping/reset")
 async def reset_mapping_grid(_: str = Depends(verify_credentials)):
-    """Clear the occupancy grid back to unexplored space."""
-    mapping_svc = get_mapping_service()
-    mapping_svc.reset_map()
+    """Clear the real SLAM graph, occupancy grid, trajectory, and robot pose."""
+    nav_svc = get_nav_service()
+    if not nav_svc.reset_mapping():
+        raise HTTPException(
+            status_code=503,
+            detail="ROS 2 SLAM did not acknowledge the map reset.",
+        )
     return {"status": "map_reset"}
 
 

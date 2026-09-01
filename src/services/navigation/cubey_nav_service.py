@@ -139,7 +139,7 @@ class CubeyNavService:
             logger.warning("Could not send command to ROS 2 explorer: %s", e)
             return False
 
-    def _wait_for_ros2_state(self, expected_states: set[str], sent_at: float, timeout_s: float = 3.0) -> bool:
+    def _wait_for_ros2_state(self, expected_states: set[str], sent_at: float, timeout_s: float = 5.0) -> bool:
         deadline = time.time() + timeout_s
         while time.time() < deadline:
             data = self._read_ros2_status()
@@ -251,6 +251,36 @@ class CubeyNavService:
         self._worker_thread.start()
 
         self._emit_log("🤖 Activated Native ROS 2 Nav2 Autonomous Exploration with Auto-Stop.")
+        self._emit_telemetry()
+        return True
+
+    def reset_mapping(self) -> bool:
+        """Stop motion and reset both the real SLAM graph and legacy UI state."""
+        self.stop_navigation()
+
+        if not self.is_ros2_ready():
+            self._emit_log("Nav2/SLAM is not ready. The map was not reset.")
+            return False
+
+        # Keep the web application's persisted/session state in sync with ROS.
+        get_mapping_service().reset_map()
+
+        sent_at = time.time()
+        if not self._send_ros2_command("reset") or not self._wait_for_ros2_state(
+            {"IDLE"}, sent_at
+        ):
+            self._emit_log("SLAM Toolbox did not acknowledge the map reset.")
+            return False
+
+        with self._lock:
+            self._is_exploring = False
+            self._is_navigating_goal = False
+            self.telemetry.state = "IDLE"
+            self.telemetry.mode = "manual"
+            self.telemetry.current_goal = None
+            self.telemetry.distance_remaining_m = 0.0
+
+        self._emit_log("SLAM map and robot pose reset to a blank origin.")
         self._emit_telemetry()
         return True
 

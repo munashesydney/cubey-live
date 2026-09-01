@@ -128,23 +128,24 @@ async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(
                     "timestamp": snapshot.timestamp,
                 }
 
-                # If ROS 2 SLAM Toolbox live map is exported to IPC, overlay it seamlessly
+                # If ROS 2 SLAM Toolbox has a live map, use one consistent set of
+                # ROS dimensions on every frame. Alternating legacy/ROS metadata
+                # makes the canvas reject its existing grid and visibly blink.
                 nav2_map_file = "/tmp/cubey_nav2_live_map.json"
                 if os.path.exists(nav2_map_file):
                     try:
                         with open(nav2_map_file, "r") as f:
                             nav2_data = json.load(f)
-                        if "pose" in nav2_data and nav2_data["pose"]:
-                            payload["pose"] = nav2_data["pose"]
-                        if "trajectory" in nav2_data and nav2_data["trajectory"]:
-                            payload["trajectory"] = nav2_data["trajectory"]
-                        if send_grid and "grid_compressed_b64" in nav2_data and nav2_data["grid_compressed_b64"]:
+                        payload["pose"] = nav2_data.get("pose", payload["pose"])
+                        payload["trajectory"] = nav2_data.get("trajectory", [])
+                        payload["width"] = nav2_data.get("width", payload["width"])
+                        payload["height"] = nav2_data.get("height", payload["height"])
+                        payload["resolution_cm"] = nav2_data.get("resolution_cm", payload["resolution_cm"])
+                        payload["origin_x_m"] = nav2_data.get("origin_x_m", payload["origin_x_m"])
+                        payload["origin_y_m"] = nav2_data.get("origin_y_m", payload["origin_y_m"])
+                        payload["grid_compressed_b64"] = None
+                        if send_grid and nav2_data.get("grid_compressed_b64"):
                             payload["grid_compressed_b64"] = nav2_data["grid_compressed_b64"]
-                            payload["width"] = nav2_data.get("width", payload["width"])
-                            payload["height"] = nav2_data.get("height", payload["height"])
-                            payload["resolution_cm"] = nav2_data.get("resolution_cm", payload["resolution_cm"])
-                            payload["origin_x_m"] = nav2_data.get("origin_x_m", payload["origin_x_m"])
-                            payload["origin_y_m"] = nav2_data.get("origin_y_m", payload["origin_y_m"])
                     except Exception:
                         pass
 
@@ -195,8 +196,7 @@ async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(
                 nav_svc.navigate_to(x_m=x, y_m=y)
 
             elif mtype == "reset_map":
-                nav_svc.stop_navigation()
-                mapping_svc.reset_map()
+                nav_svc.reset_mapping()
 
     except WebSocketDisconnect:
         pass

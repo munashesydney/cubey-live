@@ -153,16 +153,16 @@
   }
 
   function handleMapUpdate(data) {
-    robotPose = data.pose || robotPose;
-    trajectory = data.trajectory || trajectory;
-    laserScan = data.laser_scan || laserScan;
+    robotPose = data.pose ?? robotPose;
+    trajectory = data.trajectory ?? trajectory;
+    laserScan = data.laser_scan ?? laserScan;
 
-    gridWidth = data.width || gridWidth;
-    gridHeight = data.height || gridHeight;
-    resolutionCm = data.resolution_cm || resolutionCm;
+    gridWidth = data.width ?? gridWidth;
+    gridHeight = data.height ?? gridHeight;
+    resolutionCm = data.resolution_cm ?? resolutionCm;
     resolutionM = resolutionCm / 100.0;
-    originXM = data.origin_x_m || originXM;
-    originYM = data.origin_y_m || originYM;
+    originXM = data.origin_x_m ?? originXM;
+    originYM = data.origin_y_m ?? originYM;
 
     isMapping = data.is_mapping;
     activeMapName = data.map_name || activeMapName;
@@ -676,9 +676,22 @@
   }
 
 
-  btnResetMap.addEventListener("click", () => {
+  btnResetMap.addEventListener("click", async () => {
     if (confirm("Reset current occupancy grid map and robot pose?")) {
-      fetch("/api/mapping/reset", { method: "POST" });
+      try {
+        const response = await fetch("/api/mapping/reset", { method: "POST" });
+        if (!response.ok) {
+          const error = await response.json().catch(() => ({}));
+          throw new Error(error.detail || "SLAM map reset failed");
+        }
+        gridBuffer = new Int8Array(0);
+        trajectory = [];
+        robotPose = { x_m: 0, y_m: 0, theta_deg: 0 };
+        render();
+      } catch (e) {
+        console.error("Failed to reset SLAM map:", e);
+        alert(`Map reset failed: ${e.message}`);
+      }
     }
   });
 

@@ -13,6 +13,8 @@ and executes an autonomous 4-stage Auto-Stop protocol:
   4. Optimizes pose graph and saves map (/slam_toolbox/save_map).
 """
 
+from __future__ import annotations
+
 import base64
 import json
 import math
@@ -34,13 +36,15 @@ try:
     import rclpy
     from rclpy.node import Node
     from rclpy.action import ActionClient
+    from rclpy.time import Time
     from nav_msgs.msg import OccupancyGrid, Odometry
     from geometry_msgs.msg import PoseStamped
     from std_msgs.msg import String
     from std_srvs.srv import Trigger
     from nav2_msgs.action import NavigateToPose
     from action_msgs.msg import GoalStatus
-    from slam_toolbox.srv import Pause, SaveMap
+    from slam_toolbox.srv import Pause, Reset, SaveMap
+    from tf2_ros import Buffer, TransformException, TransformListener
 except ImportError as e:
     print(f"Error: ROS 2 dependencies missing: {e}. Run inside Pixi environment.", file=sys.stderr)
     Node = object
@@ -76,7 +80,8 @@ class CubeyFrontierExplorerNode(Node):
         # States: IDLE, EXPLORING, RETURNING_TO_DOCK, FINALIZING_MAP, COMPLETED
         self.state = "IDLE"
         self.exploration_start_time: float = 0.0
-        self.robot_pose: Optional[Tuple[float, float, float]] = None  # x, y, theta_rad
+        self.robot_pose: Optional[Tuple[float, float, float]] = None  # map-frame x, y, theta_rad
+        self.odom_pose: Optional[Tuple[float, float, float]] = None
         self.start_pose: Tuple[float, float, float] = (0.0, 0.0, 0.0)
         self.latest_map: Optional[OccupancyGrid] = None
         self.trajectory: List[List[float]] = []
@@ -121,11 +126,20 @@ class CubeyFrontierExplorerNode(Node):
             "/cubey/stop_exploration",
             self._handle_stop_exploration
         )
+        self.srv_reset = self.create_service(
+            Trigger,
+            "/cubey/reset_mapping",
+            self._handle_reset_mapping,
+        )
 
         # Nav2 NavigateToPose Action Client
         self.nav_client = ActionClient(self, NavigateToPose, "navigate_to_pose")
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
         self.pause_slam_client = self.create_client(Pause, "/slam_toolbox/pause_new_measurements")
+        self.reset_slam_client = self.create_client(Reset, "/slam_toolbox/reset")
         self.save_map_client = self.create_client(SaveMap, "/slam_toolbox/save_map")
+        self.reset_odom_client = self.create_client(Trigger, "/cubey/reset_odometry")
 
         # Main supervision timer (e.g. 1-2 Hz)
         self.timer = self.create_timer(self.update_interval, self._supervision_loop)
@@ -190,6 +204,8 @@ class CubeyFrontierExplorerNode(Node):
                 self._start_exploration()
             elif command == "stop":
                 self._stop_exploration()
+            elif command == "reset":
+                self._reset_mapping(start_after_reset=False)
             elif command == "navigate":
                 try:
                     x_m = float(message["x_m"])
@@ -203,23 +219,74 @@ class CubeyFrontierExplorerNode(Node):
                 self._send_nav2_goal(x_m, y_m, theta_rad)
 
     def _start_exploration(self):
-        self._cancel_active_nav_goal()
-        self.state = "EXPLORING"
-        self.exploration_start_time = time.time()
-        self.zero_frontier_cycles = 0
-        self.total_frontiers_mapped = 0
-        self.blacklist.clear()
-        self.current_goal_coord = None
-        self.trajectory = []
-        if self.robot_pose:
-            self.start_pose = self.robot_pose
-        self.get_logger().info("Native Nav2 autonomous exploration started.")
+        # Every autonomous mission starts from a genuinely blank SLAM graph.
+        self._reset_mapping(start_after_reset=True)
 
     def _stop_exploration(self):
         self._cancel_active_nav_goal()
         self.state = "IDLE"
         self.current_goal_coord = None
         self.get_logger().info("Native Nav2 navigation stopped.")
+
+    def _reset_mapping(self, start_after_reset: bool):
+        """Reset real SLAM Toolbox state and local odometry, then optionally explore."""
+        self._cancel_active_nav_goal()
+        self.state = "RESETTING"
+        self.current_goal_coord = None
+        self.latest_map = None
+        self.robot_pose = None
+        self.odom_pose = None
+        self.trajectory = []
+        self.blacklist.clear()
+        self.zero_frontier_cycles = 0
+        self.total_frontiers_mapped = 0
+
+        try:
+            os.remove("/tmp/cubey_nav2_live_map.json")
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            self.get_logger().warn(f"Could not clear live map IPC file: {e}")
+
+        def request_slam_reset(_=None):
+            if not self.reset_slam_client.wait_for_service(timeout_sec=2.0):
+                self.state = "ERROR"
+                self.get_logger().error("SLAM Toolbox reset service is unavailable.")
+                return
+            request = Reset.Request()
+            request.pause_new_measurements = False
+            future = self.reset_slam_client.call_async(request)
+            future.add_done_callback(
+                lambda completed: self._on_mapping_reset(completed, start_after_reset)
+            )
+
+        if self.reset_odom_client.wait_for_service(timeout_sec=2.0):
+            odom_future = self.reset_odom_client.call_async(Trigger.Request())
+            odom_future.add_done_callback(request_slam_reset)
+        else:
+            self.get_logger().warn("Odometry reset service unavailable; resetting SLAM only.")
+            request_slam_reset()
+
+    def _on_mapping_reset(self, future, start_after_reset: bool):
+        try:
+            response = future.result()
+            if response.result != Reset.Response.RESULT_SUCCESS:
+                self.state = "ERROR"
+                self.get_logger().error(f"SLAM reset failed with result code {response.result}.")
+                return
+        except Exception as e:
+            self.state = "ERROR"
+            self.get_logger().error(f"SLAM reset failed: {e}")
+            return
+
+        self.start_pose = (0.0, 0.0, 0.0)
+        if start_after_reset:
+            self.state = "EXPLORING"
+            self.exploration_start_time = time.time()
+            self.get_logger().info("Fresh SLAM map ready; native Nav2 exploration started.")
+        else:
+            self.state = "IDLE"
+            self.get_logger().info("SLAM map and odometry reset to a blank origin.")
 
     # ------------------------------------------------------------------
     # Telemetry & Callbacks
@@ -232,16 +299,38 @@ class CubeyFrontierExplorerNode(Node):
         siny_cosp = 2.0 * (ori.w * ori.z + ori.x * ori.y)
         cosy_cosp = 1.0 - 2.0 * (ori.y * ori.y + ori.z * ori.z)
         yaw = math.atan2(siny_cosp, cosy_cosp)
-        self.robot_pose = (pos.x, pos.y, yaw)
+        self.odom_pose = (pos.x, pos.y, yaw)
+
+    def _update_robot_pose_from_tf(self):
+        """Use the SLAM-corrected map->base pose for goals and the web trail."""
+        if self.state == "RESETTING":
+            return
+        try:
+            transform = self.tf_buffer.lookup_transform("map", "base_link", Time())
+        except TransformException:
+            return
+
+        translation = transform.transform.translation
+        rotation = transform.transform.rotation
+        siny_cosp = 2.0 * (rotation.w * rotation.z + rotation.x * rotation.y)
+        cosy_cosp = 1.0 - 2.0 * (rotation.y * rotation.y + rotation.z * rotation.z)
+        yaw = math.atan2(siny_cosp, cosy_cosp)
+        self.robot_pose = (translation.x, translation.y, yaw)
 
         # Track trajectory for web canvas
-        if not self.trajectory or math.hypot(pos.x - self.trajectory[-1][0], pos.y - self.trajectory[-1][1]) > 0.05:
-            self.trajectory.append([round(pos.x, 3), round(pos.y, 3)])
+        if not self.trajectory or math.hypot(
+            translation.x - self.trajectory[-1][0],
+            translation.y - self.trajectory[-1][1],
+        ) > 0.05:
+            self.trajectory.append([round(translation.x, 3), round(translation.y, 3)])
             if len(self.trajectory) > 5000:
                 self.trajectory = self.trajectory[-4000:]
 
     def _on_map(self, msg: OccupancyGrid):
+        if self.state == "RESETTING":
+            return
         self.latest_map = msg
+        self._update_robot_pose_from_tf()
 
         # Export live map & pose directly for Cubey Web Panel Canvas
         try:
@@ -276,6 +365,12 @@ class CubeyFrontierExplorerNode(Node):
         self._start_exploration()
         response.success = True
         response.message = "Autonomous exploration started."
+        return response
+
+    def _handle_reset_mapping(self, request, response):
+        self._reset_mapping(start_after_reset=False)
+        response.success = True
+        response.message = "SLAM reset requested."
         return response
 
     def _handle_stop_exploration(self, request, response):
@@ -509,6 +604,7 @@ class CubeyFrontierExplorerNode(Node):
 
     def _supervision_loop(self):
         """Main state machine controlling frontier exploration and auto-stop."""
+        self._update_robot_pose_from_tf()
         if self.state not in ("EXPLORING", "RETURNING_TO_DOCK"):
             return
 
@@ -662,6 +758,7 @@ class CubeyFrontierExplorerNode(Node):
 
     def _publish_status(self):
         """Broadcasts exploration status JSON on /cubey/exploration_status."""
+        self._update_robot_pose_from_tf()
         dist_m = 0.0
         if self.current_goal_coord and self.robot_pose:
             dist_m = math.hypot(
