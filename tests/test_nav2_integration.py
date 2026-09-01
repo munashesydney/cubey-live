@@ -6,10 +6,24 @@ import numpy as np
 
 from ros2.nodes.cubey_odometry_node import CubeyOdometryNode
 from ros2.nodes.cubey_frontier_explorer_node import CubeyFrontierExplorerNode
+from ros2.nodes.cmd_vel_serial_bridge import apply_minimum_effective_command
 from src.services.navigation.cubey_nav_service import CubeyNavService
 
 
 class Nav2IntegrationTests(unittest.TestCase):
+    def test_motor_floor_scales_weak_nav2_vector_without_changing_direction(self):
+        self.assertEqual(
+            apply_minimum_effective_command(100, -50, 25, 390),
+            (390, -195, 98),
+        )
+
+    def test_motor_floor_preserves_stop_and_strong_commands(self):
+        self.assertEqual(apply_minimum_effective_command(0, 0, 0, 390), (0, 0, 0))
+        self.assertEqual(
+            apply_minimum_effective_command(250, 0, -800, 390),
+            (250, 0, -800),
+        )
+
     def test_frontier_success_requires_slam_pose_near_goal(self):
         explorer = object.__new__(CubeyFrontierExplorerNode)
         explorer.robot_pose = (0.0, 0.0, 0.0)

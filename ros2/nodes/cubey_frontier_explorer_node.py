@@ -349,7 +349,16 @@ class CubeyFrontierExplorerNode(Node):
 
         self.latest_scan_hits = hits
         try:
-            scan_payload = {"laser_scan": hits, "timestamp": now}
+            scan_rate_hz = (
+                round(1.0 / float(msg.scan_time), 1)
+                if math.isfinite(float(msg.scan_time)) and float(msg.scan_time) > 0.0
+                else 0.0
+            )
+            scan_payload = {
+                "laser_scan": hits,
+                "scan_rate_hz": scan_rate_hz,
+                "timestamp": now,
+            }
             tmp_scan = "/tmp/cubey_nav2_live_scan.json"
             tmp_write = "/tmp/cubey_nav2_live_scan.json.tmp"
             with open(tmp_write, "w") as scan_file:

@@ -162,6 +162,9 @@ async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(
                         scan_age = time.time() - scan_timestamp
                         if scan_age <= 1.0:
                             payload["laser_scan"] = nav2_scan.get("laser_scan", [])
+                            ros_scan_rate = nav2_scan.get("scan_rate_hz")
+                            if isinstance(ros_scan_rate, (int, float)) and ros_scan_rate > 0:
+                                payload["lidar_rate_hz"] = round(float(ros_scan_rate), 1)
                     except Exception:
                         pass
 

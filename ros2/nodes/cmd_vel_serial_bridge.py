@@ -7,6 +7,8 @@ velocities to normalized [-1000..1000] integer space, and dispatches TWIST packe
 to the ESP32 (cubey_wheels) over hardware UART (/dev/ttyAMA0 @ 115200 baud).
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import os
@@ -34,6 +36,26 @@ logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(levelname)s] [c
 logger = logging.getLogger("cmd_vel_bridge")
 
 
+def apply_minimum_effective_command(
+    forward: int,
+    left: int,
+    counter_clockwise: int,
+    minimum: int,
+) -> tuple[int, int, int]:
+    """Raise a nonzero command vector above the drivetrain's static-friction floor."""
+    peak = max(abs(forward), abs(left), abs(counter_clockwise))
+    minimum = max(0, min(1000, int(minimum)))
+    if peak == 0 or minimum == 0 or peak >= minimum:
+        return forward, left, counter_clockwise
+
+    scale = minimum / peak
+    return (
+        int(round(forward * scale)),
+        int(round(left * scale)),
+        int(round(counter_clockwise * scale)),
+    )
+
+
 class CmdVelSerialBridgeNode(Node):
     """Bridges ROS 2 /cmd_vel velocity commands to Cubey's ESP32 mecanum controller."""
 
@@ -46,6 +68,10 @@ class CmdVelSerialBridgeNode(Node):
         self.declare_parameter("max_linear_x_mps", 0.30)
         self.declare_parameter("max_linear_y_mps", 0.25)
         self.declare_parameter("max_angular_z_radps", 1.80)
+        # The ESP32 runs the motors at speed 180/255. A normalized command of
+        # 390 therefore produces about 70 PWM, the firmware's proven minimum
+        # useful motor-test power. Lower values only make Cubey's motors buzz.
+        self.declare_parameter("minimum_effective_command", 390)
         self.declare_parameter("command_timeout_sec", 0.40)
         self.declare_parameter("publish_rate_hz", 20.0)
 
@@ -54,6 +80,9 @@ class CmdVelSerialBridgeNode(Node):
         self.max_vx = float(self.get_parameter("max_linear_x_mps").value)
         self.max_vy = float(self.get_parameter("max_linear_y_mps").value)
         self.max_wz = float(self.get_parameter("max_angular_z_radps").value)
+        self.minimum_effective_command = int(
+            self.get_parameter("minimum_effective_command").value
+        )
         self.timeout_sec = float(self.get_parameter("command_timeout_sec").value)
         self.publish_rate = float(self.get_parameter("publish_rate_hz").value)
 
@@ -125,6 +154,12 @@ class CmdVelSerialBridgeNode(Node):
         fwd = int(max(-1.0, min(1.0, vx / self.max_vx)) * 1000) if self.max_vx > 0 else 0
         left = int(max(-1.0, min(1.0, vy / self.max_vy)) * 1000) if self.max_vy > 0 else 0
         ccw = int(max(-1.0, min(1.0, wz / self.max_wz)) * 1000) if self.max_wz > 0 else 0
+        fwd, left, ccw = apply_minimum_effective_command(
+            fwd,
+            left,
+            ccw,
+            self.minimum_effective_command,
+        )
 
         self.target_forward = fwd
         self.target_left = left
