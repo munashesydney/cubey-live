@@ -28,6 +28,7 @@ def generate_launch_description():
     explore = LaunchConfiguration("explore", default="false")
 
     lifecycle_nodes = [
+        "slam_toolbox",
         "controller_server",
         "planner_server",
         "behavior_server",
