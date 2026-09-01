@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 
 from ros2.nodes.cubey_odometry_node import CubeyOdometryNode
+from ros2.nodes import cubey_frontier_explorer_node as frontier_explorer_module
 from ros2.nodes.cubey_frontier_explorer_node import CubeyFrontierExplorerNode
 from ros2.nodes.cmd_vel_serial_bridge import (
     MinimumEffectiveCommandPulseFilter,
@@ -82,6 +83,63 @@ class Nav2IntegrationTests(unittest.TestCase):
 
         self.assertFalse(explorer._goal_is_physically_reached((-0.18, -0.15)))
         self.assertTrue(explorer._goal_is_physically_reached((0.05, 0.04)))
+
+    def test_frontier_blacklist_uses_stable_world_coordinate_radius(self):
+        explorer = object.__new__(CubeyFrontierExplorerNode)
+        explorer.blacklist = []
+        explorer.frontier_blacklist_radius_m = 0.40
+
+        with patch("ros2.nodes.cubey_frontier_explorer_node.time.time", return_value=100.0):
+            explorer._blacklist_coord((3.25, -0.18))
+
+        self.assertTrue(explorer._coord_is_blacklisted((3.21, 0.01)))
+        self.assertTrue(explorer._coord_is_blacklisted((3.48, -0.35)))
+        self.assertFalse(explorer._coord_is_blacklisted((3.80, -0.18)))
+        self.assertEqual(explorer.blacklist, [(3.25, -0.18, 700.0)])
+
+    def test_frontier_selection_preflights_with_nav2_global_planner(self):
+        source = Path("ros2/nodes/cubey_frontier_explorer_node.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("ComputePathToPose", source)
+        self.assertIn('ActionClient(self, ComputePathToPose, "compute_path_to_pose")', source)
+        self.assertIn("_queue_reachable_frontier_selection(frontiers)", source)
+
+    def test_successful_planner_preflight_dispatches_navigation_goal(self):
+        explorer = object.__new__(CubeyFrontierExplorerNode)
+        explorer.frontier_selection_generation = 4
+        explorer.state = "EXPLORING"
+        explorer.active_plan_handle = MagicMock()
+        explorer.frontier_plan_queue = [(9.0, 9.0, 0.0, 9.1, 9.1, 3)]
+        explorer.planning_frontier = True
+        explorer.zero_frontier_cycles = 2
+        explorer.get_logger = MagicMock(return_value=MagicMock())
+        explorer._send_nav2_goal = MagicMock()
+        wrapped_result = MagicMock()
+        wrapped_result.status = 4
+        wrapped_result.result.path.poses = [MagicMock()]
+        future = MagicMock()
+        future.result.return_value = wrapped_result
+        candidate = (1.0, 2.0, 0.5, 1.1, 2.1, 12)
+
+        with patch.object(
+            frontier_explorer_module,
+            "GoalStatus",
+            MagicMock(STATUS_SUCCEEDED=4),
+            create=True,
+        ):
+            explorer._on_plan_result(future, 4, candidate)
+
+        explorer._send_nav2_goal.assert_called_once_with(
+            1.0,
+            2.0,
+            0.5,
+            frontier_coord=(1.1, 2.1),
+        )
+        self.assertFalse(explorer.planning_frontier)
+        self.assertEqual(explorer.frontier_plan_queue, [])
+        self.assertEqual(explorer.zero_frontier_cycles, 0)
 
     def test_scan_match_does_not_translate_identical_stationary_scans(self):
         node = object.__new__(CubeyOdometryNode)

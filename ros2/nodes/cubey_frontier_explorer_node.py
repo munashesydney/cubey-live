@@ -42,7 +42,7 @@ try:
     from geometry_msgs.msg import PoseStamped
     from std_msgs.msg import String
     from std_srvs.srv import Trigger
-    from nav2_msgs.action import NavigateToPose
+    from nav2_msgs.action import ComputePathToPose, NavigateToPose
     from action_msgs.msg import GoalStatus
     from slam_toolbox.srv import Pause, Reset, SaveMap
     from tf2_ros import Buffer, TransformException, TransformListener
@@ -66,6 +66,7 @@ class CubeyFrontierExplorerNode(Node):
         self.declare_parameter("goal_timeout_sec", 35.0)        # Max time before replanning a goal
         self.declare_parameter("min_goal_distance_m", 0.15)     # Accept close frontiers
         self.declare_parameter("max_goal_distance_m", 15.0)     # Max exploration horizon
+        self.declare_parameter("frontier_blacklist_radius_m", 0.40)
         self.declare_parameter("map_save_dir", "/home/cubey/Desktop/cubey-live/data/maps")
 
         self.autostart = bool(self.get_parameter("autostart").value)
@@ -75,6 +76,9 @@ class CubeyFrontierExplorerNode(Node):
         self.goal_timeout_sec = float(self.get_parameter("goal_timeout_sec").value)
         self.min_goal_dist = float(self.get_parameter("min_goal_distance_m").value)
         self.max_goal_dist = float(self.get_parameter("max_goal_distance_m").value)
+        self.frontier_blacklist_radius_m = float(
+            self.get_parameter("frontier_blacklist_radius_m").value
+        )
         self.map_save_dir = str(self.get_parameter("map_save_dir").value)
 
         # State tracking
@@ -94,7 +98,13 @@ class CubeyFrontierExplorerNode(Node):
         self.current_frontier_coord: Optional[Tuple[float, float]] = None
         self.goal_start_time: float = 0.0
         self.active_goal_handle = None
-        self.blacklist: Dict[Tuple[int, int], float] = {}       # (gx, gy) -> expiry timestamp
+        self.active_plan_handle = None
+        # World-frame entries remain valid when SLAM grows the occupancy grid
+        # and changes its grid origin. Each entry is (x_m, y_m, expiry_time).
+        self.blacklist: List[Tuple[float, float, float]] = []
+        self.frontier_plan_queue: List[Tuple[float, float, float, float, float, int]] = []
+        self.planning_frontier: bool = False
+        self.frontier_selection_generation: int = 0
         self.zero_frontier_cycles: int = 0
         self.total_frontiers_mapped: int = 0
 
@@ -144,6 +154,7 @@ class CubeyFrontierExplorerNode(Node):
 
         # Nav2 NavigateToPose Action Client
         self.nav_client = ActionClient(self, NavigateToPose, "navigate_to_pose")
+        self.planner_client = ActionClient(self, ComputePathToPose, "compute_path_to_pose")
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.pause_slam_client = self.create_client(Pause, "/slam_toolbox/pause_new_measurements")
@@ -502,8 +513,8 @@ class CubeyFrontierExplorerNode(Node):
         valid_clusters: List[Tuple[float, float, int]] = []
         now = time.time()
 
-        # Clean expired blacklist entries
-        self.blacklist = {k: v for k, v in self.blacklist.items() if v > now}
+        # Clean expired world-coordinate blacklist entries.
+        self.blacklist = [entry for entry in self.blacklist if entry[2] > now]
 
         robot_x, robot_y = self.robot_pose[:2] if self.robot_pose else (0.0, 0.0)
 
@@ -543,9 +554,9 @@ class CubeyFrontierExplorerNode(Node):
             wx = origin_x + (avg_c + 0.5) * res
             wy = origin_y + (avg_r + 0.5) * res
 
-            # Check blacklist
-            grid_key = (int(round(avg_r)), int(round(avg_c)))
-            if grid_key in self.blacklist:
+            # Exclude the whole failed physical region. Grid indices cannot be
+            # used here because SLAM changes the map origin as the map expands.
+            if self._coord_is_blacklisted((wx, wy)):
                 continue
 
             # Distance filter
@@ -568,6 +579,134 @@ class CubeyFrontierExplorerNode(Node):
     # Nav2 Action Client Coordination
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _pose_stamped(node, x_m: float, y_m: float, yaw: float) -> PoseStamped:
+        pose = PoseStamped()
+        pose.header.frame_id = "map"
+        pose.header.stamp = node.get_clock().now().to_msg()
+        pose.pose.position.x = float(x_m)
+        pose.pose.position.y = float(y_m)
+        pose.pose.position.z = 0.0
+        pose.pose.orientation.z = math.sin(yaw / 2.0)
+        pose.pose.orientation.w = math.cos(yaw / 2.0)
+        return pose
+
+    def _queue_reachable_frontier_selection(
+        self,
+        frontiers: List[Tuple[float, float, int]],
+    ) -> None:
+        """Ask Nav2's global planner to validate candidates before navigation."""
+        if self.planning_frontier or self.current_goal_coord is not None:
+            return
+        if not self.planner_client.wait_for_server(timeout_sec=1.0):
+            self.get_logger().warn("Nav2 compute_path_to_pose action server not yet ready.")
+            return
+
+        robot_x, robot_y = self.robot_pose[:2] if self.robot_pose else (0.0, 0.0)
+        candidates: List[Tuple[float, float, float, float, float, int]] = []
+        for frontier_x, frontier_y, frontier_size in frontiers:
+            distance = math.hypot(frontier_x - robot_x, frontier_y - robot_y)
+            if distance > 0.35:
+                pull_back = min(0.20, distance * 0.35, distance - 0.30)
+                target_x = frontier_x - ((frontier_x - robot_x) / distance) * pull_back
+                target_y = frontier_y - ((frontier_y - robot_y) / distance) * pull_back
+            else:
+                target_x, target_y = frontier_x, frontier_y
+            target_yaw = math.atan2(frontier_y - robot_y, frontier_x - robot_x)
+            candidates.append(
+                (target_x, target_y, target_yaw, frontier_x, frontier_y, frontier_size)
+            )
+
+        self.frontier_plan_queue = candidates
+        self.planning_frontier = True
+        self.frontier_selection_generation += 1
+        self._plan_next_frontier(self.frontier_selection_generation)
+
+    def _plan_next_frontier(self, generation: int) -> None:
+        if generation != self.frontier_selection_generation or self.state != "EXPLORING":
+            return
+        if not self.frontier_plan_queue:
+            self.planning_frontier = False
+            self.get_logger().info(
+                "No Nav2-reachable frontier remains in this map update; "
+                "waiting for accessible-frontier completion."
+            )
+            return
+
+        candidate = self.frontier_plan_queue.pop(0)
+        target_x, target_y, target_yaw, _, _, _ = candidate
+        goal = ComputePathToPose.Goal()
+        goal.goal = self._pose_stamped(self, target_x, target_y, target_yaw)
+        goal.planner_id = "GridBased"
+        goal.use_start = False
+        future = self.planner_client.send_goal_async(goal)
+        future.add_done_callback(
+            lambda completed: self._on_plan_goal_response(completed, generation, candidate)
+        )
+
+    def _on_plan_goal_response(self, future, generation: int, candidate) -> None:
+        if generation != self.frontier_selection_generation or self.state != "EXPLORING":
+            return
+        try:
+            goal_handle = future.result()
+        except Exception as error:
+            self.get_logger().warn(f"Nav2 frontier plan request failed: {error}")
+            self._reject_planned_frontier(candidate, generation)
+            return
+        if not goal_handle.accepted:
+            self._reject_planned_frontier(candidate, generation)
+            return
+        self.active_plan_handle = goal_handle
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(
+            lambda completed: self._on_plan_result(completed, generation, candidate)
+        )
+
+    def _on_plan_result(self, future, generation: int, candidate) -> None:
+        if generation != self.frontier_selection_generation or self.state != "EXPLORING":
+            return
+        self.active_plan_handle = None
+        try:
+            wrapped_result = future.result()
+            path_found = (
+                wrapped_result.status == GoalStatus.STATUS_SUCCEEDED
+                and bool(wrapped_result.result.path.poses)
+            )
+        except Exception as error:
+            self.get_logger().warn(f"Nav2 frontier plan result failed: {error}")
+            path_found = False
+
+        if not path_found:
+            self._reject_planned_frontier(candidate, generation)
+            return
+
+        target_x, target_y, target_yaw, frontier_x, frontier_y, frontier_size = candidate
+        remaining = len(self.frontier_plan_queue) + 1
+        self.frontier_plan_queue = []
+        self.planning_frontier = False
+        self.zero_frontier_cycles = 0
+        self.get_logger().info(
+            f"🤖 [AutoNav] Dispatching reachable Nav2 Goal -> "
+            f"({target_x:.2f}m, {target_y:.2f}m, Frontier: "
+            f"[{frontier_x:.2f}, {frontier_y:.2f}], Cluster: "
+            f"{frontier_size} cells). Candidates checked/remaining: {remaining}"
+        )
+        self._send_nav2_goal(
+            target_x,
+            target_y,
+            target_yaw,
+            frontier_coord=(frontier_x, frontier_y),
+        )
+
+    def _reject_planned_frontier(self, candidate, generation: int) -> None:
+        _, _, _, frontier_x, frontier_y, _ = candidate
+        self._blacklist_coord((frontier_x, frontier_y))
+        self.get_logger().info(
+            f"Nav2 planner rejected frontier region near "
+            f"({frontier_x:.2f}, {frontier_y:.2f}); trying the next candidate."
+        )
+        self._plan_next_frontier(generation)
+
     def _send_nav2_goal(
         self,
         target_x: float,
@@ -586,15 +725,7 @@ class CubeyFrontierExplorerNode(Node):
             return
 
         goal_msg = NavigateToPose.Goal()
-        goal_msg.pose.header.frame_id = "map"
-        goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
-        goal_msg.pose.pose.position.x = float(target_x)
-        goal_msg.pose.pose.position.y = float(target_y)
-        goal_msg.pose.pose.position.z = 0.0
-
-        # Yaw to quaternion
-        goal_msg.pose.pose.orientation.z = math.sin(target_yaw / 2.0)
-        goal_msg.pose.pose.orientation.w = math.cos(target_yaw / 2.0)
+        goal_msg.pose = self._pose_stamped(self, target_x, target_y, target_yaw)
 
         self.current_goal_coord = (target_x, target_y)
         self.current_frontier_coord = frontier_coord
@@ -680,6 +811,15 @@ class CubeyFrontierExplorerNode(Node):
         return self._distance_to_goal(goal) <= tolerance_m
 
     def _cancel_active_nav_goal(self):
+        self.frontier_selection_generation += 1
+        self.frontier_plan_queue = []
+        self.planning_frontier = False
+        if self.active_plan_handle:
+            try:
+                self.active_plan_handle.cancel_goal_async()
+            except Exception as e:
+                self.get_logger().warn(f"Error cancelling frontier plan: {e}")
+        self.active_plan_handle = None
         if self.active_goal_handle:
             try:
                 self.active_goal_handle.cancel_goal_async()
@@ -690,19 +830,17 @@ class CubeyFrontierExplorerNode(Node):
         self.current_frontier_coord = None
 
     def _blacklist_coord(self, coord: Tuple[float, float]):
-        if not self.latest_map:
-            return
-        res = self.latest_map.info.resolution
-        origin_x = self.latest_map.info.origin.position.x
-        origin_y = self.latest_map.info.origin.position.y
-        gx = int((coord[0] - origin_x) / res)
-        gy = int((coord[1] - origin_y) / res)
-        expires_at = time.time() + 45.0
-        # Cover the centroid cell and its immediate neighbors so rounding a
-        # frontier centroid cannot recreate the same failed target.
-        for row_offset in (-1, 0, 1):
-            for col_offset in (-1, 0, 1):
-                self.blacklist[(gy + row_offset, gx + col_offset)] = expires_at
+        # Keep failed regions excluded for the whole practical mission. A short
+        # expiry allowed the recovery loop to revisit them before mapping ended.
+        expires_at = time.time() + 600.0
+        self.blacklist.append((float(coord[0]), float(coord[1]), expires_at))
+
+    def _coord_is_blacklisted(self, coord: Tuple[float, float]) -> bool:
+        return any(
+            math.hypot(coord[0] - blocked_x, coord[1] - blocked_y)
+            <= self.frontier_blacklist_radius_m
+            for blocked_x, blocked_y, _ in self.blacklist
+        )
 
     # ------------------------------------------------------------------
     # High-Level Exploration & Auto-Stop State Machine
@@ -762,38 +900,10 @@ class CubeyFrontierExplorerNode(Node):
             else:
                 self.zero_frontier_cycles = 0
 
-            # If already driving to an active goal, let it complete
-            if self.current_goal_coord is not None:
+            # If already driving or asking Nav2 to validate candidates, let it complete.
+            if self.current_goal_coord is not None or self.planning_frontier:
                 return
-
-            # Pick highest-utility frontier
-            best_x, best_y, best_size = frontiers[0]
-            robot_x, robot_y = self.robot_pose[:2] if self.robot_pose else (0.0, 0.0)
-
-            # Pull goal 20cm back toward robot into confirmed free space
-            dist_to_robot = math.hypot(best_x - robot_x, best_y - robot_y)
-            if dist_to_robot > 0.35:
-                # Keep the resulting goal at least 30 cm away. Very short goals
-                # can be mistaken for orientation-only completion by Nav2.
-                pull_back = min(0.20, dist_to_robot * 0.35, dist_to_robot - 0.30)
-                nav_target_x = best_x - ((best_x - robot_x) / dist_to_robot) * pull_back
-                nav_target_y = best_y - ((best_y - robot_y) / dist_to_robot) * pull_back
-            else:
-                nav_target_x, nav_target_y = best_x, best_y
-
-            # Orient robot heading toward the frontier centroid
-            target_yaw = math.atan2(best_y - robot_y, best_x - robot_x)
-
-            self.get_logger().info(
-                f"🤖 [AutoNav] Dispatching Nav2 Goal -> ({nav_target_x:.2f}m, {nav_target_y:.2f}m, "
-                f"Frontier: [{best_x:.2f}, {best_y:.2f}], Cluster: {best_size} cells). Remaining frontiers: {len(frontiers)}"
-            )
-            self._send_nav2_goal(
-                nav_target_x,
-                nav_target_y,
-                target_yaw,
-                frontier_coord=(best_x, best_y),
-            )
+            self._queue_reachable_frontier_selection(frontiers)
 
     # ------------------------------------------------------------------
     # 4-Phase Auto-Stop Execution
