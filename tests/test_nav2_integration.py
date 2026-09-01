@@ -6,7 +6,10 @@ import numpy as np
 
 from ros2.nodes.cubey_odometry_node import CubeyOdometryNode
 from ros2.nodes.cubey_frontier_explorer_node import CubeyFrontierExplorerNode
-from ros2.nodes.cmd_vel_serial_bridge import apply_minimum_effective_command
+from ros2.nodes.cmd_vel_serial_bridge import (
+    MinimumEffectiveCommandPulseFilter,
+    apply_minimum_effective_command,
+)
 from src.services.navigation.cubey_nav_service import CubeyNavService
 
 
@@ -23,6 +26,32 @@ class Nav2IntegrationTests(unittest.TestCase):
             apply_minimum_effective_command(250, 0, -800, 390),
             (250, 0, -800),
         )
+
+    def test_motor_pulse_filter_preserves_weak_command_average(self):
+        command_filter = MinimumEffectiveCommandPulseFilter(390)
+
+        outputs = [command_filter.apply(78, -39, 0) for _ in range(10)]
+
+        self.assertEqual(sum(output[0] for output in outputs), 780)
+        self.assertEqual(sum(output[1] for output in outputs), -390)
+        self.assertEqual(sum(output[2] for output in outputs), 0)
+        self.assertEqual(sum(output != (0, 0, 0) for output in outputs), 2)
+
+    def test_motor_pulse_filter_resets_pending_pulse_on_direction_reversal(self):
+        command_filter = MinimumEffectiveCommandPulseFilter(390)
+        for _ in range(3):
+            self.assertEqual(command_filter.apply(100, 0, 0), (0, 0, 0))
+
+        self.assertEqual(command_filter.apply(-100, 0, 0), (0, 0, 0))
+        self.assertEqual(command_filter.apply(-100, 0, 0), (0, 0, 0))
+        self.assertEqual(command_filter.apply(-100, 0, 0), (0, 0, 0))
+        self.assertEqual(command_filter.apply(-100, 0, 0), (-390, 0, 0))
+
+    def test_motor_pulse_filter_preserves_stop_and_strong_commands(self):
+        command_filter = MinimumEffectiveCommandPulseFilter(390)
+
+        self.assertEqual(command_filter.apply(900, 0, -450), (900, 0, -450))
+        self.assertEqual(command_filter.apply(0, 0, 0), (0, 0, 0))
 
     def test_frontier_success_requires_slam_pose_near_goal(self):
         explorer = object.__new__(CubeyFrontierExplorerNode)

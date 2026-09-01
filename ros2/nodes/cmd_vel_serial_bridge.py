@@ -56,6 +56,57 @@ def apply_minimum_effective_command(
     )
 
 
+class MinimumEffectiveCommandPulseFilter:
+    """Preserve weak command averages using short, motor-effective pulses."""
+
+    def __init__(self, minimum: int):
+        self.minimum = max(0, min(1000, int(minimum)))
+        self._accumulator = 0
+        self._last_command: Optional[tuple[int, int, int]] = None
+
+    def reset(self):
+        self._accumulator = 0
+        self._last_command = None
+
+    def apply(
+        self,
+        forward: int,
+        left: int,
+        counter_clockwise: int,
+    ) -> tuple[int, int, int]:
+        command = (forward, left, counter_clockwise)
+        peak = max(abs(value) for value in command)
+
+        if peak == 0:
+            self.reset()
+            return command
+
+        if self.minimum == 0 or peak >= self.minimum:
+            self.reset()
+            return command
+
+        # Do not spend accumulated demand in a newly reversed direction. This
+        # matters when Nav2 crosses its target heading and changes turn sign.
+        if self._last_command is not None:
+            direction_dot = sum(
+                previous * current
+                for previous, current in zip(self._last_command, command)
+            )
+            if direction_dot <= 0:
+                self._accumulator = 0
+        self._last_command = command
+
+        # Integer pulse-density modulation: over time, the emitted command's
+        # average equals Nav2's requested magnitude, while each nonzero pulse
+        # reaches the drivetrain's usable static-friction threshold.
+        self._accumulator += peak
+        if self._accumulator < self.minimum:
+            return (0, 0, 0)
+
+        self._accumulator -= self.minimum
+        return apply_minimum_effective_command(*command, self.minimum)
+
+
 class CmdVelSerialBridgeNode(Node):
     """Bridges ROS 2 /cmd_vel velocity commands to Cubey's ESP32 mecanum controller."""
 
@@ -92,6 +143,9 @@ class CmdVelSerialBridgeNode(Node):
         self.target_forward = 0
         self.target_left = 0
         self.target_ccw = 0
+        self.command_filter = MinimumEffectiveCommandPulseFilter(
+            self.minimum_effective_command
+        )
         self.last_cmd_time = time.time()
         self.is_active = False
 
@@ -154,12 +208,6 @@ class CmdVelSerialBridgeNode(Node):
         fwd = int(max(-1.0, min(1.0, vx / self.max_vx)) * 1000) if self.max_vx > 0 else 0
         left = int(max(-1.0, min(1.0, vy / self.max_vy)) * 1000) if self.max_vy > 0 else 0
         ccw = int(max(-1.0, min(1.0, wz / self.max_wz)) * 1000) if self.max_wz > 0 else 0
-        fwd, left, ccw = apply_minimum_effective_command(
-            fwd,
-            left,
-            ccw,
-            self.minimum_effective_command,
-        )
 
         self.target_forward = fwd
         self.target_left = left
@@ -176,12 +224,18 @@ class CmdVelSerialBridgeNode(Node):
                 self.target_forward = 0
                 self.target_left = 0
                 self.target_ccw = 0
+                self.command_filter.reset()
                 self.is_active = False
                 self._send_raw("TWIST:0,0,0\n")
             return
 
         if self.is_active:
-            packet = f"TWIST:{self.target_forward},{self.target_left},{self.target_ccw}\n"
+            forward, left, ccw = self.command_filter.apply(
+                self.target_forward,
+                self.target_left,
+                self.target_ccw,
+            )
+            packet = f"TWIST:{forward},{left},{ccw}\n"
             self._send_raw(packet)
 
     def _send_raw(self, packet: str):
@@ -251,6 +305,7 @@ class CmdVelSerialBridgeNode(Node):
                             self.target_forward = 0
                             self.target_left = 0
                             self.target_ccw = 0
+                            self.command_filter.reset()
                         elif "vx" in cmd or "wz" in cmd:
                             vx = float(cmd.get("vx", 0.0))
                             vy = float(cmd.get("vy", 0.0))
@@ -268,6 +323,7 @@ class CmdVelSerialBridgeNode(Node):
                         self.target_forward = 0
                         self.target_left = 0
                         self.target_ccw = 0
+                        self.command_filter.reset()
                         self.last_cmd_time = time.time()
                         self.is_active = True
                         self._send_raw("TWIST:0,0,0\n")
