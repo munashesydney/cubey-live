@@ -64,7 +64,7 @@ def generate_launch_description():
                 "serial_port": lidar_port,
                 "serial_baudrate": lidar_baud,
                 "frame_id": "laser",
-                "min_range": 0.05,
+                "min_range": 0.14,
                 "max_range": 12.0,
             }],
             output="screen",

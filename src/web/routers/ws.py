@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import secrets
+import time
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
 
@@ -146,6 +147,21 @@ async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(
                         payload["grid_compressed_b64"] = None
                         if send_grid and nav2_data.get("grid_compressed_b64"):
                             payload["grid_compressed_b64"] = nav2_data["grid_compressed_b64"]
+                    except Exception:
+                        pass
+
+                # The native ROS LiDAR owns the hardware, so its live points
+                # arrive through a small loopback IPC snapshot rather than the
+                # disabled legacy Python LiDAR service.
+                nav2_scan_file = "/tmp/cubey_nav2_live_scan.json"
+                if os.path.exists(nav2_scan_file):
+                    try:
+                        with open(nav2_scan_file, "r") as scan_file:
+                            nav2_scan = json.load(scan_file)
+                        scan_timestamp = float(nav2_scan.get("timestamp", 0.0))
+                        scan_age = time.time() - scan_timestamp
+                        if scan_age <= 1.0:
+                            payload["laser_scan"] = nav2_scan.get("laser_scan", [])
                     except Exception:
                         pass
 

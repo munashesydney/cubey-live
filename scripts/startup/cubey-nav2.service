@@ -11,7 +11,7 @@ User=__USER__
 Environment=HOME=__HOME__
 Environment=PYTHONUNBUFFERED=1
 WorkingDirectory=__PROJECT_ROOT__/ros2
-ExecStartPre=/usr/bin/rm -f /tmp/cubey_exploration_status.json /tmp/cubey_nav2_live_map.json /tmp/cubey_wheels_telemetry.txt
+ExecStartPre=/usr/bin/rm -f /tmp/cubey_exploration_status.json /tmp/cubey_nav2_live_map.json /tmp/cubey_nav2_live_scan.json /tmp/cubey_wheels_telemetry.txt
 ExecStart=/bin/bash __PROJECT_ROOT__/ros2/run_nav.sh
 Restart=always
 RestartSec=5

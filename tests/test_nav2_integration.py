@@ -5,10 +5,18 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 
 from ros2.nodes.cubey_odometry_node import CubeyOdometryNode
+from ros2.nodes.cubey_frontier_explorer_node import CubeyFrontierExplorerNode
 from src.services.navigation.cubey_nav_service import CubeyNavService
 
 
 class Nav2IntegrationTests(unittest.TestCase):
+    def test_frontier_success_requires_slam_pose_near_goal(self):
+        explorer = object.__new__(CubeyFrontierExplorerNode)
+        explorer.robot_pose = (0.0, 0.0, 0.0)
+
+        self.assertFalse(explorer._goal_is_physically_reached((-0.18, -0.15)))
+        self.assertTrue(explorer._goal_is_physically_reached((0.05, 0.04)))
+
     def test_scan_match_does_not_translate_identical_stationary_scans(self):
         node = object.__new__(CubeyOdometryNode)
         points = np.array(

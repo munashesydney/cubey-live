@@ -170,7 +170,8 @@ planner_server:
     planner_plugins: ["GridBased"]
     GridBased:
       plugin: "nav2_navfn_planner::NavfnPlanner"
-      tolerance: 0.45
+      # Never let a short frontier goal resolve to Cubey's current cell.
+      tolerance: 0.10
       use_astar: true
       allow_unknown: true
 

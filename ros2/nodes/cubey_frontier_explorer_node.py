@@ -38,6 +38,7 @@ try:
     from rclpy.action import ActionClient
     from rclpy.time import Time
     from nav_msgs.msg import OccupancyGrid, Odometry
+    from sensor_msgs.msg import LaserScan
     from geometry_msgs.msg import PoseStamped
     from std_msgs.msg import String
     from std_srvs.srv import Trigger
@@ -85,9 +86,12 @@ class CubeyFrontierExplorerNode(Node):
         self.start_pose: Tuple[float, float, float] = (0.0, 0.0, 0.0)
         self.latest_map: Optional[OccupancyGrid] = None
         self.trajectory: List[List[float]] = []
+        self.latest_scan_hits: List[List[float]] = []
+        self.last_scan_export_time: float = 0.0
 
         # Goal & Frontier Management
         self.current_goal_coord: Optional[Tuple[float, float]] = None
+        self.current_frontier_coord: Optional[Tuple[float, float]] = None
         self.goal_start_time: float = 0.0
         self.active_goal_handle = None
         self.blacklist: Dict[Tuple[int, int], float] = {}       # (gx, gy) -> expiry timestamp
@@ -106,6 +110,12 @@ class CubeyFrontierExplorerNode(Node):
             "/odom",
             self._on_odom,
             10
+        )
+        self.sub_scan = self.create_subscription(
+            LaserScan,
+            "/scan",
+            self._on_scan,
+            5,
         )
 
         # Publisher for external telemetry (Web UI / Gemini audio bridge)
@@ -226,6 +236,7 @@ class CubeyFrontierExplorerNode(Node):
         self._cancel_active_nav_goal()
         self.state = "IDLE"
         self.current_goal_coord = None
+        self.current_frontier_coord = None
         self.get_logger().info("Native Nav2 navigation stopped.")
 
     def _reset_mapping(self, start_after_reset: bool):
@@ -237,6 +248,7 @@ class CubeyFrontierExplorerNode(Node):
         self.robot_pose = None
         self.odom_pose = None
         self.trajectory = []
+        self.latest_scan_hits = []
         self.blacklist.clear()
         self.zero_frontier_cycles = 0
         self.total_frontiers_mapped = 0
@@ -247,6 +259,12 @@ class CubeyFrontierExplorerNode(Node):
             pass
         except OSError as e:
             self.get_logger().warn(f"Could not clear live map IPC file: {e}")
+        try:
+            os.remove("/tmp/cubey_nav2_live_scan.json")
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            self.get_logger().warn(f"Could not clear live scan IPC file: {e}")
 
         def request_slam_reset(_=None):
             if not self.reset_slam_client.wait_for_service(timeout_sec=2.0):
@@ -300,6 +318,45 @@ class CubeyFrontierExplorerNode(Node):
         cosy_cosp = 1.0 - 2.0 * (ori.y * ori.y + ori.z * ori.z)
         yaw = math.atan2(siny_cosp, cosy_cosp)
         self.odom_pose = (pos.x, pos.y, yaw)
+
+    def _on_scan(self, msg: LaserScan):
+        """Export real ROS LiDAR hits in map coordinates for the web canvas."""
+        now = time.time()
+        if now - self.last_scan_export_time < 0.20:
+            return
+        self.last_scan_export_time = now
+        self._update_robot_pose_from_tf()
+        if not self.robot_pose:
+            return
+
+        robot_x, robot_y, robot_yaw = self.robot_pose
+        cos_yaw = math.cos(robot_yaw)
+        sin_yaw = math.sin(robot_yaw)
+        hits: List[List[float]] = []
+
+        # Match the old mapper's proven self-reflection filter: Cubey's own
+        # chassis occupies the first 14 cm around the laser.
+        for index, range_m in enumerate(msg.ranges):
+            if not math.isfinite(range_m) or range_m < 0.14 or range_m > msg.range_max:
+                continue
+            angle = msg.angle_min + index * msg.angle_increment
+            laser_x = range_m * math.cos(angle)
+            laser_y = range_m * math.sin(angle)
+            base_x = laser_x - 0.035  # laser is 35 mm behind base_link
+            world_x = robot_x + base_x * cos_yaw - laser_y * sin_yaw
+            world_y = robot_y + base_x * sin_yaw + laser_y * cos_yaw
+            hits.append([round(world_x, 3), round(world_y, 3)])
+
+        self.latest_scan_hits = hits
+        try:
+            scan_payload = {"laser_scan": hits, "timestamp": now}
+            tmp_scan = "/tmp/cubey_nav2_live_scan.json"
+            tmp_write = "/tmp/cubey_nav2_live_scan.json.tmp"
+            with open(tmp_write, "w") as scan_file:
+                json.dump(scan_payload, scan_file)
+            os.replace(tmp_write, tmp_scan)
+        except OSError:
+            pass
 
     def _update_robot_pose_from_tf(self):
         """Use the SLAM-corrected map->base pose for goals and the web trail."""
@@ -502,7 +559,13 @@ class CubeyFrontierExplorerNode(Node):
     # Nav2 Action Client Coordination
     # ------------------------------------------------------------------
 
-    def _send_nav2_goal(self, target_x: float, target_y: float, target_yaw: float = 0.0):
+    def _send_nav2_goal(
+        self,
+        target_x: float,
+        target_y: float,
+        target_yaw: float = 0.0,
+        frontier_coord: Optional[Tuple[float, float]] = None,
+    ):
         """Dispatches an action goal to Nav2 bt_navigator."""
         if not self.nav_client.wait_for_server(timeout_sec=2.0):
             self.get_logger().warn("Nav2 navigate_to_pose action server not yet ready.")
@@ -525,6 +588,7 @@ class CubeyFrontierExplorerNode(Node):
         goal_msg.pose.pose.orientation.w = math.cos(target_yaw / 2.0)
 
         self.current_goal_coord = (target_x, target_y)
+        self.current_frontier_coord = frontier_coord
         self.goal_start_time = time.time()
 
         send_future = self.nav_client.send_goal_async(
@@ -537,9 +601,10 @@ class CubeyFrontierExplorerNode(Node):
         goal_handle = future.result()
         if not goal_handle.accepted:
             self.get_logger().warn("Nav2 rejected frontier goal! Blacklisting coordinate.")
-            if self.current_goal_coord and self.latest_map:
-                self._blacklist_coord(self.current_goal_coord)
+            if (self.current_frontier_coord or self.current_goal_coord) and self.latest_map:
+                self._blacklist_coord(self.current_frontier_coord or self.current_goal_coord)
             self.current_goal_coord = None
+            self.current_frontier_coord = None
             if self.state == "NAVIGATING":
                 self.state = "BLOCKED"
             elif self.state == "RETURNING_TO_DOCK":
@@ -560,17 +625,29 @@ class CubeyFrontierExplorerNode(Node):
         self.active_goal_handle = None
 
         if status == GoalStatus.STATUS_SUCCEEDED:
-            self.get_logger().info("🎯 Reached frontier waypoint successfully!")
-            if self.state == "RETURNING_TO_DOCK":
+            # Nav2 may occasionally report success after only rotating toward a
+            # short goal. Never count that as exploration unless SLAM confirms
+            # Cubey physically reached the target.
+            verified = self._goal_is_physically_reached(self.current_goal_coord)
+            if self.state == "EXPLORING" and not verified:
+                distance = self._distance_to_goal(self.current_goal_coord)
+                self.get_logger().warn(
+                    f"Nav2 reported success but SLAM pose is still {distance:.2f}m from the goal. "
+                    "Rejecting false success and blacklisting this frontier."
+                )
+                if self.current_frontier_coord:
+                    self._blacklist_coord(self.current_frontier_coord)
+            elif self.state == "RETURNING_TO_DOCK":
                 self._initiate_map_finalization()
             elif self.state == "NAVIGATING":
                 self.state = "REACHED"
             else:
+                self.get_logger().info("🎯 Reached frontier waypoint successfully!")
                 self.total_frontiers_mapped += 1
         else:
             self.get_logger().warn(f"Nav2 goal terminated with status: {status}. Blacklisting coordinate.")
-            if self.current_goal_coord:
-                self._blacklist_coord(self.current_goal_coord)
+            if self.current_frontier_coord or self.current_goal_coord:
+                self._blacklist_coord(self.current_frontier_coord or self.current_goal_coord)
             if self.state == "RETURNING_TO_DOCK":
                 self.get_logger().warn("Return-to-dock failed; saving the map at the current safe position.")
                 self._initiate_map_finalization()
@@ -578,6 +655,20 @@ class CubeyFrontierExplorerNode(Node):
                 self.state = "BLOCKED"
 
         self.current_goal_coord = None
+        self.current_frontier_coord = None
+
+    def _distance_to_goal(self, goal: Optional[Tuple[float, float]]) -> float:
+        if not goal or not self.robot_pose:
+            return float("inf")
+        return math.hypot(goal[0] - self.robot_pose[0], goal[1] - self.robot_pose[1])
+
+    def _goal_is_physically_reached(
+        self,
+        goal: Optional[Tuple[float, float]],
+        tolerance_m: float = 0.12,
+    ) -> bool:
+        """Validate Nav2 success against the SLAM-corrected physical pose."""
+        return self._distance_to_goal(goal) <= tolerance_m
 
     def _cancel_active_nav_goal(self):
         if self.active_goal_handle:
@@ -587,6 +678,7 @@ class CubeyFrontierExplorerNode(Node):
                 self.get_logger().warn(f"Error cancelling goal: {e}")
         self.active_goal_handle = None
         self.current_goal_coord = None
+        self.current_frontier_coord = None
 
     def _blacklist_coord(self, coord: Tuple[float, float]):
         if not self.latest_map:
@@ -596,7 +688,12 @@ class CubeyFrontierExplorerNode(Node):
         origin_y = self.latest_map.info.origin.position.y
         gx = int((coord[0] - origin_x) / res)
         gy = int((coord[1] - origin_y) / res)
-        self.blacklist[(gy, gx)] = time.time() + 45.0  # 45-second blacklist
+        expires_at = time.time() + 45.0
+        # Cover the centroid cell and its immediate neighbors so rounding a
+        # frontier centroid cannot recreate the same failed target.
+        for row_offset in (-1, 0, 1):
+            for col_offset in (-1, 0, 1):
+                self.blacklist[(gy + row_offset, gx + col_offset)] = expires_at
 
     # ------------------------------------------------------------------
     # High-Level Exploration & Auto-Stop State Machine
@@ -667,7 +764,9 @@ class CubeyFrontierExplorerNode(Node):
             # Pull goal 20cm back toward robot into confirmed free space
             dist_to_robot = math.hypot(best_x - robot_x, best_y - robot_y)
             if dist_to_robot > 0.35:
-                pull_back = min(0.20, dist_to_robot * 0.35)
+                # Keep the resulting goal at least 30 cm away. Very short goals
+                # can be mistaken for orientation-only completion by Nav2.
+                pull_back = min(0.20, dist_to_robot * 0.35, dist_to_robot - 0.30)
                 nav_target_x = best_x - ((best_x - robot_x) / dist_to_robot) * pull_back
                 nav_target_y = best_y - ((best_y - robot_y) / dist_to_robot) * pull_back
             else:
@@ -680,7 +779,12 @@ class CubeyFrontierExplorerNode(Node):
                 f"🤖 [AutoNav] Dispatching Nav2 Goal -> ({nav_target_x:.2f}m, {nav_target_y:.2f}m, "
                 f"Frontier: [{best_x:.2f}, {best_y:.2f}], Cluster: {best_size} cells). Remaining frontiers: {len(frontiers)}"
             )
-            self._send_nav2_goal(nav_target_x, nav_target_y, target_yaw)
+            self._send_nav2_goal(
+                nav_target_x,
+                nav_target_y,
+                target_yaw,
+                frontier_coord=(best_x, best_y),
+            )
 
     # ------------------------------------------------------------------
     # 4-Phase Auto-Stop Execution
