@@ -6,11 +6,15 @@ waypoint navigation, and teleoperation modes. Bridges between Gemini Live / Web
 interface and robot motion.
 """
 
+import json
 import math
 import logging
+import os
 import random
+import subprocess
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -104,9 +108,81 @@ class CubeyNavService:
         self._emit_telemetry()
         return True
 
+    def _is_ros2_explorer_active(self) -> bool:
+        """Check if native ROS 2 frontier explorer node is publishing heartbeats."""
+        status_file = "/tmp/cubey_exploration_status.json"
+        if not os.path.exists(status_file):
+            return False
+        try:
+            with open(status_file, "r") as f:
+                data = json.load(f)
+            return (time.time() - float(data.get("timestamp", 0))) < 4.0
+        except Exception:
+            return False
+
+    def _trigger_ros2_exploration(self, start: bool = True) -> bool:
+        """Trigger ROS 2 exploration start/stop service."""
+        srv = "/cubey/start_exploration" if start else "/cubey/stop_exploration"
+        pixi_bin = os.path.expanduser("~/.pixi/bin/pixi")
+        ros2_dir = "/home/cubey/Desktop/cubey-live/ros2"
+        if os.path.exists(pixi_bin) and os.path.exists(ros2_dir):
+            cmd = [pixi_bin, "run", "--manifest-path", f"{ros2_dir}/pixi.toml", "ros2", "service", "call", srv, "std_srvs/srv/Trigger"]
+        else:
+            cmd = ["ros2", "service", "call", srv, "std_srvs/srv/Trigger"]
+
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=2.5)
+            return res.returncode == 0 and "success=True" in res.stdout
+        except Exception as e:
+            logger.debug("Could not call ROS 2 service %s: %s", srv, e)
+            return False
+
+    def _monitor_ros2_exploration(self):
+        """Monitors /tmp/cubey_exploration_status.json while ROS 2 is autonomously exploring."""
+        mapping_svc = get_mapping_service()
+        status_file = "/tmp/cubey_exploration_status.json"
+        last_state = "IDLE"
+
+        while self._is_exploring:
+            try:
+                if os.path.exists(status_file):
+                    with open(status_file, "r") as f:
+                        data = json.load(f)
+
+                    st = data.get("state", "EXPLORING")
+                    if st != last_state:
+                        last_state = st
+                        self._emit_log(f"🤖 [Nav2] Exploration State: {st}")
+
+                    with self._lock:
+                        self.telemetry.state = st if st != "COMPLETED" else "IDLE"
+                        self.telemetry.distance_remaining_m = float(data.get("distance_remaining_m", 0.0))
+                        gx = data.get("goal_x")
+                        gy = data.get("goal_y")
+                        if gx is not None and gy is not None:
+                            self.telemetry.current_goal = NavGoal(x_m=gx, y_m=gy)
+
+                    self._emit_telemetry()
+
+                    if st == "COMPLETED":
+                        self._emit_log("🎉 Nav2 room exploration and return-to-dock complete!")
+                        mapping_svc.pause_mapping()
+                        with self._lock:
+                            self._is_exploring = False
+                            self.telemetry.state = "IDLE"
+                            self.telemetry.mode = "manual"
+                            self.telemetry.current_goal = None
+                        self._emit_telemetry()
+                        break
+            except Exception as e:
+                logger.debug("Error reading ROS 2 exploration status: %s", e)
+
+            time.sleep(0.5)
+
     def start_exploration(self) -> bool:
         """
-        Trigger autonomous room mapping with real-time reactive obstacle avoidance.
+        Trigger autonomous room mapping with real-time reactive obstacle avoidance
+        and auto-stop (delegating to ROS 2 Nav2 if active, or embedded frontier exploration).
         """
         self.stop_navigation()
 
@@ -120,6 +196,19 @@ class CubeyNavService:
         mapping_svc = get_mapping_service()
         mapping_svc.start_mapping()
 
+        # Check if native ROS 2 Nav2 frontier supervisor is running
+        if self._is_ros2_explorer_active() and self._trigger_ros2_exploration(start=True):
+            self._worker_thread = threading.Thread(
+                target=self._monitor_ros2_exploration,
+                daemon=True,
+                name="CubeyROS2NavMonitor"
+            )
+            self._worker_thread.start()
+            self._emit_log("🤖 Activated Native ROS 2 Nav2 Frontier Exploration with Auto-Stop.")
+            self._emit_telemetry()
+            return True
+
+        # Standalone embedded frontier exploration loop
         self._worker_thread = threading.Thread(
             target=self._autonomous_exploration_loop,
             daemon=True,
@@ -127,7 +216,7 @@ class CubeyNavService:
         )
         self._worker_thread.start()
 
-        self._emit_log("Started Autonomous Mapping & Obstacle Avoidance Exploration.")
+        self._emit_log("Started Autonomous Frontier Exploration & Obstacle Avoidance.")
         self._emit_telemetry()
         return True
 
@@ -170,7 +259,9 @@ class CubeyNavService:
             self.telemetry.state = "IDLE"
             self.telemetry.mode = "manual"
             self.telemetry.current_goal = None
-            self.telemetry.distance_remaining_m = 0.0
+        # Signal ROS 2 explorer to halt if active
+        if self._is_ros2_explorer_active():
+            self._trigger_ros2_exploration(start=False)
 
         # Send immediate stop command to wheels
         try:
@@ -214,6 +305,7 @@ class CubeyNavService:
         last_stall_check_time = time.time()
         last_explored_cells = 0
         last_cell_change_time = time.time()
+        zero_frontier_cycles = 0
 
         self._emit_log(f"🤖 Vector Potential Field Exploration active (speed {AUTONOMOUS_SPEED}).")
         logger.info("Vector Potential Field Exploration loop started at speed %d", AUTONOMOUS_SPEED)
@@ -333,20 +425,62 @@ class CubeyNavService:
                         last_stall_check_time = now
 
 
-                # --- 4. Auto-Completion Check (Frontier Exploration) ---
-                curr_explored = int(np.count_nonzero(mapping_svc._grid != -1))
-                if curr_explored != last_explored_cells:
-                    last_explored_cells = curr_explored
-                    last_cell_change_time = now
-                elif now - last_cell_change_time > 60.0 and curr_explored > 500:
-                    # No new cells discovered for 60 seconds across a mapped room -> Complete!
-                    self._emit_log(f"🎉 Floorplan exploration complete! Mapped {curr_explored} cells.")
-                    logger.info("Exploration complete — auto stopping.")
-                    break
+                # --- 4. Frontier-Based Auto-Stop Protocol ---
+                grid = mapping_svc._grid
+                free = (grid >= 0) & (grid < 25)
+                unknown = (grid == -1)
+                curr_explored = int(np.count_nonzero(grid != -1))
+
+                if np.any(free) and np.any(unknown):
+                    has_unknown = np.zeros_like(free, dtype=bool)
+                    has_unknown[:-1, :] |= unknown[1:, :]
+                    has_unknown[1:, :]  |= unknown[:-1, :]
+                    has_unknown[:, :-1] |= unknown[:, 1:]
+                    has_unknown[:, 1:]  |= unknown[:, :-1]
+                    frontiers = free & has_unknown
+                    frontier_count = int(np.count_nonzero(frontiers))
+                else:
+                    frontier_count = 0
+
+                # Detect when all accessible frontiers in room are mapped
+                if frontier_count == 0 and curr_explored > 120:
+                    zero_frontier_cycles += 1
+                    if zero_frontier_cycles >= 3:
+                        self._emit_log(f"🎉 Floorplan exploration complete! Mapped {curr_explored} cells.")
+                        logger.info("Exploration complete — initiating auto-stop & return-to-dock.")
+
+                        # Phase 2: Return to Dock Origin (0.0, 0.0)
+                        self._emit_log("🤖 Returning to dock origin (0.0, 0.0)...")
+                        with self._lock:
+                            self.telemetry.state = "RETURNING_TO_DOCK"
+                        self._emit_telemetry()
+
+                        self._execute_return_to_origin(wheels_svc, mapping_svc, lidar_svc)
+
+                        # Phase 3: Finalize and save map to SQLite
+                        mapping_svc.pause_mapping()
+                        try:
+                            map_name = f"Auto-Floorplan {time.strftime('%Y-%m-%d %H:%M')}"
+                            mapping_svc.save_current_map(name=map_name)
+                            self._emit_log(f"💾 Map '{map_name}' successfully saved to database.")
+                        except Exception as e:
+                            logger.warning("Could not auto-save map: %s", e)
+
+                        # Phase 4: State finalization
+                        with self._lock:
+                            self._is_exploring = False
+                            self.telemetry.state = "IDLE"
+                            self.telemetry.mode = "manual"
+                            self.telemetry.current_goal = None
+                        self._emit_log("✅ Room mapping and auto-stop complete!")
+                        self._emit_telemetry()
+                        break
+                else:
+                    zero_frontier_cycles = 0
 
                 logger.info(
-                    "🤖 [AutoNav-PF] Force=(vx=%.2f, vy=%.2f) MinObs=%.2fm -> Action: %s",
-                    target_vx, target_vy, min_obstacle_dist, action
+                    "🤖 [AutoNav-PF] Force=(vx=%.2f, vy=%.2f) MinObs=%.2fm Frontiers=%d -> Action: %s",
+                    target_vx, target_vy, min_obstacle_dist, frontier_count, action
                 )
 
             except Exception as e:
@@ -358,6 +492,64 @@ class CubeyNavService:
             wheels_svc.set_speed(180)  # restore teleop speed
         except Exception:
             pass
+
+        with self._lock:
+            if self.telemetry.state == "EXPLORING":
+                self.telemetry.state = "IDLE"
+            self._is_exploring = False
+        self._emit_telemetry()
+
+    def _execute_return_to_origin(self, wheels_svc, mapping_svc, lidar_svc):
+        """Maneuver robot back to starting origin (0, 0) upon exploration completion."""
+        DOCK_TOLERANCE_M = 0.25
+        wheels_svc.set_speed(110)
+        start_t = time.time()
+
+        while time.time() - start_t < 40.0:
+            pose = mapping_svc.pose
+            dist = math.hypot(pose.x_m, pose.y_m)
+            with self._lock:
+                self.telemetry.distance_remaining_m = dist
+            self._emit_telemetry()
+
+            if dist <= DOCK_TOLERANCE_M:
+                break
+
+            # Angle toward (0, 0)
+            dx = 0.0 - pose.x_m
+            dy = 0.0 - pose.y_m
+            target_heading = math.degrees(math.atan2(dx, dy))
+            heading_err = target_heading - pose.theta_deg
+            while heading_err > 180:
+                heading_err -= 360
+            while heading_err < -180:
+                heading_err += 360
+
+            # Front safety clearance
+            scan = lidar_svc.latest_scan
+            front = scan.min_front_dist_mm if scan and scan.min_front_dist_mm > 0 else 9999
+            if front < 250:
+                wheels_svc.stop()
+                time.sleep(0.06)
+                if scan.min_left_dist_mm > scan.min_right_dist_mm:
+                    wheels_svc.move("strafeLeft")
+                else:
+                    wheels_svc.move("strafeRight")
+                time.sleep(0.22)
+                wheels_svc.stop()
+                continue
+
+            if abs(heading_err) > 30:
+                wheels_svc.move("rotateRight" if heading_err > 0 else "rotateLeft")
+                time.sleep(0.16)
+            else:
+                wheels_svc.move("forward")
+                time.sleep(0.22)
+
+            wheels_svc.stop()
+            time.sleep(0.06)
+
+        wheels_svc.stop()
 
 
     def _waypoint_navigation_loop(self, goal: NavGoal):

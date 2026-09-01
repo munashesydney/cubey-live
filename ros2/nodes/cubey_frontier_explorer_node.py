@@ -507,12 +507,23 @@ class CubeyFrontierExplorerNode(Node):
             f'"goal_x": {round(self.current_goal_coord[0], 2) if self.current_goal_coord else "null"}, '
             f'"goal_y": {round(self.current_goal_coord[1], 2) if self.current_goal_coord else "null"}, '
             f'"distance_remaining_m": {round(dist_m, 2)}, '
-            f'"frontiers_completed": {self.total_frontiers_mapped}}}'
+            f'"frontiers_completed": {self.total_frontiers_mapped}, '
+            f'"timestamp": {time.time()}}}'
         )
 
         msg = String()
         msg.data = status_json
         self.pub_status.publish(msg)
+
+        # Fast atomic IPC file for Web UI & Gemini Voice Bridge
+        try:
+            tmp_file = "/tmp/cubey_exploration_status.json"
+            tmp_write = "/tmp/cubey_exploration_status.json.tmp"
+            with open(tmp_write, "w") as f:
+                f.write(status_json)
+            os.replace(tmp_write, tmp_file)
+        except Exception:
+            pass
 
 
 def main(args=None):
