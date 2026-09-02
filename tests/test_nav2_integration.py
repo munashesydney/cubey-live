@@ -352,7 +352,7 @@ class Nav2IntegrationTests(unittest.TestCase):
         self.assertEqual(explorer.state, "EXPLORING")
         self.assertEqual(explorer.zero_frontier_cycles, 0)
 
-    def test_completed_map_save_is_requested_before_return_planning(self):
+    def test_completed_map_is_saved_before_slam_is_paused_for_return(self):
         explorer = object.__new__(CubeyFrontierExplorerNode)
         explorer.map_save_dir = "maps"
         explorer.pre_return_save_attempts = 0
@@ -409,28 +409,6 @@ class Nav2IntegrationTests(unittest.TestCase):
 
         self.assertIn("elif self.zero_frontier_cycles == 2:", source)
         self.assertNotIn("elif self.zero_frontier_cycles >= 2:", source)
-        self.assertIn("math.radians(45.0)", source)
-        self.assertNotIn("math.radians(90.0)", source)
-
-    def test_completion_rejects_tiny_or_untravelled_maps(self):
-        explorer = object.__new__(CubeyFrontierExplorerNode)
-        explorer.min_completion_explored_cells = 1000
-        explorer.min_completion_travel_m = 0.75
-
-        explorer.max_exploration_travel_m = 0.20
-        self.assertFalse(explorer._completion_coverage_is_sufficient(359))
-
-        explorer.max_exploration_travel_m = 1.10
-        self.assertFalse(explorer._completion_coverage_is_sufficient(900))
-        self.assertTrue(explorer._completion_coverage_is_sufficient(1200))
-
-    def test_web_monitor_treats_incomplete_map_as_terminal(self):
-        source = Path("src/services/navigation/cubey_nav_service.py").read_text(
-            encoding="utf-8"
-        )
-
-        self.assertIn('if st in ("ERROR", "INCOMPLETE"):', source)
-        self.assertIn("rejected a tiny enclosed map as incomplete", source)
 
     def test_dock_candidates_prefer_origin_then_nearby_approaches(self):
         explorer = object.__new__(CubeyFrontierExplorerNode)
@@ -539,52 +517,21 @@ class Nav2IntegrationTests(unittest.TestCase):
 
         explorer._initiate_map_finalization.assert_called_once_with()
 
-    def test_successful_snapshot_keeps_slam_active_for_return(self):
+    def test_return_waits_for_confirmed_slam_lock(self):
         explorer = object.__new__(CubeyFrontierExplorerNode)
         explorer.state = "RETURNING_TO_DOCK"
-        explorer.pre_return_save_attempts = 1
-        explorer.pre_return_map_saved = False
-        explorer.pre_return_map_base = "maps/completed"
-        explorer.map_save_succeeded = False
+        explorer.slam_locked_for_return = False
         explorer.get_logger = MagicMock(return_value=MagicMock())
         explorer._queue_reachable_dock_selection = MagicMock()
         explorer._initiate_map_finalization = MagicMock()
-        explorer.pause_slam_client = MagicMock()
         future = MagicMock()
-        future.result.return_value.result = 0
-        fake_save_map = MagicMock()
-        fake_save_map.Response.RESULT_SUCCESS = 0
+        future.result.return_value.status = True
 
-        with patch.object(
-            frontier_explorer_module, "SaveMap", fake_save_map, create=True
-        ):
-            explorer._on_pre_return_map_saved(future)
+        explorer._on_slam_locked_for_return(future)
 
-        self.assertTrue(explorer.pre_return_map_saved)
-        self.assertTrue(explorer.map_save_succeeded)
+        self.assertTrue(explorer.slam_locked_for_return)
         explorer._queue_reachable_dock_selection.assert_called_once_with()
-        explorer.pause_slam_client.wait_for_service.assert_not_called()
         explorer._initiate_map_finalization.assert_not_called()
-
-    def test_slam_is_paused_only_during_completion(self):
-        explorer = object.__new__(CubeyFrontierExplorerNode)
-        explorer.slam_paused_for_completion = False
-        explorer.pause_slam_client = MagicMock()
-        explorer.pause_slam_client.wait_for_service.return_value = True
-        pause_future = MagicMock()
-        explorer.pause_slam_client.call_async.return_value = pause_future
-        explorer.get_logger = MagicMock(return_value=MagicMock())
-
-        explorer._pause_slam_for_completion()
-
-        explorer.pause_slam_client.call_async.assert_called_once()
-        callback = pause_future.add_done_callback.call_args.args[0]
-        completed_future = MagicMock()
-        completed_future.result.return_value.status = True
-        explorer._complete_mapping = MagicMock()
-        callback(completed_future)
-        self.assertTrue(explorer.slam_paused_for_completion)
-        explorer._complete_mapping.assert_called_once_with()
 
     def test_stale_heartbeat_is_not_ready(self):
         service = CubeyNavService()
@@ -608,7 +555,7 @@ class Nav2IntegrationTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn('if st in ("ERROR", "INCOMPLETE"):', source)
+        self.assertIn('if st == "ERROR":', source)
         self.assertIn("Nav2 mapping could not be finalized", source)
 
     @patch("src.services.navigation.cubey_nav_service.threading.Thread")

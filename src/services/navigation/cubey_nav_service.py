@@ -205,22 +205,17 @@ class CubeyNavService:
                         self._emit_telemetry()
                         break
 
-                    if st in ("ERROR", "INCOMPLETE"):
+                    if st == "ERROR":
                         mapping_svc.pause_mapping()
                         get_wheels_service().stop()
                         with self._lock:
                             self._is_exploring = False
-                            self.telemetry.state = st
+                            self.telemetry.state = "ERROR"
                             self.telemetry.mode = "manual"
                             self.telemetry.current_goal = None
-                        if st == "INCOMPLETE":
-                            self._emit_log(
-                                "Nav2 rejected a tiny enclosed map as incomplete; Cubey stopped safely."
-                            )
-                        else:
-                            self._emit_log(
-                                "Nav2 mapping could not be finalized; Cubey stopped safely."
-                            )
+                        self._emit_log(
+                            "Nav2 mapping could not be finalized; Cubey stopped safely."
+                        )
                         self._emit_telemetry()
                         break
 
