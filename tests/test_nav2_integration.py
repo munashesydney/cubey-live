@@ -409,6 +409,28 @@ class Nav2IntegrationTests(unittest.TestCase):
 
         self.assertIn("elif self.zero_frontier_cycles == 2:", source)
         self.assertNotIn("elif self.zero_frontier_cycles >= 2:", source)
+        self.assertIn("math.radians(45.0)", source)
+        self.assertNotIn("math.radians(90.0)", source)
+
+    def test_completion_rejects_tiny_or_untravelled_maps(self):
+        explorer = object.__new__(CubeyFrontierExplorerNode)
+        explorer.min_completion_explored_cells = 1000
+        explorer.min_completion_travel_m = 0.75
+
+        explorer.max_exploration_travel_m = 0.20
+        self.assertFalse(explorer._completion_coverage_is_sufficient(359))
+
+        explorer.max_exploration_travel_m = 1.10
+        self.assertFalse(explorer._completion_coverage_is_sufficient(900))
+        self.assertTrue(explorer._completion_coverage_is_sufficient(1200))
+
+    def test_web_monitor_treats_incomplete_map_as_terminal(self):
+        source = Path("src/services/navigation/cubey_nav_service.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('if st in ("ERROR", "INCOMPLETE"):', source)
+        self.assertIn("rejected a tiny enclosed map as incomplete", source)
 
     def test_dock_candidates_prefer_origin_then_nearby_approaches(self):
         explorer = object.__new__(CubeyFrontierExplorerNode)

@@ -73,6 +73,8 @@ class CubeyFrontierExplorerNode(Node):
         self.declare_parameter("min_goal_distance_m", 0.15)     # Accept close frontiers
         self.declare_parameter("max_goal_distance_m", 15.0)     # Max exploration horizon
         self.declare_parameter("frontier_blacklist_radius_m", 0.40)
+        self.declare_parameter("min_completion_explored_cells", 1000)
+        self.declare_parameter("min_completion_travel_m", 0.75)
         self.declare_parameter("map_save_dir", "/home/cubey/Desktop/cubey-live/data/maps")
 
         self.autostart = bool(self.get_parameter("autostart").value)
@@ -85,6 +87,12 @@ class CubeyFrontierExplorerNode(Node):
         self.max_goal_dist = float(self.get_parameter("max_goal_distance_m").value)
         self.frontier_blacklist_radius_m = float(
             self.get_parameter("frontier_blacklist_radius_m").value
+        )
+        self.min_completion_explored_cells = int(
+            self.get_parameter("min_completion_explored_cells").value
+        )
+        self.min_completion_travel_m = float(
+            self.get_parameter("min_completion_travel_m").value
         )
         self.map_save_dir = str(self.get_parameter("map_save_dir").value)
 
@@ -134,6 +142,8 @@ class CubeyFrontierExplorerNode(Node):
         self.recovery_blocked_coord: Optional[Tuple[float, float]] = None
         self.zero_frontier_cycles: int = 0
         self.total_frontiers_mapped: int = 0
+        self.max_exploration_travel_m: float = 0.0
+        self.small_map_retry_count: int = 0
 
         # Subscriptions
         self.sub_map = self.create_subscription(
@@ -280,6 +290,7 @@ class CubeyFrontierExplorerNode(Node):
 
     def _start_exploration(self):
         # Every autonomous mission starts from a genuinely blank SLAM graph.
+        self.small_map_retry_count = 0
         self._reset_mapping(start_after_reset=True)
 
     def _stop_exploration(self):
@@ -302,6 +313,7 @@ class CubeyFrontierExplorerNode(Node):
         self.blacklist.clear()
         self.zero_frontier_cycles = 0
         self.total_frontiers_mapped = 0
+        self.max_exploration_travel_m = 0.0
         self.finalization_at_dock = False
         self.dock_plan_generation += 1
         self.dock_plan_queue = []
@@ -446,6 +458,15 @@ class CubeyFrontierExplorerNode(Node):
         cosy_cosp = 1.0 - 2.0 * (rotation.y * rotation.y + rotation.z * rotation.z)
         yaw = math.atan2(siny_cosp, cosy_cosp)
         self.robot_pose = (translation.x, translation.y, yaw)
+        if self.state == "EXPLORING":
+            travel_from_start = math.hypot(
+                translation.x - self.start_pose[0],
+                translation.y - self.start_pose[1],
+            )
+            self.max_exploration_travel_m = max(
+                self.max_exploration_travel_m,
+                travel_from_start,
+            )
 
         # Track trajectory for web canvas
         if not self.trajectory or math.hypot(
@@ -1128,6 +1149,13 @@ class CubeyFrontierExplorerNode(Node):
     # High-Level Exploration & Auto-Stop State Machine
     # ------------------------------------------------------------------
 
+    def _completion_coverage_is_sufficient(self, explored_cells: int) -> bool:
+        """Reject tiny maps that only look complete because false walls enclosed Cubey."""
+        return (
+            explored_cells >= self.min_completion_explored_cells
+            and self.max_exploration_travel_m >= self.min_completion_travel_m
+        )
+
     def _supervision_loop(self):
         """Main state machine controlling frontier exploration and auto-stop."""
         self._update_robot_pose_from_tf()
@@ -1195,16 +1223,35 @@ class CubeyFrontierExplorerNode(Node):
                     f"Frontiers empty (cycle {self.zero_frontier_cycles}/4, explored={explored_cells}, elapsed={time_exploring:.1f}s)...",
                     throttle_duration_sec=2.0
                 )
-                # Only auto-stop if exploration has run for at least 30s AND mapped at least 250 cells (or completed frontiers)
-                can_auto_stop = (time_exploring > 30.0 and (self.total_frontiers_mapped > 0 or explored_cells > 250))
+                coverage_ready = self._completion_coverage_is_sufficient(explored_cells)
+                can_auto_stop = time_exploring > 30.0 and coverage_ready
                 if can_auto_stop and self.zero_frontier_cycles >= 4:
                     self._trigger_auto_stop_sequence()
+                elif time_exploring > 30.0 and self.zero_frontier_cycles >= 4 and not coverage_ready:
+                    if self.small_map_retry_count < 1:
+                        self.small_map_retry_count += 1
+                        self.get_logger().warn(
+                            "Tiny enclosed map rejected as incomplete "
+                            f"(explored={explored_cells}/{self.min_completion_explored_cells}, "
+                            f"travel={self.max_exploration_travel_m:.2f}/"
+                            f"{self.min_completion_travel_m:.2f}m). Clearing suspected false walls "
+                            "and retrying mapping once."
+                        )
+                        self._reset_mapping(start_after_reset=True)
+                    else:
+                        self._cancel_active_nav_goal()
+                        self.state = "INCOMPLETE"
+                        self.get_logger().warn(
+                            "Mapping stopped incomplete after a second tiny enclosed map; "
+                            "refusing to report false completion."
+                        )
                 elif self.zero_frontier_cycles == 2:
-                    # Still in early exploration: survey surroundings by gently rotating to discover frontiers
-                    self.get_logger().info("Surveying room with exploratory turn to discover frontiers...")
+                    # A smaller turn preserves more scan overlap and reduces the
+                    # chance of a bad yaw estimate drawing a false enclosing wall.
+                    self.get_logger().info("Surveying room with a gentle 45-degree discovery turn...")
                     robot_x, robot_y = self.robot_pose[:2] if self.robot_pose else (0.0, 0.0)
                     robot_yaw = self.robot_pose[2] if self.robot_pose else 0.0
-                    survey_yaw = robot_yaw + math.radians(90.0)
+                    survey_yaw = robot_yaw + math.radians(45.0)
                     self._send_nav2_goal(
                         robot_x,
                         robot_y,
@@ -1222,7 +1269,7 @@ class CubeyFrontierExplorerNode(Node):
     # ------------------------------------------------------------------
 
     def _trigger_auto_stop_sequence(self):
-        """Save and freeze the completed map, then use a verified dock approach."""
+        """Save the completed map, then return with live SLAM localization."""
         self.get_logger().info("=========================================================")
         self.get_logger().info("🎉 ALL ACCESSIBLE FRONTIERS FULLY EXPLORED!")
         self.get_logger().info("🤖 Phase 1: Initiating Return-to-Dock Sequence.")
