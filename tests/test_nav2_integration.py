@@ -26,6 +26,18 @@ class Nav2IntegrationTests(unittest.TestCase):
         )
         self.assertIn("desired_linear_vel: 0.12", params)
 
+    def test_nav2_detects_physical_stalls_before_the_hard_goal_timeout(self):
+        params = Path("ros2/config/nav2_params.yaml").read_text(encoding="utf-8")
+        source = Path("ros2/nodes/cubey_frontier_explorer_node.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("required_movement_radius: 0.05", params)
+        self.assertIn("movement_time_allowance: 5.0", params)
+        self.assertIn('self.declare_parameter("stuck_timeout_sec", 7.0)', source)
+        self.assertIn('self.declare_parameter("goal_timeout_sec", 90.0)', source)
+        self.assertIn("goal.target.x = -0.18", source)
+
     def test_slam_processes_scans_at_pi_safe_rate(self):
         params = Path("ros2/config/slam_toolbox_params.yaml").read_text(encoding="utf-8")
 
@@ -308,6 +320,63 @@ class Nav2IntegrationTests(unittest.TestCase):
         explorer._extract_frontiers.assert_not_called()
         explorer._trigger_auto_stop_sequence.assert_not_called()
 
+    def test_stationary_slam_pose_does_not_fake_goal_progress(self):
+        explorer = object.__new__(CubeyFrontierExplorerNode)
+        explorer.robot_pose = (1.0, 2.0, 0.5)
+        explorer.goal_progress_pose = (1.0, 2.0, 0.5)
+        explorer.last_goal_progress_time = 10.0
+
+        explorer._refresh_goal_progress(20.0)
+
+        self.assertEqual(explorer.last_goal_progress_time, 10.0)
+
+        explorer.robot_pose = (1.05, 2.0, 0.5)
+        explorer._refresh_goal_progress(21.0)
+
+        self.assertEqual(explorer.last_goal_progress_time, 21.0)
+        self.assertEqual(explorer.goal_progress_pose, explorer.robot_pose)
+
+    def test_failed_backup_blacklists_blocked_frontier_then_replans_elsewhere(self):
+        explorer = object.__new__(CubeyFrontierExplorerNode)
+        explorer.recovery_generation = 4
+        explorer.recovery_purpose = explorer.GOAL_FRONTIER
+        explorer.recovery_blocked_coord = (2.0, 1.0)
+        explorer.active_recovery_handle = MagicMock()
+        explorer.zero_frontier_cycles = 3
+        explorer.get_logger = MagicMock(return_value=MagicMock())
+        explorer._blacklist_coord = MagicMock()
+
+        explorer._finish_stuck_recovery(False, 4)
+
+        explorer._blacklist_coord.assert_called_once_with((2.0, 1.0))
+        self.assertEqual(explorer.state, "EXPLORING")
+        self.assertEqual(explorer.zero_frontier_cycles, 0)
+
+    def test_completed_map_is_saved_before_slam_is_paused_for_return(self):
+        explorer = object.__new__(CubeyFrontierExplorerNode)
+        explorer.map_save_dir = "maps"
+        explorer.save_map_client = MagicMock()
+        explorer.save_map_client.wait_for_service.return_value = True
+        explorer.save_map_client.call_async.return_value = MagicMock()
+        explorer.pause_slam_client = MagicMock()
+        explorer.get_logger = MagicMock(return_value=MagicMock())
+        explorer._cancel_active_nav_goal = MagicMock()
+        fake_save_map = MagicMock()
+        fake_save_map.Request.return_value = MagicMock()
+
+        with patch.object(
+            frontier_explorer_module, "SaveMap", fake_save_map, create=True
+        ), patch(
+            "ros2.nodes.cubey_frontier_explorer_node.os.makedirs"
+        ):
+            explorer._trigger_auto_stop_sequence()
+
+        explorer.save_map_client.call_async.assert_called_once_with(
+            fake_save_map.Request.return_value
+        )
+        explorer.pause_slam_client.wait_for_service.assert_not_called()
+        self.assertEqual(explorer.state, "RETURNING_TO_DOCK")
+
     def test_final_survey_is_dispatched_only_on_second_empty_cycle(self):
         source = Path("ros2/nodes/cubey_frontier_explorer_node.py").read_text(
             encoding="utf-8"
@@ -397,6 +466,14 @@ class Nav2IntegrationTests(unittest.TestCase):
         ):
             self.assertFalse(service.start_exploration())
             self.assertFalse(service._is_exploring)
+
+    def test_mapping_monitor_handles_ros_map_save_error_as_terminal(self):
+        source = Path("src/services/navigation/cubey_nav_service.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('if st == "ERROR":', source)
+        self.assertIn("Nav2 mapping could not be finalized", source)
 
     @patch("src.services.navigation.cubey_nav_service.threading.Thread")
     @patch("src.services.navigation.cubey_nav_service.get_mapping_service")

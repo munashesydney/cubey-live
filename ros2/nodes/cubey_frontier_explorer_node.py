@@ -42,7 +42,7 @@ try:
     from geometry_msgs.msg import PoseStamped
     from std_msgs.msg import String
     from std_srvs.srv import Trigger
-    from nav2_msgs.action import ComputePathToPose, NavigateToPose
+    from nav2_msgs.action import BackUp, ComputePathToPose, NavigateToPose
     from action_msgs.msg import GoalStatus
     from slam_toolbox.srv import Pause, Reset, SaveMap
     from tf2_ros import Buffer, TransformException, TransformListener
@@ -68,7 +68,8 @@ class CubeyFrontierExplorerNode(Node):
         self.declare_parameter("min_frontier_size", 2)          # 2 cells = 10cm minimum frontier
         self.declare_parameter("robot_radius_m", 0.12)          # Obstacle buffer
         self.declare_parameter("update_interval_sec", 2.0)      # Rate to re-evaluate frontiers
-        self.declare_parameter("goal_timeout_sec", 35.0)        # Max time before replanning a goal
+        self.declare_parameter("goal_timeout_sec", 90.0)        # Hard safety limit; stalls recover sooner
+        self.declare_parameter("stuck_timeout_sec", 7.0)        # Fallback after Nav2 progress recovery
         self.declare_parameter("min_goal_distance_m", 0.15)     # Accept close frontiers
         self.declare_parameter("max_goal_distance_m", 15.0)     # Max exploration horizon
         self.declare_parameter("frontier_blacklist_radius_m", 0.40)
@@ -79,6 +80,7 @@ class CubeyFrontierExplorerNode(Node):
         self.robot_radius_m = float(self.get_parameter("robot_radius_m").value)
         self.update_interval = float(self.get_parameter("update_interval_sec").value)
         self.goal_timeout_sec = float(self.get_parameter("goal_timeout_sec").value)
+        self.stuck_timeout_sec = float(self.get_parameter("stuck_timeout_sec").value)
         self.min_goal_dist = float(self.get_parameter("min_goal_distance_m").value)
         self.max_goal_dist = float(self.get_parameter("max_goal_distance_m").value)
         self.frontier_blacklist_radius_m = float(
@@ -104,6 +106,8 @@ class CubeyFrontierExplorerNode(Node):
         self.current_goal_coord: Optional[Tuple[float, float]] = None
         self.current_frontier_coord: Optional[Tuple[float, float]] = None
         self.goal_start_time: float = 0.0
+        self.goal_progress_pose: Optional[Tuple[float, float, float]] = None
+        self.last_goal_progress_time: float = 0.0
         self.active_goal_handle = None
         self.active_goal_purpose: Optional[str] = None
         self.nav_goal_generation: int = 0
@@ -118,6 +122,13 @@ class CubeyFrontierExplorerNode(Node):
         self.dock_plan_queue: List[Tuple[float, float, float]] = []
         self.planning_dock: bool = False
         self.slam_locked_for_return: bool = False
+        self.pre_return_map_base: Optional[str] = None
+        self.pre_return_map_saved: bool = False
+        self.map_save_succeeded: bool = False
+        self.recovery_generation: int = 0
+        self.active_recovery_handle = None
+        self.recovery_purpose: Optional[str] = None
+        self.recovery_blocked_coord: Optional[Tuple[float, float]] = None
         self.zero_frontier_cycles: int = 0
         self.total_frontiers_mapped: int = 0
 
@@ -168,6 +179,7 @@ class CubeyFrontierExplorerNode(Node):
         # Nav2 NavigateToPose Action Client
         self.nav_client = ActionClient(self, NavigateToPose, "navigate_to_pose")
         self.planner_client = ActionClient(self, ComputePathToPose, "compute_path_to_pose")
+        self.backup_client = ActionClient(self, BackUp, "backup")
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.pause_slam_client = self.create_client(Pause, "/slam_toolbox/pause_new_measurements")
@@ -286,6 +298,13 @@ class CubeyFrontierExplorerNode(Node):
         self.dock_plan_queue = []
         self.planning_dock = False
         self.slam_locked_for_return = False
+        self.pre_return_map_base = None
+        self.pre_return_map_saved = False
+        self.map_save_succeeded = False
+        self.recovery_generation += 1
+        self.active_recovery_handle = None
+        self.recovery_purpose = None
+        self.recovery_blocked_coord = None
 
         try:
             os.remove("/tmp/cubey_nav2_live_map.json")
@@ -360,7 +379,7 @@ class CubeyFrontierExplorerNode(Node):
             return
         self.last_scan_export_time = now
         self._update_robot_pose_from_tf()
-        if not self.robot_pose:
+        if not getattr(self, "robot_pose", None):
             return
 
         robot_x, robot_y, robot_yaw = self.robot_pose
@@ -755,6 +774,8 @@ class CubeyFrontierExplorerNode(Node):
         self.current_goal_coord = (target_x, target_y)
         self.current_frontier_coord = frontier_coord
         self.goal_start_time = time.time()
+        self.goal_progress_pose = self.robot_pose
+        self.last_goal_progress_time = self.goal_start_time
         self.nav_goal_generation += 1
         generation = self.nav_goal_generation
         self.active_goal_purpose = purpose
@@ -870,6 +891,8 @@ class CubeyFrontierExplorerNode(Node):
         self.active_goal_purpose = None
         self.current_goal_coord = None
         self.current_frontier_coord = None
+        self.goal_progress_pose = None
+        self.last_goal_progress_time = 0.0
 
     def _distance_to_goal(self, goal: Optional[Tuple[float, float]]) -> float:
         if not goal or not self.robot_pose:
@@ -898,12 +921,21 @@ class CubeyFrontierExplorerNode(Node):
         self.dock_plan_queue = []
         self.planning_frontier = False
         self.planning_dock = False
+        self.recovery_generation += 1
         if self.active_plan_handle:
             try:
                 self.active_plan_handle.cancel_goal_async()
             except Exception as e:
                 self.get_logger().warn(f"Error cancelling frontier plan: {e}")
         self.active_plan_handle = None
+        if self.active_recovery_handle:
+            try:
+                self.active_recovery_handle.cancel_goal_async()
+            except Exception as e:
+                self.get_logger().warn(f"Error cancelling stuck recovery: {e}")
+        self.active_recovery_handle = None
+        self.recovery_purpose = None
+        self.recovery_blocked_coord = None
         if self.active_goal_handle:
             try:
                 self.active_goal_handle.cancel_goal_async()
@@ -913,6 +945,119 @@ class CubeyFrontierExplorerNode(Node):
         self.active_goal_purpose = None
         self.current_goal_coord = None
         self.current_frontier_coord = None
+        self.goal_progress_pose = None
+        self.last_goal_progress_time = 0.0
+
+    @staticmethod
+    def _angular_distance(first: float, second: float) -> float:
+        return abs(math.atan2(math.sin(first - second), math.cos(first - second)))
+
+    def _refresh_goal_progress(self, now: float) -> None:
+        """Track only LiDAR/SLAM-confirmed physical movement, never wheel intent."""
+        if not getattr(self, "robot_pose", None):
+            return
+        if not getattr(self, "goal_progress_pose", None):
+            self.goal_progress_pose = self.robot_pose
+            self.last_goal_progress_time = now
+            return
+        translation = math.hypot(
+            self.robot_pose[0] - self.goal_progress_pose[0],
+            self.robot_pose[1] - self.goal_progress_pose[1],
+        )
+        rotation = self._angular_distance(
+            self.robot_pose[2], self.goal_progress_pose[2]
+        )
+        if translation >= 0.04 or rotation >= math.radians(8.0):
+            self.goal_progress_pose = self.robot_pose
+            self.last_goal_progress_time = now
+
+    def _start_stuck_recovery(self, purpose: str) -> None:
+        """Cancel a physically stalled route and ask Nav2 for a safe reverse."""
+        blocked_coord = self.current_frontier_coord or self.current_goal_coord
+        self.get_logger().warn(
+            f"Cubey is physically stuck on {purpose}: no SLAM-confirmed motion for "
+            f"{self.stuck_timeout_sec:.0f}s. Starting Nav2 backup recovery."
+        )
+        self._cancel_active_nav_goal()
+        self.state = "RECOVERING_STUCK"
+        self.recovery_purpose = purpose
+        self.recovery_blocked_coord = blocked_coord
+        generation = self.recovery_generation
+
+        if not self.backup_client.wait_for_server(timeout_sec=1.0):
+            self.get_logger().warn("Nav2 backup action is unavailable.")
+            self._finish_stuck_recovery(False, generation)
+            return
+
+        goal = BackUp.Goal()
+        goal.target.x = -0.18
+        goal.speed = 0.05
+        goal.time_allowance.sec = 6
+        future = self.backup_client.send_goal_async(goal)
+        future.add_done_callback(
+            lambda completed: self._on_backup_goal_response(completed, generation)
+        )
+
+    def _on_backup_goal_response(self, future, generation: int) -> None:
+        if generation != self.recovery_generation or self.state != "RECOVERING_STUCK":
+            return
+        try:
+            goal_handle = future.result()
+        except Exception as error:
+            self.get_logger().warn(f"Nav2 backup request failed: {error}")
+            self._finish_stuck_recovery(False, generation)
+            return
+        if not goal_handle.accepted:
+            self.get_logger().warn("Nav2 rejected the backup recovery.")
+            self._finish_stuck_recovery(False, generation)
+            return
+        self.active_recovery_handle = goal_handle
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(
+            lambda completed: self._on_backup_result(completed, generation)
+        )
+
+    def _on_backup_result(self, future, generation: int) -> None:
+        if generation != self.recovery_generation or self.state != "RECOVERING_STUCK":
+            return
+        try:
+            succeeded = future.result().status == GoalStatus.STATUS_SUCCEEDED
+        except Exception as error:
+            self.get_logger().warn(f"Nav2 backup result failed: {error}")
+            succeeded = False
+        self._finish_stuck_recovery(succeeded, generation)
+
+    def _finish_stuck_recovery(self, succeeded: bool, generation: int) -> None:
+        if generation != self.recovery_generation:
+            return
+        purpose = self.recovery_purpose
+        blocked_coord = self.recovery_blocked_coord
+        self.active_recovery_handle = None
+        self.recovery_purpose = None
+        self.recovery_blocked_coord = None
+
+        if succeeded:
+            self.get_logger().info(
+                "Nav2 backup recovery succeeded; replanning from the verified new pose."
+            )
+        else:
+            self.get_logger().warn(
+                "Nav2 could not back out safely; abandoning this blocked route."
+            )
+            if purpose == self.GOAL_FRONTIER and blocked_coord:
+                self._blacklist_coord(blocked_coord)
+
+        if purpose == self.GOAL_RETURN:
+            if succeeded:
+                self.state = "RETURNING_TO_DOCK"
+                self._queue_reachable_dock_selection()
+            else:
+                self._initiate_map_finalization()
+        elif purpose == self.GOAL_MANUAL:
+            self.state = "BLOCKED"
+        else:
+            self.state = "EXPLORING"
+            self.zero_frontier_cycles = 0
 
     def _blacklist_coord(self, coord: Tuple[float, float]):
         # Keep failed regions excluded for the whole practical mission. A short
@@ -941,8 +1086,27 @@ class CubeyFrontierExplorerNode(Node):
             self.get_logger().info("Waiting for initial /map from SLAM Toolbox...", throttle_duration_sec=5.0)
             return
 
-        # Handle active goal timeout / stall
-        if self.current_goal_coord and (time.time() - self.goal_start_time > self.goal_timeout_sec):
+        # Let Nav2's progress checker recover first, then use a LiDAR-confirmed
+        # fallback if commands still produce no physical translation or turn.
+        now = time.time()
+        if self.current_goal_coord:
+            self._refresh_goal_progress(now)
+        active_purpose = getattr(self, "active_goal_purpose", None)
+        last_progress_time = getattr(
+            self, "last_goal_progress_time", self.goal_start_time
+        )
+        if (
+            self.current_goal_coord
+            and getattr(self, "robot_pose", None) is not None
+            and active_purpose in (self.GOAL_FRONTIER, self.GOAL_RETURN)
+            and now - last_progress_time > self.stuck_timeout_sec
+        ):
+            self._start_stuck_recovery(active_purpose)
+            return
+
+        # Hard duration limit remains only as a final safety bound. Unlike the
+        # old 35-second limit, it no longer kills normal long, progressing paths.
+        if self.current_goal_coord and (now - self.goal_start_time > self.goal_timeout_sec):
             timed_out_purpose = self.active_goal_purpose
             self.get_logger().warn(
                 f"Active {timed_out_purpose or 'Nav2'} goal timed out "
@@ -1006,7 +1170,7 @@ class CubeyFrontierExplorerNode(Node):
     # ------------------------------------------------------------------
 
     def _trigger_auto_stop_sequence(self):
-        """Freeze the completed map, then return using a planner-verified dock approach."""
+        """Save and freeze the completed map, then use a verified dock approach."""
         self.get_logger().info("=========================================================")
         self.get_logger().info("🎉 ALL ACCESSIBLE FRONTIERS FULLY EXPLORED!")
         self.get_logger().info("🤖 Phase 1: Initiating Return-to-Dock Sequence.")
@@ -1014,6 +1178,49 @@ class CubeyFrontierExplorerNode(Node):
 
         self._cancel_active_nav_goal()
         self.state = "RETURNING_TO_DOCK"
+
+        os.makedirs(self.map_save_dir, exist_ok=True)
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.pre_return_map_base = os.path.join(
+            self.map_save_dir, f"cubey_floorplan_{timestamp_str}"
+        )
+        if not self.save_map_client.wait_for_service(timeout_sec=2.0):
+            self.get_logger().error(
+                "SLAM save_map service unavailable; stopping before return so the live map is not damaged."
+            )
+            self._initiate_map_finalization()
+            return
+
+        request = SaveMap.Request()
+        request.name.data = self.pre_return_map_base
+        save_future = self.save_map_client.call_async(request)
+        save_future.add_done_callback(self._on_pre_return_map_saved)
+        self.get_logger().info("Saving completed map before return-to-dock.")
+
+    def _on_pre_return_map_saved(self, future) -> None:
+        if self.state != "RETURNING_TO_DOCK":
+            return
+        try:
+            response = future.result()
+            if response.result != SaveMap.Response.RESULT_SUCCESS:
+                raise RuntimeError(f"SLAM Toolbox result code {response.result}")
+        except Exception as error:
+            self.get_logger().error(
+                f"Could not save completed map before return ({error}); stopping safely."
+            )
+            self._initiate_map_finalization()
+            return
+
+        self.pre_return_map_saved = True
+        self.map_save_succeeded = True
+        self.get_logger().info(
+            f"💾 Completed map safely saved before return: {self.pre_return_map_base}"
+        )
+        self._lock_slam_for_return()
+
+    def _lock_slam_for_return(self) -> None:
+        if self.state != "RETURNING_TO_DOCK":
+            return
 
         # Do not let return-path recovery spins or backups deform a map that is
         # already complete. Nav2 can continue navigating on the last published
@@ -1155,7 +1362,7 @@ class CubeyFrontierExplorerNode(Node):
         )
 
     def _initiate_map_finalization(self, at_dock: bool = False):
-        """Phase 3 & 4: Pause SLAM scan matching, trigger loop closure, and save map."""
+        """Stop navigation and finish with the already-saved map when available."""
         if self.state in ("FINALIZING_MAP", "COMPLETED", "COMPLETED_AWAY_FROM_DOCK"):
             return
         self.finalization_at_dock = at_dock
@@ -1173,22 +1380,21 @@ class CubeyFrontierExplorerNode(Node):
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         final_map_base = os.path.join(self.map_save_dir, f"cubey_floorplan_{timestamp_str}")
 
-        # Return navigation already runs on a frozen map. Avoid a redundant
-        # pause round-trip and save that exact locked map.
-        if self.slam_locked_for_return:
-            self._save_final_map(final_map_base)
-        elif self.pause_slam_client.wait_for_service(timeout_sec=2.0):
-            pause_future = self.pause_slam_client.call_async(Pause.Request())
-            pause_future.add_done_callback(lambda _: self._save_final_map(final_map_base))
-            self.get_logger().info("SLAM pause requested for final map lock.")
+        if self.pre_return_map_saved:
+            self.get_logger().info(
+                f"Using completed map saved before return: {self.pre_return_map_base}"
+            )
+            self._complete_mapping()
         else:
-            self.get_logger().warn("SLAM pause service unavailable; attempting map save anyway.")
+            # If completion happens outside the normal auto-return path, save
+            # while SLAM is still publishing. Pausing before this request can
+            # starve map_saver's subscription and lose the disk snapshot.
             self._save_final_map(final_map_base)
 
     def _save_final_map(self, final_map_base: str):
         if not self.save_map_client.wait_for_service(timeout_sec=2.0):
             self.get_logger().error("SLAM save_map service unavailable; map remains available live but was not written to disk.")
-            self._complete_mapping()
+            self.state = "ERROR"
             return
 
         request = SaveMap.Request()
@@ -1200,12 +1406,15 @@ class CubeyFrontierExplorerNode(Node):
         try:
             response = future.result()
             if response.result == SaveMap.Response.RESULT_SUCCESS:
+                self.map_save_succeeded = True
                 self.get_logger().info(f"💾 Map saved via SLAM Toolbox to: {final_map_base}")
+                self._complete_mapping()
             else:
                 self.get_logger().error(f"SLAM Toolbox map save failed with result code {response.result}.")
+                self.state = "ERROR"
         except Exception as e:
             self.get_logger().error(f"SLAM Toolbox map save failed: {e}")
-        self._complete_mapping()
+            self.state = "ERROR"
 
     def _complete_mapping(self):
         self.state = "COMPLETED" if self.finalization_at_dock else "COMPLETED_AWAY_FROM_DOCK"

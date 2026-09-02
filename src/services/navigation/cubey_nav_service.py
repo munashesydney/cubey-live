@@ -205,6 +205,20 @@ class CubeyNavService:
                         self._emit_telemetry()
                         break
 
+                    if st == "ERROR":
+                        mapping_svc.pause_mapping()
+                        get_wheels_service().stop()
+                        with self._lock:
+                            self._is_exploring = False
+                            self.telemetry.state = "ERROR"
+                            self.telemetry.mode = "manual"
+                            self.telemetry.current_goal = None
+                        self._emit_log(
+                            "Nav2 mapping could not be finalized; Cubey stopped safely."
+                        )
+                        self._emit_telemetry()
+                        break
+
                 if time.time() - last_healthy_heartbeat > ROS2_HEARTBEAT_MAX_AGE_S:
                     mapping_svc.pause_mapping()
                     with self._lock:
