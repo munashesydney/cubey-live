@@ -650,7 +650,7 @@ class CubeyFrontierExplorerNode(Node):
 
     def _costmap_pose_diagnostic(self, x_m: float, y_m: float) -> str:
         """Describe the global-costmap cell Nav2 sees at a world pose."""
-        grid = self.latest_global_costmap
+        grid = getattr(self, "latest_global_costmap", None)
         if grid is None:
             return "global_costmap=unavailable"
 
@@ -1346,7 +1346,8 @@ class CubeyFrontierExplorerNode(Node):
             return
         if not self.dock_plan_queue:
             self.planning_dock = False
-            robot_x, robot_y = self.robot_pose[:2] if self.robot_pose else (0.0, 0.0)
+            robot_pose = getattr(self, "robot_pose", None)
+            robot_x, robot_y = robot_pose[:2] if robot_pose else (0.0, 0.0)
             self.get_logger().warn(
                 "Dock preflight exhausted every candidate: "
                 f"current=({robot_x:.2f},{robot_y:.2f}) "
