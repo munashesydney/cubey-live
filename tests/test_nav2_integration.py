@@ -1,3 +1,4 @@
+import math
 import time
 import unittest
 from pathlib import Path
@@ -306,6 +307,79 @@ class Nav2IntegrationTests(unittest.TestCase):
 
         explorer._extract_frontiers.assert_not_called()
         explorer._trigger_auto_stop_sequence.assert_not_called()
+
+    def test_final_survey_is_dispatched_only_on_second_empty_cycle(self):
+        source = Path("ros2/nodes/cubey_frontier_explorer_node.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("elif self.zero_frontier_cycles == 2:", source)
+        self.assertNotIn("elif self.zero_frontier_cycles >= 2:", source)
+
+    def test_dock_candidates_prefer_origin_then_nearby_approaches(self):
+        explorer = object.__new__(CubeyFrontierExplorerNode)
+        explorer.start_pose = (0.0, 0.0, 0.0)
+        explorer.robot_pose = (1.0, 0.0, 0.0)
+
+        candidates = explorer._dock_candidates()
+
+        self.assertEqual(candidates[0], (0.0, 0.0, 0.0))
+        self.assertEqual(len(candidates), 17)
+        self.assertAlmostEqual(candidates[1][0], 0.15)
+        self.assertAlmostEqual(candidates[1][1], 0.0)
+        self.assertTrue(
+            all(math.hypot(x, y) <= 0.250001 for x, y, _ in candidates)
+        )
+
+    def test_successful_dock_preflight_dispatches_return_goal(self):
+        explorer = object.__new__(CubeyFrontierExplorerNode)
+        explorer.dock_plan_generation = 3
+        explorer.state = "RETURNING_TO_DOCK"
+        explorer.active_plan_handle = MagicMock()
+        explorer.dock_plan_queue = [(0.2, 0.0, 0.0)]
+        explorer.planning_dock = True
+        explorer.start_pose = (0.0, 0.0, 0.0)
+        explorer.get_logger = MagicMock(return_value=MagicMock())
+        explorer._send_nav2_goal = MagicMock()
+        wrapped_result = MagicMock()
+        wrapped_result.status = 4
+        wrapped_result.result.path.poses = [MagicMock()]
+        future = MagicMock()
+        future.result.return_value = wrapped_result
+        candidate = (0.15, 0.0, 0.0)
+
+        with patch.object(
+            frontier_explorer_module,
+            "GoalStatus",
+            MagicMock(STATUS_SUCCEEDED=4),
+            create=True,
+        ):
+            explorer._on_dock_plan_result(future, 3, candidate)
+
+        explorer._send_nav2_goal.assert_called_once_with(
+            0.15,
+            0.0,
+            0.0,
+            purpose=explorer.GOAL_RETURN,
+        )
+        self.assertFalse(explorer.planning_dock)
+        self.assertEqual(explorer.dock_plan_queue, [])
+
+    def test_return_waits_for_confirmed_slam_lock(self):
+        explorer = object.__new__(CubeyFrontierExplorerNode)
+        explorer.state = "RETURNING_TO_DOCK"
+        explorer.slam_locked_for_return = False
+        explorer.get_logger = MagicMock(return_value=MagicMock())
+        explorer._queue_reachable_dock_selection = MagicMock()
+        explorer._initiate_map_finalization = MagicMock()
+        future = MagicMock()
+        future.result.return_value.status = True
+
+        explorer._on_slam_locked_for_return(future)
+
+        self.assertTrue(explorer.slam_locked_for_return)
+        explorer._queue_reachable_dock_selection.assert_called_once_with()
+        explorer._initiate_map_finalization.assert_not_called()
 
     def test_stale_heartbeat_is_not_ready(self):
         service = CubeyNavService()

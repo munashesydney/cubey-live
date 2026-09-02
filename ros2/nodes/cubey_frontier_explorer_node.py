@@ -8,8 +8,8 @@ prioritizes exploration goals by utility (size vs. distance),
 dispatches action goals to Nav2 (NavigateToPose),
 and executes an autonomous 4-stage Auto-Stop protocol:
   1. Detects 0 reachable frontiers (space fully explored).
-  2. Navigates robot back to starting origin / dock (0.0, 0.0, 0.0).
-  3. Freezes SLAM measurements (/slam_toolbox/pause_new_measurements).
+  2. Freezes SLAM measurements (/slam_toolbox/pause_new_measurements).
+  3. Navigates robot back to a planner-verified approach near the starting dock.
   4. Optimizes pose graph and saves map (/slam_toolbox/save_map).
 """
 
@@ -114,6 +114,10 @@ class CubeyFrontierExplorerNode(Node):
         self.frontier_plan_queue: List[Tuple[float, float, float, float, float, int]] = []
         self.planning_frontier: bool = False
         self.frontier_selection_generation: int = 0
+        self.dock_plan_generation: int = 0
+        self.dock_plan_queue: List[Tuple[float, float, float]] = []
+        self.planning_dock: bool = False
+        self.slam_locked_for_return: bool = False
         self.zero_frontier_cycles: int = 0
         self.total_frontiers_mapped: int = 0
 
@@ -278,6 +282,10 @@ class CubeyFrontierExplorerNode(Node):
         self.zero_frontier_cycles = 0
         self.total_frontiers_mapped = 0
         self.finalization_at_dock = False
+        self.dock_plan_generation += 1
+        self.dock_plan_queue = []
+        self.planning_dock = False
+        self.slam_locked_for_return = False
 
         try:
             os.remove("/tmp/cubey_nav2_live_map.json")
@@ -826,12 +834,14 @@ class CubeyFrontierExplorerNode(Node):
             elif purpose == self.GOAL_MANUAL:
                 self.state = "REACHED"
             elif purpose == self.GOAL_RETURN:
-                if self._goal_is_physically_reached(self.current_goal_coord, tolerance_m=0.20):
+                if self._goal_is_physically_reached(
+                    self.current_goal_coord, tolerance_m=0.20
+                ) and self._dock_is_physically_reached():
                     self._initiate_map_finalization(at_dock=True)
                 else:
-                    distance = self._distance_to_goal(self.current_goal_coord)
+                    dock_distance = self._distance_to_goal(self.start_pose[:2])
                     self.get_logger().warn(
-                        f"Nav2 reported dock success but Cubey remains {distance:.2f}m away; "
+                        f"Nav2 reported dock success but Cubey remains {dock_distance:.2f}m from origin; "
                         "saving at the current safe position."
                     )
                     self._initiate_map_finalization()
@@ -874,13 +884,20 @@ class CubeyFrontierExplorerNode(Node):
         """Validate Nav2 success against the SLAM-corrected physical pose."""
         return self._distance_to_goal(goal) <= tolerance_m
 
+    def _dock_is_physically_reached(self) -> bool:
+        """A planner-selected approach within 35 cm counts as safely returned."""
+        return self._distance_to_goal(self.start_pose[:2]) <= 0.35
+
     def _cancel_active_nav_goal(self):
         # Invalidate callbacks before requesting cancellation. A delayed result
         # from the old goal must never affect the next mission phase.
         self.nav_goal_generation += 1
         self.frontier_selection_generation += 1
+        self.dock_plan_generation += 1
         self.frontier_plan_queue = []
+        self.dock_plan_queue = []
         self.planning_frontier = False
+        self.planning_dock = False
         if self.active_plan_handle:
             try:
                 self.active_plan_handle.cancel_goal_async()
@@ -966,7 +983,7 @@ class CubeyFrontierExplorerNode(Node):
                 can_auto_stop = (time_exploring > 30.0 and (self.total_frontiers_mapped > 0 or explored_cells > 250))
                 if can_auto_stop and self.zero_frontier_cycles >= 4:
                     self._trigger_auto_stop_sequence()
-                elif self.zero_frontier_cycles >= 2:
+                elif self.zero_frontier_cycles == 2:
                     # Still in early exploration: survey surroundings by gently rotating to discover frontiers
                     self.get_logger().info("Surveying room with exploratory turn to discover frontiers...")
                     robot_x, robot_y = self.robot_pose[:2] if self.robot_pose else (0.0, 0.0)
@@ -989,7 +1006,7 @@ class CubeyFrontierExplorerNode(Node):
     # ------------------------------------------------------------------
 
     def _trigger_auto_stop_sequence(self):
-        """Phase 1 & 2: Initiates return to starting dock after frontiers are depleted."""
+        """Freeze the completed map, then return using a planner-verified dock approach."""
         self.get_logger().info("=========================================================")
         self.get_logger().info("🎉 ALL ACCESSIBLE FRONTIERS FULLY EXPLORED!")
         self.get_logger().info("🤖 Phase 1: Initiating Return-to-Dock Sequence.")
@@ -998,13 +1015,142 @@ class CubeyFrontierExplorerNode(Node):
         self._cancel_active_nav_goal()
         self.state = "RETURNING_TO_DOCK"
 
-        # Navigate to origin (0.0, 0.0) where mapping started
+        # Do not let return-path recovery spins or backups deform a map that is
+        # already complete. Nav2 can continue navigating on the last published
+        # occupancy grid while SLAM scan matching is paused.
+        if self.pause_slam_client.wait_for_service(timeout_sec=2.0):
+            pause_future = self.pause_slam_client.call_async(Pause.Request())
+            pause_future.add_done_callback(self._on_slam_locked_for_return)
+            self.get_logger().info("Locking completed SLAM map before return-to-dock.")
+        else:
+            self.get_logger().warn(
+                "SLAM pause service unavailable; stopping safely instead of risking the completed map."
+            )
+            self._initiate_map_finalization()
+
+    def _on_slam_locked_for_return(self, future) -> None:
+        if self.state != "RETURNING_TO_DOCK":
+            return
+        try:
+            response = future.result()
+            if not response.status:
+                raise RuntimeError("SLAM Toolbox did not confirm the pause")
+        except Exception as error:
+            self.get_logger().warn(
+                f"Could not lock SLAM before return ({error}); preserving the map and stopping."
+            )
+            self._initiate_map_finalization()
+            return
+
+        self.slam_locked_for_return = True
+        self.get_logger().info("Completed SLAM map locked; selecting a reachable dock approach.")
+        self._queue_reachable_dock_selection()
+
+    def _dock_candidates(self) -> List[Tuple[float, float, float]]:
+        """Return exact dock first, followed by nearby approach poses."""
         dock_x, dock_y, dock_yaw = self.start_pose
-        self.get_logger().info(f"Navigating back to dock origin: ({dock_x:.2f}m, {dock_y:.2f}m)...")
+        candidates = [(dock_x, dock_y, dock_yaw)]
+        robot_x, robot_y = self.robot_pose[:2] if self.robot_pose else (dock_x, dock_y)
+        approach_angle = math.atan2(robot_y - dock_y, robot_x - dock_x)
+        angle_offsets = (0.0, math.pi / 4.0, -math.pi / 4.0, math.pi / 2.0,
+                         -math.pi / 2.0, math.pi, 3.0 * math.pi / 4.0, -3.0 * math.pi / 4.0)
+        for radius in (0.15, 0.25):
+            for offset in angle_offsets:
+                angle = approach_angle + offset
+                candidates.append(
+                    (
+                        dock_x + radius * math.cos(angle),
+                        dock_y + radius * math.sin(angle),
+                        dock_yaw,
+                    )
+                )
+        return candidates
+
+    def _queue_reachable_dock_selection(self) -> None:
+        if self.state != "RETURNING_TO_DOCK":
+            return
+        if not self.planner_client.wait_for_server(timeout_sec=1.0):
+            self.get_logger().warn(
+                "Nav2 planner unavailable for dock preflight; preserving the map and stopping."
+            )
+            self._initiate_map_finalization()
+            return
+        self.dock_plan_queue = self._dock_candidates()
+        self.planning_dock = True
+        self.dock_plan_generation += 1
+        self._plan_next_dock_approach(self.dock_plan_generation)
+
+    def _plan_next_dock_approach(self, generation: int) -> None:
+        if generation != self.dock_plan_generation or self.state != "RETURNING_TO_DOCK":
+            return
+        if not self.dock_plan_queue:
+            self.planning_dock = False
+            self.get_logger().warn(
+                "No Nav2-reachable approach exists near the dock; preserving the map and stopping."
+            )
+            self._initiate_map_finalization()
+            return
+
+        candidate = self.dock_plan_queue.pop(0)
+        target_x, target_y, target_yaw = candidate
+        goal = ComputePathToPose.Goal()
+        goal.goal = self._pose_stamped(self, target_x, target_y, target_yaw)
+        goal.planner_id = "GridBased"
+        goal.use_start = False
+        future = self.planner_client.send_goal_async(goal)
+        future.add_done_callback(
+            lambda completed: self._on_dock_plan_goal_response(completed, generation, candidate)
+        )
+
+    def _on_dock_plan_goal_response(self, future, generation: int, candidate) -> None:
+        if generation != self.dock_plan_generation or self.state != "RETURNING_TO_DOCK":
+            return
+        try:
+            goal_handle = future.result()
+        except Exception as error:
+            self.get_logger().warn(f"Nav2 dock plan request failed: {error}")
+            self._plan_next_dock_approach(generation)
+            return
+        if not goal_handle.accepted:
+            self._plan_next_dock_approach(generation)
+            return
+        self.active_plan_handle = goal_handle
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(
+            lambda completed: self._on_dock_plan_result(completed, generation, candidate)
+        )
+
+    def _on_dock_plan_result(self, future, generation: int, candidate) -> None:
+        if generation != self.dock_plan_generation or self.state != "RETURNING_TO_DOCK":
+            return
+        self.active_plan_handle = None
+        try:
+            wrapped_result = future.result()
+            path_found = (
+                wrapped_result.status == GoalStatus.STATUS_SUCCEEDED
+                and bool(wrapped_result.result.path.poses)
+            )
+        except Exception as error:
+            self.get_logger().warn(f"Nav2 dock plan result failed: {error}")
+            path_found = False
+
+        if not path_found:
+            self._plan_next_dock_approach(generation)
+            return
+
+        self.dock_plan_queue = []
+        self.planning_dock = False
+        target_x, target_y, target_yaw = candidate
+        dock_x, dock_y, _ = self.start_pose
+        offset = math.hypot(target_x - dock_x, target_y - dock_y)
+        self.get_logger().info(
+            f"Navigating to planner-verified dock approach ({target_x:.2f}m, {target_y:.2f}m; "
+            f"{offset:.2f}m from origin)."
+        )
         self._send_nav2_goal(
-            dock_x,
-            dock_y,
-            dock_yaw,
+            target_x,
+            target_y,
+            target_yaw,
             purpose=self.GOAL_RETURN,
         )
 
@@ -1027,8 +1173,11 @@ class CubeyFrontierExplorerNode(Node):
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         final_map_base = os.path.join(self.map_save_dir, f"cubey_floorplan_{timestamp_str}")
 
-        # Pause first, then save after the pause service responds.
-        if self.pause_slam_client.wait_for_service(timeout_sec=2.0):
+        # Return navigation already runs on a frozen map. Avoid a redundant
+        # pause round-trip and save that exact locked map.
+        if self.slam_locked_for_return:
+            self._save_final_map(final_map_base)
+        elif self.pause_slam_client.wait_for_service(timeout_sec=2.0):
             pause_future = self.pause_slam_client.call_async(Pause.Request())
             pause_future.add_done_callback(lambda _: self._save_final_map(final_map_base))
             self.get_logger().info("SLAM pause requested for final map lock.")
