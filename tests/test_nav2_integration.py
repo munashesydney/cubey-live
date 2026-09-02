@@ -425,6 +425,40 @@ class Nav2IntegrationTests(unittest.TestCase):
             all(math.hypot(x, y) <= 0.250001 for x, y, _ in candidates)
         )
 
+    def test_costmap_pose_diagnostic_reports_exact_planner_cell(self):
+        explorer = object.__new__(CubeyFrontierExplorerNode)
+        grid = MagicMock()
+        grid.info.resolution = 0.5
+        grid.info.origin.position.x = -1.0
+        grid.info.origin.position.y = -1.0
+        grid.info.width = 4
+        grid.info.height = 3
+        grid.data = [0] * 12
+        grid.data[2 * 4 + 3] = 100
+        explorer.latest_global_costmap = grid
+
+        diagnostic = explorer._costmap_pose_diagnostic(0.75, 0.25)
+
+        self.assertEqual(
+            diagnostic,
+            "global_costmap=lethal_or_inscribed cost=100 cell=(3,2)",
+        )
+
+    def test_costmap_pose_diagnostic_reports_outside_grid(self):
+        explorer = object.__new__(CubeyFrontierExplorerNode)
+        grid = MagicMock()
+        grid.info.resolution = 0.5
+        grid.info.origin.position.x = 0.0
+        grid.info.origin.position.y = 0.0
+        grid.info.width = 2
+        grid.info.height = 2
+        grid.data = [0] * 4
+        explorer.latest_global_costmap = grid
+
+        diagnostic = explorer._costmap_pose_diagnostic(-0.1, 0.5)
+
+        self.assertIn("global_costmap=outside cell=(-1,1)", diagnostic)
+
     def test_successful_dock_preflight_dispatches_return_goal(self):
         explorer = object.__new__(CubeyFrontierExplorerNode)
         explorer.dock_plan_generation = 3

@@ -98,6 +98,7 @@ class CubeyFrontierExplorerNode(Node):
         self.odom_pose: Optional[Tuple[float, float, float]] = None
         self.start_pose: Tuple[float, float, float] = (0.0, 0.0, 0.0)
         self.latest_map: Optional[OccupancyGrid] = None
+        self.latest_global_costmap: Optional[OccupancyGrid] = None
         self.trajectory: List[List[float]] = []
         self.latest_scan_hits: List[List[float]] = []
         self.last_scan_export_time: float = 0.0
@@ -152,6 +153,12 @@ class CubeyFrontierExplorerNode(Node):
             "/scan",
             self._on_scan,
             5,
+        )
+        self.sub_global_costmap = self.create_subscription(
+            OccupancyGrid,
+            "/global_costmap/costmap",
+            self._on_global_costmap,
+            10,
         )
 
         # Publisher for external telemetry (Web UI / Gemini audio bridge)
@@ -484,6 +491,10 @@ class CubeyFrontierExplorerNode(Node):
         except Exception:
             pass
 
+    def _on_global_costmap(self, msg: OccupancyGrid) -> None:
+        """Keep the planner's exact grid available for return-path diagnostics."""
+        self.latest_global_costmap = msg
+
     def _handle_start_exploration(self, request, response):
         self._start_exploration()
         response.success = True
@@ -636,6 +647,38 @@ class CubeyFrontierExplorerNode(Node):
         pose.pose.orientation.z = math.sin(yaw / 2.0)
         pose.pose.orientation.w = math.cos(yaw / 2.0)
         return pose
+
+    def _costmap_pose_diagnostic(self, x_m: float, y_m: float) -> str:
+        """Describe the global-costmap cell Nav2 sees at a world pose."""
+        grid = self.latest_global_costmap
+        if grid is None:
+            return "global_costmap=unavailable"
+
+        resolution = float(grid.info.resolution)
+        if resolution <= 0.0:
+            return "global_costmap=invalid_resolution"
+        origin_x = float(grid.info.origin.position.x)
+        origin_y = float(grid.info.origin.position.y)
+        cell_x = math.floor((x_m - origin_x) / resolution)
+        cell_y = math.floor((y_m - origin_y) / resolution)
+        width = int(grid.info.width)
+        height = int(grid.info.height)
+        if cell_x < 0 or cell_y < 0 or cell_x >= width or cell_y >= height:
+            return (
+                f"global_costmap=outside cell=({cell_x},{cell_y}) "
+                f"size={width}x{height} origin=({origin_x:.2f},{origin_y:.2f})"
+            )
+
+        cost = int(grid.data[cell_y * width + cell_x])
+        if cost < 0:
+            classification = "unknown"
+        elif cost == 0:
+            classification = "free"
+        elif cost >= 99:
+            classification = "lethal_or_inscribed"
+        else:
+            classification = "inflated"
+        return f"global_costmap={classification} cost={cost} cell=({cell_x},{cell_y})"
 
     def _queue_reachable_frontier_selection(
         self,
@@ -1316,6 +1359,15 @@ class CubeyFrontierExplorerNode(Node):
         self.dock_plan_queue = self._dock_candidates()
         self.planning_dock = True
         self.dock_plan_generation += 1
+        robot_x, robot_y = self.robot_pose[:2] if self.robot_pose else (0.0, 0.0)
+        dock_x, dock_y, _ = self.start_pose
+        self.get_logger().info(
+            "Dock preflight diagnostics: "
+            f"start=({robot_x:.2f},{robot_y:.2f}) "
+            f"[{self._costmap_pose_diagnostic(robot_x, robot_y)}]; "
+            f"dock=({dock_x:.2f},{dock_y:.2f}) "
+            f"[{self._costmap_pose_diagnostic(dock_x, dock_y)}]."
+        )
         self._plan_next_dock_approach(self.dock_plan_generation)
 
     def _plan_next_dock_approach(self, generation: int) -> None:
@@ -1323,6 +1375,12 @@ class CubeyFrontierExplorerNode(Node):
             return
         if not self.dock_plan_queue:
             self.planning_dock = False
+            robot_x, robot_y = self.robot_pose[:2] if self.robot_pose else (0.0, 0.0)
+            self.get_logger().warn(
+                "Dock preflight exhausted every candidate: "
+                f"current=({robot_x:.2f},{robot_y:.2f}) "
+                f"[{self._costmap_pose_diagnostic(robot_x, robot_y)}]."
+            )
             if not self.dock_escape_attempted:
                 self._start_stuck_recovery(
                     self.GOAL_RETURN,
@@ -1359,6 +1417,11 @@ class CubeyFrontierExplorerNode(Node):
             self._plan_next_dock_approach(generation)
             return
         if not goal_handle.accepted:
+            target_x, target_y, _ = candidate
+            self.get_logger().warn(
+                f"Dock planner rejected candidate ({target_x:.2f},{target_y:.2f}) "
+                f"[{self._costmap_pose_diagnostic(target_x, target_y)}]."
+            )
             self._plan_next_dock_approach(generation)
             return
         self.active_plan_handle = goal_handle
@@ -1377,11 +1440,26 @@ class CubeyFrontierExplorerNode(Node):
                 wrapped_result.status == GoalStatus.STATUS_SUCCEEDED
                 and bool(wrapped_result.result.path.poses)
             )
+            planner_status = wrapped_result.status
+            planner_error_code = getattr(wrapped_result.result, "error_code", "unavailable")
+            planner_error_msg = getattr(wrapped_result.result, "error_msg", "") or "none"
         except Exception as error:
             self.get_logger().warn(f"Nav2 dock plan result failed: {error}")
             path_found = False
+            planner_status = "exception"
+            planner_error_code = "exception"
+            planner_error_msg = str(error)
 
         if not path_found:
+            target_x, target_y, _ = candidate
+            robot_x, robot_y = self.robot_pose[:2] if self.robot_pose else (0.0, 0.0)
+            self.get_logger().warn(
+                f"Dock candidate ({target_x:.2f},{target_y:.2f}) has no path: "
+                f"status={planner_status} "
+                f"error_code={planner_error_code} error_msg={planner_error_msg}; "
+                f"start[{self._costmap_pose_diagnostic(robot_x, robot_y)}] "
+                f"goal[{self._costmap_pose_diagnostic(target_x, target_y)}]."
+            )
             self._plan_next_dock_approach(generation)
             return
 
