@@ -7,9 +7,10 @@ by fusing 2D laser scan matching with open-loop velocity commands.
 Compensates for the absence of hardware wheel encoders and IMU.
 """
 
+from __future__ import annotations
+
 import math
 import sys
-import time
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -17,9 +18,11 @@ import numpy as np
 try:
     import rclpy
     from rclpy.node import Node
+    from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
     from sensor_msgs.msg import LaserScan
     from geometry_msgs.msg import Twist, TransformStamped
     from nav_msgs.msg import Odometry
+    from std_srvs.srv import Trigger
     from tf2_ros import TransformBroadcaster
 except ImportError:
     print("Warning: rclpy / ros_msgs not available in host Python. Run inside Pixi environment.", file=sys.stderr)
@@ -73,7 +76,6 @@ class CubeyOdometryNode(Node):
         self.vx = 0.0
         self.vy = 0.0
         self.wz = 0.0
-        self.last_update_time = self.get_clock().now()
 
         # Scan Matching state
         self.prev_points: Optional[np.ndarray] = None
@@ -84,8 +86,25 @@ class CubeyOdometryNode(Node):
         self.tf_broadcaster = TransformBroadcaster(self) if self.publish_tf else None
 
         # Subscriptions
-        self.sub_scan = self.create_subscription(LaserScan, "/scan", self._on_laser_scan, 5)
+        # Odometry must use the freshest scan. Processing a reliable backlog
+        # after motion or reset creates pose jumps and warped SLAM walls.
+        scan_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+        )
+        self.sub_scan = self.create_subscription(
+            LaserScan,
+            "/scan",
+            self._on_laser_scan,
+            scan_qos,
+        )
         self.sub_cmd = self.create_subscription(Twist, "/cmd_vel", self._on_cmd_vel, 10)
+        self.reset_service = self.create_service(
+            Trigger,
+            "/cubey/reset_odometry",
+            self._handle_reset_odometry,
+        )
 
         # Periodic publish timer
         self.timer = self.create_timer(1.0 / self.freq, self._publish_odometry)
@@ -98,11 +117,39 @@ class CubeyOdometryNode(Node):
         self.vy = msg.linear.y
         self.wz = msg.angular.z
 
+    def _handle_reset_odometry(self, request, response):
+        """Reset the local odom frame when a new SLAM mapping session begins."""
+        self.x = 0.0
+        self.y = 0.0
+        self.yaw = 0.0
+        self.vx = 0.0
+        self.vy = 0.0
+        self.wz = 0.0
+        self.prev_points = None
+        self.last_scan_time = 0.0
+        response.success = True
+        response.message = "Cubey odometry reset."
+        self.get_logger().info("Odometry reset to the mapping origin.")
+        return response
+
     def _on_laser_scan(self, msg: LaserScan):
         """Correlate consecutive scans to refine displacement (X, Y, Yaw)."""
-        now_time = time.time()
-        dt = now_time - self.last_scan_time if self.last_scan_time > 0 else 0.1
-        self.last_scan_time = now_time
+        scan_time = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) / 1e9
+        ros_now = self.get_clock().now().nanoseconds / 1e9
+        if scan_time <= 0.0:
+            scan_time = ros_now
+
+        # A delayed pre-reset scan must never be integrated into the new odom
+        # frame. Depth-one QoS prevents backlog; this check handles anything
+        # already in transit when reset occurs.
+        scan_age = ros_now - scan_time
+        if scan_age > 0.25:
+            return
+
+        dt = scan_time - self.last_scan_time if self.last_scan_time > 0 else 0.0
+        if self.last_scan_time > 0 and dt <= 0.0:
+            return
+        self.last_scan_time = scan_time
 
         ranges = np.array(msg.ranges, dtype=np.float32)
         angles = msg.angle_min + np.arange(len(ranges)) * msg.angle_increment
@@ -125,20 +172,35 @@ class CubeyOdometryNode(Node):
             step = len(current_points) // 80
             current_points = current_points[::step]
 
-        if self.prev_points is not None and dt < 0.5:
-            # Simple ICP / Point-to-Point correlation search centered around dead-reckoned motion
-            dx_est = (self.vx * math.cos(self.yaw) - self.vy * math.sin(self.yaw)) * dt
-            dy_est = (self.vx * math.sin(self.yaw) + self.vy * math.cos(self.yaw)) * dt
+        is_stationary = abs(self.vx) < 0.005 and abs(self.vy) < 0.005 and abs(self.wz) < 0.01
+        if is_stationary:
+            # Never manufacture motion from LiDAR noise while the motor command is zero.
+            self.prev_points = current_points
+            return
+
+        if self.prev_points is not None and 0.0 < dt < 0.5:
+            # Estimate motion in the robot-local frame. Scan correlation decides
+            # whether commanded translation really happened (important when stuck).
+            dx_est = self.vx * dt
+            dy_est = self.vy * dt
             dyaw_est = self.wz * dt
+            lock_translation = abs(self.vx) < 0.01 and abs(self.vy) < 0.01
 
             # Refine pose delta using scan matching
-            dx_match, dy_match, dyaw_match = self._correlate_scans(
-                self.prev_points, current_points, dx_est, dy_est, dyaw_est
+            local_dx, local_dy, dyaw_match = self._correlate_scans(
+                self.prev_points,
+                current_points,
+                dx_est,
+                dy_est,
+                dyaw_est,
+                lock_translation=lock_translation,
             )
 
-            # Update pose
-            self.x += dx_match
-            self.y += dy_match
+            # Rotate the measured local translation into the odom frame.
+            cos_yaw = math.cos(self.yaw)
+            sin_yaw = math.sin(self.yaw)
+            self.x += local_dx * cos_yaw - local_dy * sin_yaw
+            self.y += local_dx * sin_yaw + local_dy * cos_yaw
             self.yaw += dyaw_match
             # Normalize yaw to [-pi, pi]
             self.yaw = math.atan2(math.sin(self.yaw), math.cos(self.yaw))
@@ -150,7 +212,8 @@ class CubeyOdometryNode(Node):
 
     def _correlate_scans(
         self, prev_pts: np.ndarray, curr_pts: np.ndarray,
-        dx_init: float, dy_init: float, dyaw_init: float
+        dx_init: float, dy_init: float, dyaw_init: float,
+        lock_translation: bool = False,
     ) -> Tuple[float, float, float]:
         """Fast grid-search scan match around initial motion estimate."""
         best_score = float("inf")
@@ -158,10 +221,16 @@ class CubeyOdometryNode(Node):
         best_dy = dy_init
         best_dyaw = dyaw_init
 
-        # Local search window
-        dx_candidates = [dx_init - 0.03, dx_init, dx_init + 0.03]
-        dy_candidates = [dy_init - 0.03, dy_init, dy_init + 0.03]
+        # Always evaluate zero translation. If the wheels spin against an
+        # obstacle, the stationary scan alignment should beat dead reckoning.
+        dx_candidates = [0.0] if lock_translation else [0.0, dx_init - 0.03, dx_init, dx_init + 0.03]
+        dy_candidates = [0.0] if lock_translation else [0.0, dy_init - 0.03, dy_init, dy_init + 0.03]
         dyaw_candidates = [dyaw_init - 0.04, dyaw_init, dyaw_init + 0.04]
+        zero_motion_score = float("inf")
+
+        # Zero yaw is mandatory. Without it, a commanded rotation forces the
+        # estimator to invent a turn even when Cubey is physically stuck.
+        dyaw_candidates = list(dict.fromkeys([0.0, *dyaw_candidates]))
 
         for dyaw in dyaw_candidates:
             cos_a = math.cos(dyaw)
@@ -184,26 +253,35 @@ class CubeyOdometryNode(Node):
                     )
                     score = np.mean(dists_sq)
 
+                    if dx == 0.0 and dy == 0.0 and dyaw == 0.0:
+                        zero_motion_score = score
+
                     if score < best_score:
                         best_score = score
                         best_dx = dx
                         best_dy = dy
                         best_dyaw = dyaw
 
+        # Require measured scan alignment to beat the exact zero-motion case
+        # before accepting either translation or rotation. Commands only seed
+        # the search; they are never proof that the chassis moved.
+        improvement = (zero_motion_score - best_score) / max(zero_motion_score, 1e-9)
+        if improvement < 0.03:
+            return 0.0, 0.0, 0.0
+
+        if lock_translation:
+            return 0.0, 0.0, best_dyaw
+
         return best_dx, best_dy, best_dyaw
 
     def _publish_odometry(self):
         """Periodically broadcast /odom message and TF transform."""
         now = self.get_clock().now()
-        dt = (now - self.last_update_time).nanoseconds / 1e9
-        self.last_update_time = now
 
-        # Integrate velocity if no recent scan update occurred
-        if dt > 0 and dt < 0.2:
-            self.x += (self.vx * math.cos(self.yaw) - self.vy * math.sin(self.yaw)) * dt
-            self.y += (self.vx * math.sin(self.yaw) + self.vy * math.cos(self.yaw)) * dt
-            self.yaw += self.wz * dt
-            self.yaw = math.atan2(math.sin(self.yaw), math.cos(self.yaw))
+        # Fail closed when LiDAR is late or absent. Open-loop command integration
+        # made the web trail and SLAM pose move while the physical robot was stuck.
+        # Holding the last scan-confirmed pose lets Nav2's progress checker stop
+        # safely instead of corrupting the map.
 
         qx, qy, qz, qw = quaternion_from_euler(0, 0, self.yaw)
 

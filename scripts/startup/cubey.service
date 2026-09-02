@@ -8,8 +8,8 @@
 
 [Unit]
 Description=Cubey - Gemini Live Robot
-After=network-online.target sound.target
-Wants=network-online.target
+After=network-online.target sound.target cubey-nav2.service
+Wants=network-online.target cubey-nav2.service
 
 [Service]
 Type=simple

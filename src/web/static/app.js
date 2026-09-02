@@ -153,16 +153,16 @@
   }
 
   function handleMapUpdate(data) {
-    robotPose = data.pose || robotPose;
-    trajectory = data.trajectory || trajectory;
-    laserScan = data.laser_scan || laserScan;
+    robotPose = data.pose ?? robotPose;
+    trajectory = data.trajectory ?? trajectory;
+    laserScan = data.laser_scan ?? laserScan;
 
-    gridWidth = data.width || gridWidth;
-    gridHeight = data.height || gridHeight;
-    resolutionCm = data.resolution_cm || resolutionCm;
+    gridWidth = data.width ?? gridWidth;
+    gridHeight = data.height ?? gridHeight;
+    resolutionCm = data.resolution_cm ?? resolutionCm;
     resolutionM = resolutionCm / 100.0;
-    originXM = data.origin_x_m || originXM;
-    originYM = data.origin_y_m || originYM;
+    originXM = data.origin_x_m ?? originXM;
+    originYM = data.origin_y_m ?? originYM;
 
     isMapping = data.is_mapping;
     activeMapName = data.map_name || activeMapName;
@@ -348,8 +348,8 @@
 
     ctx.save();
     ctx.translate(rx, ry);
-    // Rotate by heading: theta_deg (0° is North / -Y in canvas coords)
-    ctx.rotate((robotPose.theta_deg * Math.PI) / 180.0);
+    // Rotate by heading: theta_deg (0° points along Cartesian +X / East, counter-clockwise)
+    ctx.rotate((-robotPose.theta_deg * Math.PI) / 180.0);
 
     // Robot body circle
     ctx.fillStyle = "#89B4FA";
@@ -360,12 +360,12 @@
     ctx.lineWidth = 2;
     ctx.stroke();
 
-    // Direction pointer triangle (pointing forward UP in local frame)
+    // Direction pointer triangle (pointing forward along +X in local robot frame)
     ctx.fillStyle = "#F5E0DC";
     ctx.beginPath();
-    ctx.moveTo(0, -rRadius - 6);
-    ctx.lineTo(-rRadius * 0.6, 0);
-    ctx.lineTo(rRadius * 0.6, 0);
+    ctx.moveTo(rRadius + 7, 0);
+    ctx.lineTo(rRadius * 0.1, -rRadius * 0.55);
+    ctx.lineTo(rRadius * 0.1, rRadius * 0.55);
     ctx.closePath();
     ctx.fill();
 
@@ -639,13 +639,18 @@
     btnStartAuto.addEventListener("click", async () => {
       modalModeSelect.classList.add("hidden");
       try {
-        await fetch("/api/mapping/start", {
+        const response = await fetch("/api/mapping/start", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ mode: "autonomous" }),
         });
+        if (!response.ok) {
+          const error = await response.json().catch(() => ({}));
+          throw new Error(error.detail || "Nav2 mapping failed to start");
+        }
       } catch (e) {
         console.error("Failed to start autonomous mapping:", e);
+        alert(`Autonomous mapping did not start: ${e.message}`);
       }
     });
   }
@@ -654,21 +659,39 @@
     btnStartManual.addEventListener("click", async () => {
       modalModeSelect.classList.add("hidden");
       try {
-        await fetch("/api/mapping/start", {
+        const response = await fetch("/api/mapping/start", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ mode: "manual" }),
         });
+        if (!response.ok) {
+          const error = await response.json().catch(() => ({}));
+          throw new Error(error.detail || "SLAM mapping failed to start");
+        }
       } catch (e) {
         console.error("Failed to start manual mapping:", e);
+        alert(`Manual mapping did not start: ${e.message}`);
       }
     });
   }
 
 
-  btnResetMap.addEventListener("click", () => {
+  btnResetMap.addEventListener("click", async () => {
     if (confirm("Reset current occupancy grid map and robot pose?")) {
-      fetch("/api/mapping/reset", { method: "POST" });
+      try {
+        const response = await fetch("/api/mapping/reset", { method: "POST" });
+        if (!response.ok) {
+          const error = await response.json().catch(() => ({}));
+          throw new Error(error.detail || "SLAM map reset failed");
+        }
+        gridBuffer = new Int8Array(0);
+        trajectory = [];
+        robotPose = { x_m: 0, y_m: 0, theta_deg: 0 };
+        render();
+      } catch (e) {
+        console.error("Failed to reset SLAM map:", e);
+        alert(`Map reset failed: ${e.message}`);
+      }
     }
   });
 

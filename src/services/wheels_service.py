@@ -7,7 +7,9 @@ and pulse/continuous motion dispatch.
 """
 
 import logging
+import os
 import platform
+import socket
 import threading
 import time
 from dataclasses import dataclass, field
@@ -94,6 +96,7 @@ class WheelsService:
         self._write_lock = threading.Lock()
         self._is_connected: bool = False
         self._is_mock: bool = False
+        self._use_bridge: bool = (platform.system().lower() == "linux")
 
         self._reader_thread: Optional[threading.Thread] = None
         self._running: bool = False
@@ -178,6 +181,21 @@ class WheelsService:
 
         self.disconnect()
 
+        # If ROS 2 Bridge mode is active (default on Linux robot), use UDP 9876
+        if self._use_bridge:
+            self._is_mock = False
+            self._is_connected = True
+            self._running = True
+            if not self._reader_thread or not self._reader_thread.is_alive():
+                self._reader_thread = threading.Thread(
+                    target=self._ipc_telemetry_loop, daemon=True, name="WheelsIPCTelemetry"
+                )
+                self._reader_thread.start()
+            self._emit_log("Connected to ESP32 via ROS 2 Bridge (UDP 9876)")
+            self._emit_connection_change(True, "Connected (ROS 2 Bridge)")
+            logger.info("WheelsService connected to ESP32 via ROS 2 Bridge (UDP 9876).")
+            return True
+
         if self.port == "MOCK_SIMULATOR" or not PYSERIAL_AVAILABLE:
             self._is_mock = True
             self._is_connected = True
@@ -240,9 +258,22 @@ class WheelsService:
         return False
 
     def disconnect(self) -> None:
-        """Safely close serial port and terminate background worker threads."""
+        """Safely close connection and terminate background worker threads."""
         self._stop_continuous_repeat()
         self._running = False
+
+        if self._use_bridge:
+            try:
+                self.stop()
+            except Exception:
+                pass
+            self._is_connected = False
+            if self._reader_thread and self._reader_thread.is_alive():
+                self._reader_thread.join(timeout=0.5)
+            self._reader_thread = None
+            self._emit_log("Disconnected from ROS 2 Wheels Bridge.")
+            self._emit_connection_change(False, "Disconnected")
+            return
 
         if self._serial:
             try:
@@ -263,17 +294,47 @@ class WheelsService:
             self._emit_log("Disconnected from serial port.")
             self._emit_connection_change(False, "Disconnected")
 
+    def _ipc_telemetry_loop(self):
+        """Reads ESP32 telemetry from /tmp/cubey_wheels_telemetry.txt written by cmd_vel_serial_bridge."""
+        status_file = "/tmp/cubey_wheels_telemetry.txt"
+        last_mtime = 0.0
+        while self._running:
+            try:
+                if os.path.exists(status_file):
+                    mtime = os.path.getmtime(status_file)
+                    if mtime != last_mtime:
+                        last_mtime = mtime
+                        with open(status_file, "r") as f:
+                            line = f.read().strip()
+                        if line:
+                            self._parse_incoming_line(line)
+            except Exception:
+                pass
+            time.sleep(0.2)
+
     # ------------------------------------------------------------------
     # Command Dispatchers
     # ------------------------------------------------------------------
 
     def send_raw(self, line: str) -> bool:
-        """Write raw ASCII line over serial port."""
+        """Write raw ASCII line over serial port or UDP ROS bridge."""
         if not self._is_connected:
             self._emit_log(f"Cannot send '{line}': not connected")
             return False
 
         line = line.strip()
+
+        if self._use_bridge:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.sendto((line + "\n").encode("ascii"), ("127.0.0.1", 9876))
+                sock.close()
+                self._emit_log(f"[TX-ROS] {line}")
+                return True
+            except Exception as e:
+                logger.debug("UDP send error: %s", e)
+                return False
+
         data = (line + "\n").encode("utf-8")
 
         if self._is_mock:

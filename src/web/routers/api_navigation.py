@@ -4,7 +4,7 @@ SLAM mapping sessions, waypoint navigation, and teleoperation motor drive endpoi
 
 import logging
 from typing import Optional
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from src.services.mapping_service import get_mapping_service
@@ -41,9 +41,15 @@ async def start_mapping_session(req: Optional[StartMappingRequest] = None, _: st
     mode = (req.mode if req and req.mode else "manual").lower()
 
     if mode == "autonomous":
-        nav_svc.start_exploration()
+        started = nav_svc.start_exploration()
     else:
-        nav_svc.start_manual_mapping()
+        started = nav_svc.start_manual_mapping()
+
+    if not started:
+        raise HTTPException(
+            status_code=503,
+            detail="ROS 2 Nav2/SLAM is not ready; mapping was not started.",
+        )
 
     return {"status": "mapping_started", "mode": mode}
 
@@ -60,9 +66,13 @@ async def pause_mapping_session(_: str = Depends(verify_credentials)):
 
 @router.post("/mapping/reset")
 async def reset_mapping_grid(_: str = Depends(verify_credentials)):
-    """Clear the occupancy grid back to unexplored space."""
-    mapping_svc = get_mapping_service()
-    mapping_svc.reset_map()
+    """Clear the real SLAM graph, occupancy grid, trajectory, and robot pose."""
+    nav_svc = get_nav_service()
+    if not nav_svc.reset_mapping():
+        raise HTTPException(
+            status_code=503,
+            detail="ROS 2 SLAM did not acknowledge the map reset.",
+        )
     return {"status": "map_reset"}
 
 

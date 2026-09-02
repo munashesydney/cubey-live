@@ -4,8 +4,11 @@ Real-time WebSocket streaming endpoints for Live 2D SLAM Maps and Microphone Aud
 
 import asyncio
 import base64
+import json
 import logging
+import os
 import secrets
+import time
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
 
@@ -125,6 +128,46 @@ async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(
                     "nav_mode": nav_svc.telemetry.mode,
                     "timestamp": snapshot.timestamp,
                 }
+
+                # If ROS 2 SLAM Toolbox has a live map, use one consistent set of
+                # ROS dimensions on every frame. Alternating legacy/ROS metadata
+                # makes the canvas reject its existing grid and visibly blink.
+                nav2_map_file = "/tmp/cubey_nav2_live_map.json"
+                if os.path.exists(nav2_map_file):
+                    try:
+                        with open(nav2_map_file, "r") as f:
+                            nav2_data = json.load(f)
+                        payload["pose"] = nav2_data.get("pose", payload["pose"])
+                        payload["trajectory"] = nav2_data.get("trajectory", [])
+                        payload["width"] = nav2_data.get("width", payload["width"])
+                        payload["height"] = nav2_data.get("height", payload["height"])
+                        payload["resolution_cm"] = nav2_data.get("resolution_cm", payload["resolution_cm"])
+                        payload["origin_x_m"] = nav2_data.get("origin_x_m", payload["origin_x_m"])
+                        payload["origin_y_m"] = nav2_data.get("origin_y_m", payload["origin_y_m"])
+                        payload["grid_compressed_b64"] = None
+                        if send_grid and nav2_data.get("grid_compressed_b64"):
+                            payload["grid_compressed_b64"] = nav2_data["grid_compressed_b64"]
+                    except Exception:
+                        pass
+
+                # The native ROS LiDAR owns the hardware, so its live points
+                # arrive through a small loopback IPC snapshot rather than the
+                # disabled legacy Python LiDAR service.
+                nav2_scan_file = "/tmp/cubey_nav2_live_scan.json"
+                if os.path.exists(nav2_scan_file):
+                    try:
+                        with open(nav2_scan_file, "r") as scan_file:
+                            nav2_scan = json.load(scan_file)
+                        scan_timestamp = float(nav2_scan.get("timestamp", 0.0))
+                        scan_age = time.time() - scan_timestamp
+                        if scan_age <= 1.0:
+                            payload["laser_scan"] = nav2_scan.get("laser_scan", [])
+                            ros_scan_rate = nav2_scan.get("scan_rate_hz")
+                            if isinstance(ros_scan_rate, (int, float)) and ros_scan_rate > 0:
+                                payload["lidar_rate_hz"] = round(float(ros_scan_rate), 1)
+                    except Exception:
+                        pass
+
                 await websocket.send_json(payload)
                 await asyncio.sleep(0.10)  # 10 Hz stream
             except Exception:
@@ -172,8 +215,7 @@ async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(
                 nav_svc.navigate_to(x_m=x, y_m=y)
 
             elif mtype == "reset_map":
-                nav_svc.stop_navigation()
-                mapping_svc.reset_map()
+                nav_svc.reset_mapping()
 
     except WebSocketDisconnect:
         pass

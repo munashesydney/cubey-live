@@ -201,8 +201,16 @@ else
         | tr -d '\r' \
         | sudo tee /etc/systemd/system/cubey.service > /dev/null
 
+    sed -e "s|__USER__|${USER}|g" \
+        -e "s|__HOME__|${HOME}|g" \
+        -e "s|__PROJECT_ROOT__|${PROJECT_ROOT}|g" \
+        "${SCRIPT_DIR}/cubey-nav2.service" \
+        | tr -d '\r' \
+        | sudo tee /etc/systemd/system/cubey-nav2.service > /dev/null
+
     sudo systemctl daemon-reload
-    sudo systemctl enable cubey.service
+    sudo systemctl enable cubey-nav2.service cubey.service
+    sudo systemctl start cubey-nav2.service
     if sudo systemctl start cubey.service; then
         echo "==> Cubey autostart installed and started."
     else

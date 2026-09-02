@@ -7,10 +7,16 @@ velocities to normalized [-1000..1000] integer space, and dispatches TWIST packe
 to the ESP32 (cubey_wheels) over hardware UART (/dev/ttyAMA0 @ 115200 baud).
 """
 
-import sys
-import time
-import threading
+from __future__ import annotations
+
+import json
 import logging
+import os
+import select
+import socket
+import sys
+import threading
+import time
 from typing import Optional
 
 try:
@@ -30,6 +36,87 @@ logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(levelname)s] [c
 logger = logging.getLogger("cmd_vel_bridge")
 
 
+def apply_minimum_effective_command(
+    forward: int,
+    left: int,
+    counter_clockwise: int,
+    minimum: int,
+) -> tuple[int, int, int]:
+    """Raise a nonzero command vector above the drivetrain's static-friction floor."""
+    peak = max(abs(forward), abs(left), abs(counter_clockwise))
+    minimum = max(0, min(1000, int(minimum)))
+    if peak == 0 or minimum == 0 or peak >= minimum:
+        return forward, left, counter_clockwise
+
+    scale = minimum / peak
+    return (
+        int(round(forward * scale)),
+        int(round(left * scale)),
+        int(round(counter_clockwise * scale)),
+    )
+
+
+class MinimumEffectiveCommandPulseFilter:
+    """Preserve weak command averages using short, motor-effective pulses."""
+
+    def __init__(self, minimum: int, pulse_frames: int = 3):
+        self.minimum = max(0, min(1000, int(minimum)))
+        self.pulse_frames = max(1, int(pulse_frames))
+        self._accumulator = 0
+        self._pulse_frames_remaining = 0
+        self._last_command: Optional[tuple[int, int, int]] = None
+
+    def reset(self):
+        self._accumulator = 0
+        self._pulse_frames_remaining = 0
+        self._last_command = None
+
+    def apply(
+        self,
+        forward: int,
+        left: int,
+        counter_clockwise: int,
+    ) -> tuple[int, int, int]:
+        command = (forward, left, counter_clockwise)
+        peak = max(abs(value) for value in command)
+
+        if peak == 0:
+            self.reset()
+            return command
+
+        if self.minimum == 0 or peak >= self.minimum:
+            self.reset()
+            return command
+
+        # Do not spend accumulated demand in a newly reversed direction. This
+        # matters when Nav2 crosses its target heading and changes turn sign.
+        if self._last_command is not None:
+            direction_dot = sum(
+                previous * current
+                for previous, current in zip(self._last_command, command)
+            )
+            if direction_dot <= 0:
+                self._accumulator = 0
+                self._pulse_frames_remaining = 0
+        self._last_command = command
+
+        # Integer pulse-density modulation: over time, the emitted command's
+        # average equals Nav2's requested magnitude, while each nonzero pulse
+        # reaches the drivetrain's usable static-friction threshold.
+        self._accumulator += peak
+        if self._pulse_frames_remaining > 0:
+            self._pulse_frames_remaining -= 1
+            return apply_minimum_effective_command(*command, self.minimum)
+
+        pulse_threshold = self.minimum * self.pulse_frames
+        if self._accumulator < pulse_threshold:
+            return (0, 0, 0)
+
+        self._accumulator -= pulse_threshold
+        self._pulse_frames_remaining = self.pulse_frames - 1
+        return apply_minimum_effective_command(*command, self.minimum)
+
+
 class CmdVelSerialBridgeNode(Node):
     """Bridges ROS 2 /cmd_vel velocity commands to Cubey's ESP32 mecanum controller."""
 
@@ -42,6 +129,11 @@ class CmdVelSerialBridgeNode(Node):
         self.declare_parameter("max_linear_x_mps", 0.30)
         self.declare_parameter("max_linear_y_mps", 0.25)
         self.declare_parameter("max_angular_z_radps", 1.80)
+        # The ESP32 runs the motors at speed 180/255. A normalized command of
+        # 390 therefore produces about 70 PWM, the firmware's proven minimum
+        # useful motor-test power. Lower values only make Cubey's motors buzz.
+        self.declare_parameter("minimum_effective_command", 390)
+        self.declare_parameter("minimum_effective_pulse_frames", 3)
         self.declare_parameter("command_timeout_sec", 0.40)
         self.declare_parameter("publish_rate_hz", 20.0)
 
@@ -50,6 +142,12 @@ class CmdVelSerialBridgeNode(Node):
         self.max_vx = float(self.get_parameter("max_linear_x_mps").value)
         self.max_vy = float(self.get_parameter("max_linear_y_mps").value)
         self.max_wz = float(self.get_parameter("max_angular_z_radps").value)
+        self.minimum_effective_command = int(
+            self.get_parameter("minimum_effective_command").value
+        )
+        self.minimum_effective_pulse_frames = int(
+            self.get_parameter("minimum_effective_pulse_frames").value
+        )
         self.timeout_sec = float(self.get_parameter("command_timeout_sec").value)
         self.publish_rate = float(self.get_parameter("publish_rate_hz").value)
 
@@ -59,6 +157,10 @@ class CmdVelSerialBridgeNode(Node):
         self.target_forward = 0
         self.target_left = 0
         self.target_ccw = 0
+        self.command_filter = MinimumEffectiveCommandPulseFilter(
+            self.minimum_effective_command,
+            self.minimum_effective_pulse_frames,
+        )
         self.last_cmd_time = time.time()
         self.is_active = False
 
@@ -79,6 +181,17 @@ class CmdVelSerialBridgeNode(Node):
         self._running = True
         self._reader_thread = threading.Thread(target=self._read_telemetry_loop, daemon=True)
         self._reader_thread.start()
+
+        # Background UDP listener for Python application layer (teleop, web joystick, Gemini voice)
+        self._udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            self._udp_sock.bind(("127.0.0.1", 9876))
+            self._udp_sock.setblocking(False)
+            self._udp_thread = threading.Thread(target=self._udp_listener_loop, daemon=True)
+            self._udp_thread.start()
+            self.get_logger().info("UDP IPC Command Listener active on 127.0.0.1:9876")
+        except Exception as e:
+            self.get_logger().warn(f"Could not bind UDP 9876: {e}")
 
         self.get_logger().info(f"Cubey cmd_vel Serial Bridge started on {self.port} @ {self.baudrate} baud")
 
@@ -126,12 +239,18 @@ class CmdVelSerialBridgeNode(Node):
                 self.target_forward = 0
                 self.target_left = 0
                 self.target_ccw = 0
+                self.command_filter.reset()
                 self.is_active = False
                 self._send_raw("TWIST:0,0,0\n")
             return
 
         if self.is_active:
-            packet = f"TWIST:{self.target_forward},{self.target_left},{self.target_ccw}\n"
+            forward, left, ccw = self.command_filter.apply(
+                self.target_forward,
+                self.target_left,
+                self.target_ccw,
+            )
+            packet = f"TWIST:{forward},{left},{ccw}\n"
             self._send_raw(packet)
 
     def _send_raw(self, packet: str):
@@ -145,8 +264,92 @@ class CmdVelSerialBridgeNode(Node):
             except Exception as e:
                 self.get_logger().error(f"Serial write error: {e}")
 
+    def _udp_listener_loop(self):
+        """Listens for commands from wheels_service.py on localhost:9876."""
+        while self._running:
+            try:
+                ready, _, _ = select.select([self._udp_sock], [], [], 0.5)
+                if not ready:
+                    continue
+                data, _ = self._udp_sock.recvfrom(4096)
+                if not data:
+                    continue
+                text = data.decode("utf-8", errors="ignore").strip()
+                if not text:
+                    continue
+
+                if text.startswith("{"):
+                    try:
+                        cmd = json.loads(text)
+                        action = cmd.get("action")
+                        speed = int(cmd.get("speed", 180))
+                        norm = int(max(0, min(1000, (speed / 255.0) * 1000)))
+                        if action == "forward":
+                            self.target_forward = norm
+                            self.target_left = 0
+                            self.target_ccw = 0
+                        elif action == "backward":
+                            self.target_forward = -norm
+                            self.target_left = 0
+                            self.target_ccw = 0
+                        elif action == "strafeLeft":
+                            self.target_forward = 0
+                            self.target_left = norm
+                            self.target_ccw = 0
+                        elif action == "strafeRight":
+                            self.target_forward = 0
+                            self.target_left = -norm
+                            self.target_ccw = 0
+                        elif action == "rotateLeft":
+                            self.target_forward = 0
+                            self.target_left = 0
+                            self.target_ccw = norm
+                        elif action == "rotateRight":
+                            self.target_forward = 0
+                            self.target_left = 0
+                            self.target_ccw = -norm
+                        elif action == "forwardLeft":
+                            self.target_forward = norm
+                            self.target_left = norm // 2
+                            self.target_ccw = 0
+                        elif action == "forwardRight":
+                            self.target_forward = norm
+                            self.target_left = -norm // 2
+                            self.target_ccw = 0
+                        elif action == "stop":
+                            self.target_forward = 0
+                            self.target_left = 0
+                            self.target_ccw = 0
+                            self.command_filter.reset()
+                        elif "vx" in cmd or "wz" in cmd:
+                            vx = float(cmd.get("vx", 0.0))
+                            vy = float(cmd.get("vy", 0.0))
+                            wz = float(cmd.get("wz", 0.0))
+                            self.target_forward = int(max(-1.0, min(1.0, vx / self.max_vx)) * 1000) if self.max_vx > 0 else 0
+                            self.target_left = int(max(-1.0, min(1.0, vy / self.max_vy)) * 1000) if self.max_vy > 0 else 0
+                            self.target_ccw = int(max(-1.0, min(1.0, wz / self.max_wz)) * 1000) if self.max_wz > 0 else 0
+                        self.last_cmd_time = time.time()
+                        self.is_active = True
+                    except Exception:
+                        pass
+                else:
+                    # Raw ASCII line (e.g. "CMD:forward", "CMD:stop", "SPEED:180", "PING")
+                    if text.lower() == "cmd:stop":
+                        self.target_forward = 0
+                        self.target_left = 0
+                        self.target_ccw = 0
+                        self.command_filter.reset()
+                        self.last_cmd_time = time.time()
+                        self.is_active = True
+                        self._send_raw("TWIST:0,0,0\n")
+                    self._send_raw(f"{text}\n")
+            except Exception:
+                time.sleep(0.05)
+
     def _read_telemetry_loop(self):
         """Reads incoming telemetry from ESP32."""
+        tmp_telemetry = "/tmp/cubey_wheels_telemetry.txt"
+        tmp_w = "/tmp/cubey_wheels_telemetry.txt.tmp"
         while self._running:
             if not self.serial_conn or not self.serial_conn.is_open:
                 time.sleep(1.0)
@@ -154,14 +357,23 @@ class CmdVelSerialBridgeNode(Node):
                 continue
             try:
                 line = self.serial_conn.readline().decode("utf-8", errors="ignore").strip()
-                if line and "TELEMETRY:" in line:
-                    # Telemetry received from ESP32
-                    pass
+                if line:
+                    try:
+                        with open(tmp_w, "w") as f:
+                            f.write(line + "\n")
+                        os.replace(tmp_w, tmp_telemetry)
+                    except Exception:
+                        pass
             except Exception:
                 time.sleep(0.1)
 
     def destroy_node(self):
         self._running = False
+        if hasattr(self, "_udp_sock") and self._udp_sock:
+            try:
+                self._udp_sock.close()
+            except Exception:
+                pass
         if self.serial_conn and self.serial_conn.is_open:
             try:
                 self._send_raw("TWIST:0,0,0\nCMD:stop\n")
