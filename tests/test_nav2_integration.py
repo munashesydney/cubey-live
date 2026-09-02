@@ -608,7 +608,7 @@ class Nav2IntegrationTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn('if st == "ERROR":', source)
+        self.assertIn('if st in ("ERROR", "INCOMPLETE"):', source)
         self.assertIn("Nav2 mapping could not be finalized", source)
 
     @patch("src.services.navigation.cubey_nav_service.threading.Thread")
