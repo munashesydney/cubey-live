@@ -55,6 +55,11 @@ except ImportError as e:
 class CubeyFrontierExplorerNode(Node):
     """Autonomous room exploration supervisor with auto-stop for Nav2 and SLAM Toolbox."""
 
+    GOAL_FRONTIER = "FRONTIER"
+    GOAL_SURVEY = "SURVEY"
+    GOAL_MANUAL = "MANUAL"
+    GOAL_RETURN = "RETURN_TO_DOCK"
+
     def __init__(self):
         super().__init__("cubey_frontier_explorer")
 
@@ -100,6 +105,8 @@ class CubeyFrontierExplorerNode(Node):
         self.current_frontier_coord: Optional[Tuple[float, float]] = None
         self.goal_start_time: float = 0.0
         self.active_goal_handle = None
+        self.active_goal_purpose: Optional[str] = None
+        self.nav_goal_generation: int = 0
         self.active_plan_handle = None
         # World-frame entries remain valid when SLAM grows the occupancy grid
         # and changes its grid origin. Each entry is (x_m, y_m, expiry_time).
@@ -239,7 +246,12 @@ class CubeyFrontierExplorerNode(Node):
                     continue
                 self._cancel_active_nav_goal()
                 self.state = "NAVIGATING"
-                self._send_nav2_goal(x_m, y_m, theta_rad)
+                self._send_nav2_goal(
+                    x_m,
+                    y_m,
+                    theta_rad,
+                    purpose=self.GOAL_MANUAL,
+                )
 
     def _start_exploration(self):
         # Every autonomous mission starts from a genuinely blank SLAM graph.
@@ -699,6 +711,7 @@ class CubeyFrontierExplorerNode(Node):
             target_y,
             target_yaw,
             frontier_coord=(frontier_x, frontier_y),
+            purpose=self.GOAL_FRONTIER,
         )
 
     def _reject_planned_frontier(self, candidate, generation: int) -> None:
@@ -716,13 +729,14 @@ class CubeyFrontierExplorerNode(Node):
         target_y: float,
         target_yaw: float = 0.0,
         frontier_coord: Optional[Tuple[float, float]] = None,
+        purpose: str = GOAL_FRONTIER,
     ):
         """Dispatches an action goal to Nav2 bt_navigator."""
         if not self.nav_client.wait_for_server(timeout_sec=2.0):
             self.get_logger().warn("Nav2 navigate_to_pose action server not yet ready.")
-            if self.state == "NAVIGATING":
+            if purpose == self.GOAL_MANUAL:
                 self.state = "ERROR"
-            elif self.state == "RETURNING_TO_DOCK":
+            elif purpose == self.GOAL_RETURN:
                 self.get_logger().warn("Dock goal could not start; saving the map at the current safe position.")
                 self._initiate_map_finalization()
             return
@@ -733,46 +747,70 @@ class CubeyFrontierExplorerNode(Node):
         self.current_goal_coord = (target_x, target_y)
         self.current_frontier_coord = frontier_coord
         self.goal_start_time = time.time()
+        self.nav_goal_generation += 1
+        generation = self.nav_goal_generation
+        self.active_goal_purpose = purpose
 
         send_future = self.nav_client.send_goal_async(
             goal_msg,
             feedback_callback=self._on_nav2_feedback
         )
-        send_future.add_done_callback(self._on_goal_response)
+        send_future.add_done_callback(
+            lambda completed: self._on_goal_response(completed, generation, purpose)
+        )
 
-    def _on_goal_response(self, future):
-        goal_handle = future.result()
+    def _on_goal_response(self, future, generation: int, purpose: str):
+        try:
+            goal_handle = future.result()
+        except Exception as error:
+            if generation != self.nav_goal_generation:
+                return
+            self.get_logger().warn(f"Nav2 rejected {purpose} goal: {error}")
+            self._handle_goal_failure(purpose)
+            self._clear_current_goal(generation)
+            return
+
+        if generation != self.nav_goal_generation:
+            # A stop/reset/return transition superseded this request before the
+            # action server answered. Cancel it without touching current state.
+            if goal_handle.accepted:
+                goal_handle.cancel_goal_async()
+            return
+
         if not goal_handle.accepted:
-            self.get_logger().warn("Nav2 rejected frontier goal! Blacklisting coordinate.")
-            if (self.current_frontier_coord or self.current_goal_coord) and self.latest_map:
-                self._blacklist_coord(self.current_frontier_coord or self.current_goal_coord)
-            self.current_goal_coord = None
-            self.current_frontier_coord = None
-            if self.state == "NAVIGATING":
-                self.state = "BLOCKED"
-            elif self.state == "RETURNING_TO_DOCK":
-                self._initiate_map_finalization()
+            self.get_logger().warn(f"Nav2 rejected {purpose} goal.")
+            self._handle_goal_failure(purpose)
+            self._clear_current_goal(generation)
             return
 
         self.active_goal_handle = goal_handle
         result_future = goal_handle.get_result_async()
-        result_future.add_done_callback(self._on_goal_result)
+        result_future.add_done_callback(
+            lambda completed: self._on_goal_result(completed, generation, purpose)
+        )
 
     def _on_nav2_feedback(self, feedback_msg):
         # Progress check
         pass
 
-    def _on_goal_result(self, future):
-        result = future.result()
-        status = result.status
+    def _on_goal_result(self, future, generation: int, purpose: str):
+        if generation != self.nav_goal_generation:
+            self.get_logger().info(
+                f"Ignoring stale {purpose} result from superseded Nav2 goal generation {generation}."
+            )
+            return
+
+        try:
+            status = future.result().status
+        except Exception as error:
+            self.get_logger().warn(f"Nav2 {purpose} goal result failed: {error}")
+            status = GoalStatus.STATUS_ABORTED
         self.active_goal_handle = None
 
         if status == GoalStatus.STATUS_SUCCEEDED:
-            # Nav2 may occasionally report success after only rotating toward a
-            # short goal. Never count that as exploration unless SLAM confirms
-            # Cubey physically reached the target.
-            verified = self._goal_is_physically_reached(self.current_goal_coord)
-            if self.state == "EXPLORING" and not verified:
+            if purpose == self.GOAL_FRONTIER and not self._goal_is_physically_reached(
+                self.current_goal_coord
+            ):
                 distance = self._distance_to_goal(self.current_goal_coord)
                 self.get_logger().warn(
                     f"Nav2 reported success but SLAM pose is still {distance:.2f}m from the goal. "
@@ -780,23 +818,46 @@ class CubeyFrontierExplorerNode(Node):
                 )
                 if self.current_frontier_coord:
                     self._blacklist_coord(self.current_frontier_coord)
-            elif self.state == "RETURNING_TO_DOCK":
-                self._initiate_map_finalization(at_dock=True)
-            elif self.state == "NAVIGATING":
-                self.state = "REACHED"
-            else:
+            elif purpose == self.GOAL_FRONTIER:
                 self.get_logger().info("🎯 Reached frontier waypoint successfully!")
                 self.total_frontiers_mapped += 1
+            elif purpose == self.GOAL_SURVEY:
+                self.get_logger().info("Final room survey turn completed.")
+            elif purpose == self.GOAL_MANUAL:
+                self.state = "REACHED"
+            elif purpose == self.GOAL_RETURN:
+                if self._goal_is_physically_reached(self.current_goal_coord, tolerance_m=0.20):
+                    self._initiate_map_finalization(at_dock=True)
+                else:
+                    distance = self._distance_to_goal(self.current_goal_coord)
+                    self.get_logger().warn(
+                        f"Nav2 reported dock success but Cubey remains {distance:.2f}m away; "
+                        "saving at the current safe position."
+                    )
+                    self._initiate_map_finalization()
         else:
-            self.get_logger().warn(f"Nav2 goal terminated with status: {status}. Blacklisting coordinate.")
+            self.get_logger().warn(f"Nav2 {purpose} goal terminated with status: {status}.")
+            self._handle_goal_failure(purpose)
+
+        self._clear_current_goal(generation)
+
+    def _handle_goal_failure(self, purpose: str) -> None:
+        if purpose == self.GOAL_FRONTIER:
             if self.current_frontier_coord or self.current_goal_coord:
                 self._blacklist_coord(self.current_frontier_coord or self.current_goal_coord)
-            if self.state == "RETURNING_TO_DOCK":
-                self.get_logger().warn("Return-to-dock failed; saving the map at the current safe position.")
-                self._initiate_map_finalization()
-            elif self.state == "NAVIGATING":
-                self.state = "BLOCKED"
+        elif purpose == self.GOAL_RETURN:
+            self.get_logger().warn(
+                "Return-to-dock failed; saving the map at the current safe position."
+            )
+            self._initiate_map_finalization()
+        elif purpose == self.GOAL_MANUAL:
+            self.state = "BLOCKED"
 
+    def _clear_current_goal(self, generation: int) -> None:
+        if generation != self.nav_goal_generation:
+            return
+        self.active_goal_handle = None
+        self.active_goal_purpose = None
         self.current_goal_coord = None
         self.current_frontier_coord = None
 
@@ -814,6 +875,9 @@ class CubeyFrontierExplorerNode(Node):
         return self._distance_to_goal(goal) <= tolerance_m
 
     def _cancel_active_nav_goal(self):
+        # Invalidate callbacks before requesting cancellation. A delayed result
+        # from the old goal must never affect the next mission phase.
+        self.nav_goal_generation += 1
         self.frontier_selection_generation += 1
         self.frontier_plan_queue = []
         self.planning_frontier = False
@@ -829,6 +893,7 @@ class CubeyFrontierExplorerNode(Node):
             except Exception as e:
                 self.get_logger().warn(f"Error cancelling goal: {e}")
         self.active_goal_handle = None
+        self.active_goal_purpose = None
         self.current_goal_coord = None
         self.current_frontier_coord = None
 
@@ -861,12 +926,16 @@ class CubeyFrontierExplorerNode(Node):
 
         # Handle active goal timeout / stall
         if self.current_goal_coord and (time.time() - self.goal_start_time > self.goal_timeout_sec):
-            self.get_logger().warn("Active frontier goal timed out (>35s). Cancelling and selecting new frontier.")
+            timed_out_purpose = self.active_goal_purpose
+            self.get_logger().warn(
+                f"Active {timed_out_purpose or 'Nav2'} goal timed out "
+                f"(>{self.goal_timeout_sec:.0f}s). Cancelling."
+            )
             self._cancel_active_nav_goal()
-            if self.state == "RETURNING_TO_DOCK":
+            if timed_out_purpose == self.GOAL_RETURN:
                 self.get_logger().warn("Return-to-dock timed out; saving the map at the current safe position.")
                 self._initiate_map_finalization()
-            elif self.state == "NAVIGATING":
+            elif timed_out_purpose == self.GOAL_MANUAL:
                 self.state = "BLOCKED"
             return
 
@@ -874,6 +943,11 @@ class CubeyFrontierExplorerNode(Node):
         # STATE: EXPLORING
         # -------------------------------------------------------------
         if self.state == "EXPLORING":
+            # Do not decide that exploration is complete from a transient map
+            # while a frontier/survey goal or planner preflight is still active.
+            if self.current_goal_coord is not None or self.planning_frontier:
+                return
+
             frontiers = self._extract_frontiers(self.latest_map)
 
             # Check explored map extent
@@ -892,20 +966,22 @@ class CubeyFrontierExplorerNode(Node):
                 can_auto_stop = (time_exploring > 30.0 and (self.total_frontiers_mapped > 0 or explored_cells > 250))
                 if can_auto_stop and self.zero_frontier_cycles >= 4:
                     self._trigger_auto_stop_sequence()
-                elif self.zero_frontier_cycles >= 2 and self.current_goal_coord is None:
+                elif self.zero_frontier_cycles >= 2:
                     # Still in early exploration: survey surroundings by gently rotating to discover frontiers
                     self.get_logger().info("Surveying room with exploratory turn to discover frontiers...")
                     robot_x, robot_y = self.robot_pose[:2] if self.robot_pose else (0.0, 0.0)
                     robot_yaw = self.robot_pose[2] if self.robot_pose else 0.0
                     survey_yaw = robot_yaw + math.radians(90.0)
-                    self._send_nav2_goal(robot_x, robot_y, survey_yaw)
+                    self._send_nav2_goal(
+                        robot_x,
+                        robot_y,
+                        survey_yaw,
+                        purpose=self.GOAL_SURVEY,
+                    )
                 return
             else:
                 self.zero_frontier_cycles = 0
 
-            # If already driving or asking Nav2 to validate candidates, let it complete.
-            if self.current_goal_coord is not None or self.planning_frontier:
-                return
             self._queue_reachable_frontier_selection(frontiers)
 
     # ------------------------------------------------------------------
@@ -925,7 +1001,12 @@ class CubeyFrontierExplorerNode(Node):
         # Navigate to origin (0.0, 0.0) where mapping started
         dock_x, dock_y, dock_yaw = self.start_pose
         self.get_logger().info(f"Navigating back to dock origin: ({dock_x:.2f}m, {dock_y:.2f}m)...")
-        self._send_nav2_goal(dock_x, dock_y, dock_yaw)
+        self._send_nav2_goal(
+            dock_x,
+            dock_y,
+            dock_yaw,
+            purpose=self.GOAL_RETURN,
+        )
 
     def _initiate_map_finalization(self, at_dock: bool = False):
         """Phase 3 & 4: Pause SLAM scan matching, trigger loop closure, and save map."""

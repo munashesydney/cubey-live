@@ -142,6 +142,7 @@ class Nav2IntegrationTests(unittest.TestCase):
             2.0,
             0.5,
             frontier_coord=(1.1, 2.1),
+            purpose=explorer.GOAL_FRONTIER,
         )
         self.assertFalse(explorer.planning_frontier)
         self.assertEqual(explorer.frontier_plan_queue, [])
@@ -235,6 +236,76 @@ class Nav2IntegrationTests(unittest.TestCase):
         explorer.finalization_at_dock = False
         explorer._complete_mapping()
         self.assertEqual(explorer.state, "COMPLETED_AWAY_FROM_DOCK")
+
+    def test_stale_frontier_cancel_cannot_fail_new_return_goal(self):
+        explorer = object.__new__(CubeyFrontierExplorerNode)
+        explorer.nav_goal_generation = 8
+        explorer.state = "RETURNING_TO_DOCK"
+        explorer.current_goal_coord = (0.0, 0.0)
+        explorer.current_frontier_coord = None
+        explorer.active_goal_handle = MagicMock()
+        explorer.active_goal_purpose = explorer.GOAL_RETURN
+        explorer.get_logger = MagicMock(return_value=MagicMock())
+        explorer._initiate_map_finalization = MagicMock()
+        stale_result = MagicMock()
+        stale_result.result.return_value.status = 5
+
+        explorer._on_goal_result(
+            stale_result,
+            generation=7,
+            purpose=explorer.GOAL_FRONTIER,
+        )
+
+        explorer._initiate_map_finalization.assert_not_called()
+        self.assertEqual(explorer.state, "RETURNING_TO_DOCK")
+        self.assertEqual(explorer.current_goal_coord, (0.0, 0.0))
+        self.assertEqual(explorer.active_goal_purpose, explorer.GOAL_RETURN)
+
+    def test_current_return_failure_stops_away_from_dock(self):
+        explorer = object.__new__(CubeyFrontierExplorerNode)
+        explorer.nav_goal_generation = 8
+        explorer.state = "RETURNING_TO_DOCK"
+        explorer.current_goal_coord = (0.0, 0.0)
+        explorer.current_frontier_coord = None
+        explorer.active_goal_handle = MagicMock()
+        explorer.active_goal_purpose = explorer.GOAL_RETURN
+        explorer.get_logger = MagicMock(return_value=MagicMock())
+        explorer._initiate_map_finalization = MagicMock()
+        result = MagicMock()
+        result.result.return_value.status = 5
+
+        with patch.object(
+            frontier_explorer_module,
+            "GoalStatus",
+            MagicMock(STATUS_SUCCEEDED=4, STATUS_ABORTED=6),
+            create=True,
+        ):
+            explorer._on_goal_result(
+                result,
+                generation=8,
+                purpose=explorer.GOAL_RETURN,
+            )
+
+        explorer._initiate_map_finalization.assert_called_once_with()
+        self.assertIsNone(explorer.current_goal_coord)
+        self.assertIsNone(explorer.active_goal_purpose)
+
+    def test_active_goal_suspends_empty_frontier_completion_checks(self):
+        explorer = object.__new__(CubeyFrontierExplorerNode)
+        explorer.state = "EXPLORING"
+        explorer.latest_map = MagicMock()
+        explorer.current_goal_coord = (2.0, 1.0)
+        explorer.goal_start_time = time.time()
+        explorer.goal_timeout_sec = 35.0
+        explorer.planning_frontier = False
+        explorer._update_robot_pose_from_tf = MagicMock()
+        explorer._extract_frontiers = MagicMock(return_value=[])
+        explorer._trigger_auto_stop_sequence = MagicMock()
+
+        explorer._supervision_loop()
+
+        explorer._extract_frontiers.assert_not_called()
+        explorer._trigger_auto_stop_sequence.assert_not_called()
 
     def test_stale_heartbeat_is_not_ready(self):
         service = CubeyNavService()
