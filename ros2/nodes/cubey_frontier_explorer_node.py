@@ -125,6 +125,7 @@ class CubeyFrontierExplorerNode(Node):
         self.slam_locked_for_return: bool = False
         self.pre_return_map_base: Optional[str] = None
         self.pre_return_map_saved: bool = False
+        self.pre_return_save_attempts: int = 0
         self.map_save_succeeded: bool = False
         self.recovery_generation: int = 0
         self.active_recovery_handle = None
@@ -302,6 +303,7 @@ class CubeyFrontierExplorerNode(Node):
         self.slam_locked_for_return = False
         self.pre_return_map_base = None
         self.pre_return_map_saved = False
+        self.pre_return_save_attempts = 0
         self.map_save_succeeded = False
         self.recovery_generation += 1
         self.active_recovery_handle = None
@@ -1192,6 +1194,12 @@ class CubeyFrontierExplorerNode(Node):
         self.pre_return_map_base = os.path.join(
             self.map_save_dir, f"cubey_floorplan_{timestamp_str}"
         )
+        self.pre_return_save_attempts = 0
+        self._request_pre_return_map_save()
+
+    def _request_pre_return_map_save(self) -> None:
+        if self.state != "RETURNING_TO_DOCK":
+            return
         if not self.save_map_client.wait_for_service(timeout_sec=2.0):
             self.get_logger().error(
                 "SLAM save_map service unavailable; stopping before return so the live map is not damaged."
@@ -1201,20 +1209,35 @@ class CubeyFrontierExplorerNode(Node):
 
         request = SaveMap.Request()
         request.name.data = self.pre_return_map_base
+        self.pre_return_save_attempts += 1
         save_future = self.save_map_client.call_async(request)
         save_future.add_done_callback(self._on_pre_return_map_saved)
-        self.get_logger().info("Saving completed map before return-to-dock.")
+        self.get_logger().info(
+            f"Saving completed map before return-to-dock "
+            f"(attempt {self.pre_return_save_attempts}/2)."
+        )
 
     def _on_pre_return_map_saved(self, future) -> None:
         if self.state != "RETURNING_TO_DOCK":
             return
+        save_error: Optional[str] = None
         try:
             response = future.result()
             if response.result != SaveMap.Response.RESULT_SUCCESS:
-                raise RuntimeError(f"SLAM Toolbox result code {response.result}")
+                save_error = f"SLAM Toolbox result code {response.result}"
         except Exception as error:
+            save_error = str(error)
+
+        if save_error:
+            if self.pre_return_save_attempts < 2:
+                self.get_logger().warn(
+                    f"Completed-map save was temporarily unavailable ({save_error}); retrying once."
+                )
+                self._request_pre_return_map_save()
+                return
             self.get_logger().error(
-                f"Could not save completed map before return ({error}); stopping safely."
+                f"Could not save completed map before return after two attempts "
+                f"({save_error}); stopping safely."
             )
             self._initiate_map_finalization()
             return

@@ -355,6 +355,7 @@ class Nav2IntegrationTests(unittest.TestCase):
     def test_completed_map_is_saved_before_slam_is_paused_for_return(self):
         explorer = object.__new__(CubeyFrontierExplorerNode)
         explorer.map_save_dir = "maps"
+        explorer.pre_return_save_attempts = 0
         explorer.save_map_client = MagicMock()
         explorer.save_map_client.wait_for_service.return_value = True
         explorer.save_map_client.call_async.return_value = MagicMock()
@@ -376,6 +377,30 @@ class Nav2IntegrationTests(unittest.TestCase):
         )
         explorer.pause_slam_client.wait_for_service.assert_not_called()
         self.assertEqual(explorer.state, "RETURNING_TO_DOCK")
+
+    def test_transient_pre_return_map_save_failure_retries_without_stopping(self):
+        explorer = object.__new__(CubeyFrontierExplorerNode)
+        explorer.state = "RETURNING_TO_DOCK"
+        explorer.pre_return_save_attempts = 1
+        explorer.pre_return_map_saved = False
+        explorer.get_logger = MagicMock(return_value=MagicMock())
+        explorer._request_pre_return_map_save = MagicMock()
+        explorer._initiate_map_finalization = MagicMock()
+        failed_response = MagicMock()
+        failed_response.result = 255
+        future = MagicMock()
+        future.result.return_value = failed_response
+        fake_save_map = MagicMock()
+        fake_save_map.Response.RESULT_SUCCESS = 0
+
+        with patch.object(
+            frontier_explorer_module, "SaveMap", fake_save_map, create=True
+        ):
+            explorer._on_pre_return_map_saved(future)
+
+        explorer._request_pre_return_map_save.assert_called_once_with()
+        explorer._initiate_map_finalization.assert_not_called()
+        self.assertFalse(explorer.pre_return_map_saved)
 
     def test_final_survey_is_dispatched_only_on_second_empty_cycle(self):
         source = Path("ros2/nodes/cubey_frontier_explorer_node.py").read_text(
