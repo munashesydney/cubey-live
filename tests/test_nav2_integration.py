@@ -434,6 +434,30 @@ class Nav2IntegrationTests(unittest.TestCase):
         self.assertFalse(explorer.planning_dock)
         self.assertEqual(explorer.dock_plan_queue, [])
 
+    def test_unreachable_dock_preflight_tries_one_safe_escape_backup(self):
+        explorer = object.__new__(CubeyFrontierExplorerNode)
+        explorer.dock_plan_generation = 3
+        explorer.state = "RETURNING_TO_DOCK"
+        explorer.dock_plan_queue = []
+        explorer.planning_dock = True
+        explorer.dock_escape_attempted = False
+        explorer.get_logger = MagicMock(return_value=MagicMock())
+        explorer._start_stuck_recovery = MagicMock()
+        explorer._initiate_map_finalization = MagicMock()
+
+        explorer._plan_next_dock_approach(3)
+
+        explorer._start_stuck_recovery.assert_called_once_with(
+            explorer.GOAL_RETURN,
+            reason="Dock path is blocked at Cubey's current inflated costmap position.",
+        )
+        explorer._initiate_map_finalization.assert_not_called()
+
+        explorer.dock_escape_attempted = True
+        explorer._plan_next_dock_approach(3)
+
+        explorer._initiate_map_finalization.assert_called_once_with()
+
     def test_return_waits_for_confirmed_slam_lock(self):
         explorer = object.__new__(CubeyFrontierExplorerNode)
         explorer.state = "RETURNING_TO_DOCK"

@@ -121,6 +121,7 @@ class CubeyFrontierExplorerNode(Node):
         self.dock_plan_generation: int = 0
         self.dock_plan_queue: List[Tuple[float, float, float]] = []
         self.planning_dock: bool = False
+        self.dock_escape_attempted: bool = False
         self.slam_locked_for_return: bool = False
         self.pre_return_map_base: Optional[str] = None
         self.pre_return_map_saved: bool = False
@@ -297,6 +298,7 @@ class CubeyFrontierExplorerNode(Node):
         self.dock_plan_generation += 1
         self.dock_plan_queue = []
         self.planning_dock = False
+        self.dock_escape_attempted = False
         self.slam_locked_for_return = False
         self.pre_return_map_base = None
         self.pre_return_map_saved = False
@@ -971,17 +973,22 @@ class CubeyFrontierExplorerNode(Node):
             self.goal_progress_pose = self.robot_pose
             self.last_goal_progress_time = now
 
-    def _start_stuck_recovery(self, purpose: str) -> None:
+    def _start_stuck_recovery(self, purpose: str, reason: Optional[str] = None) -> None:
         """Cancel a physically stalled route and ask Nav2 for a safe reverse."""
         blocked_coord = self.current_frontier_coord or self.current_goal_coord
-        self.get_logger().warn(
-            f"Cubey is physically stuck on {purpose}: no SLAM-confirmed motion for "
-            f"{self.stuck_timeout_sec:.0f}s. Starting Nav2 backup recovery."
-        )
+        if reason:
+            self.get_logger().warn(f"{reason} Starting Nav2 backup recovery.")
+        else:
+            self.get_logger().warn(
+                f"Cubey is physically stuck on {purpose}: no SLAM-confirmed motion for "
+                f"{self.stuck_timeout_sec:.0f}s. Starting Nav2 backup recovery."
+            )
         self._cancel_active_nav_goal()
         self.state = "RECOVERING_STUCK"
         self.recovery_purpose = purpose
         self.recovery_blocked_coord = blocked_coord
+        if purpose == self.GOAL_RETURN:
+            self.dock_escape_attempted = True
         generation = self.recovery_generation
 
         if not self.backup_client.wait_for_server(timeout_sec=1.0):
@@ -1178,6 +1185,7 @@ class CubeyFrontierExplorerNode(Node):
 
         self._cancel_active_nav_goal()
         self.state = "RETURNING_TO_DOCK"
+        self.dock_escape_attempted = False
 
         os.makedirs(self.map_save_dir, exist_ok=True)
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1292,10 +1300,19 @@ class CubeyFrontierExplorerNode(Node):
             return
         if not self.dock_plan_queue:
             self.planning_dock = False
-            self.get_logger().warn(
-                "No Nav2-reachable approach exists near the dock; preserving the map and stopping."
-            )
-            self._initiate_map_finalization()
+            if not self.dock_escape_attempted:
+                self._start_stuck_recovery(
+                    self.GOAL_RETURN,
+                    reason=(
+                        "Dock path is blocked at Cubey's current inflated costmap position."
+                    ),
+                )
+            else:
+                self.get_logger().warn(
+                    "No Nav2-reachable dock approach after one safe escape attempt; "
+                    "preserving the map and stopping."
+                )
+                self._initiate_map_finalization()
             return
 
         candidate = self.dock_plan_queue.pop(0)
