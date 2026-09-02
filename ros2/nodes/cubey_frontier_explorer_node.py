@@ -8,9 +8,9 @@ prioritizes exploration goals by utility (size vs. distance),
 dispatches action goals to Nav2 (NavigateToPose),
 and executes an autonomous 4-stage Auto-Stop protocol:
   1. Detects 0 reachable frontiers (space fully explored).
-  2. Freezes SLAM measurements (/slam_toolbox/pause_new_measurements).
-  3. Navigates robot back to a planner-verified approach near the starting dock.
-  4. Optimizes pose graph and saves map (/slam_toolbox/save_map).
+  2. Saves a clean completed-map snapshot.
+  3. Keeps SLAM localization active while navigating back to the starting dock.
+  4. Pauses mapping after return and stops safely.
 """
 
 from __future__ import annotations
@@ -123,7 +123,7 @@ class CubeyFrontierExplorerNode(Node):
         self.dock_plan_queue: List[Tuple[float, float, float]] = []
         self.planning_dock: bool = False
         self.dock_escape_attempted: bool = False
-        self.slam_locked_for_return: bool = False
+        self.slam_paused_for_completion: bool = False
         self.pre_return_map_base: Optional[str] = None
         self.pre_return_map_saved: bool = False
         self.pre_return_save_attempts: int = 0
@@ -307,7 +307,7 @@ class CubeyFrontierExplorerNode(Node):
         self.dock_plan_queue = []
         self.planning_dock = False
         self.dock_escape_attempted = False
-        self.slam_locked_for_return = False
+        self.slam_paused_for_completion = False
         self.pre_return_map_base = None
         self.pre_return_map_saved = False
         self.pre_return_save_attempts = 0
@@ -1290,41 +1290,12 @@ class CubeyFrontierExplorerNode(Node):
         self.get_logger().info(
             f"💾 Completed map safely saved before return: {self.pre_return_map_base}"
         )
-        self._lock_slam_for_return()
-
-    def _lock_slam_for_return(self) -> None:
-        if self.state != "RETURNING_TO_DOCK":
-            return
-
-        # Do not let return-path recovery spins or backups deform a map that is
-        # already complete. Nav2 can continue navigating on the last published
-        # occupancy grid while SLAM scan matching is paused.
-        if self.pause_slam_client.wait_for_service(timeout_sec=2.0):
-            pause_future = self.pause_slam_client.call_async(Pause.Request())
-            pause_future.add_done_callback(self._on_slam_locked_for_return)
-            self.get_logger().info("Locking completed SLAM map before return-to-dock.")
-        else:
-            self.get_logger().warn(
-                "SLAM pause service unavailable; stopping safely instead of risking the completed map."
-            )
-            self._initiate_map_finalization()
-
-    def _on_slam_locked_for_return(self, future) -> None:
-        if self.state != "RETURNING_TO_DOCK":
-            return
-        try:
-            response = future.result()
-            if not response.status:
-                raise RuntimeError("SLAM Toolbox did not confirm the pause")
-        except Exception as error:
-            self.get_logger().warn(
-                f"Could not lock SLAM before return ({error}); preserving the map and stopping."
-            )
-            self._initiate_map_finalization()
-            return
-
-        self.slam_locked_for_return = True
-        self.get_logger().info("Completed SLAM map locked; selecting a reachable dock approach.")
+        # Keep SLAM scan matching live while Cubey moves. The saved snapshot is
+        # already protected on disk, while active SLAM supplies the map->odom
+        # corrections Nav2 needs to prevent LiDAR-only yaw drift on the return.
+        self.get_logger().info(
+            "Completed map snapshot protected; keeping SLAM localization active for return."
+        )
         self._queue_reachable_dock_selection()
 
     def _dock_candidates(self) -> List[Tuple[float, float, float]]:
@@ -1502,7 +1473,7 @@ class CubeyFrontierExplorerNode(Node):
             self.get_logger().info(
                 f"Using completed map saved before return: {self.pre_return_map_base}"
             )
-            self._complete_mapping()
+            self._pause_slam_for_completion()
         else:
             # If completion happens outside the normal auto-return path, save
             # while SLAM is still publishing. Pausing before this request can
@@ -1526,13 +1497,45 @@ class CubeyFrontierExplorerNode(Node):
             if response.result == SaveMap.Response.RESULT_SUCCESS:
                 self.map_save_succeeded = True
                 self.get_logger().info(f"💾 Map saved via SLAM Toolbox to: {final_map_base}")
-                self._complete_mapping()
+                self._pause_slam_for_completion()
             else:
                 self.get_logger().error(f"SLAM Toolbox map save failed with result code {response.result}.")
                 self.state = "ERROR"
         except Exception as e:
             self.get_logger().error(f"SLAM Toolbox map save failed: {e}")
             self.state = "ERROR"
+
+    def _pause_slam_for_completion(self) -> None:
+        """Stop accepting map measurements only after the protected map is saved."""
+        if self.slam_paused_for_completion:
+            self._complete_mapping()
+            return
+        if not self.pause_slam_client.wait_for_service(timeout_sec=2.0):
+            self.get_logger().warn(
+                "SLAM pause service unavailable during finalization; robot is still stopping safely."
+            )
+            self._complete_mapping()
+            return
+
+        pause_future = self.pause_slam_client.call_async(Pause.Request())
+        pause_future.add_done_callback(self._on_slam_paused_for_completion)
+        self.get_logger().info("Pausing SLAM measurements after return navigation finished.")
+
+    def _on_slam_paused_for_completion(self, future) -> None:
+        try:
+            response = future.result()
+            if response.status:
+                self.slam_paused_for_completion = True
+                self.get_logger().info("SLAM measurements paused; completed map is finalized.")
+            else:
+                self.get_logger().warn(
+                    "SLAM Toolbox did not confirm its final pause; robot is still stopping safely."
+                )
+        except Exception as error:
+            self.get_logger().warn(
+                f"Could not pause SLAM during finalization ({error}); robot is still stopping safely."
+            )
+        self._complete_mapping()
 
     def _complete_mapping(self):
         self.state = "COMPLETED" if self.finalization_at_dock else "COMPLETED_AWAY_FROM_DOCK"

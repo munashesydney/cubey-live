@@ -352,7 +352,7 @@ class Nav2IntegrationTests(unittest.TestCase):
         self.assertEqual(explorer.state, "EXPLORING")
         self.assertEqual(explorer.zero_frontier_cycles, 0)
 
-    def test_completed_map_is_saved_before_slam_is_paused_for_return(self):
+    def test_completed_map_save_is_requested_before_return_planning(self):
         explorer = object.__new__(CubeyFrontierExplorerNode)
         explorer.map_save_dir = "maps"
         explorer.pre_return_save_attempts = 0
@@ -517,21 +517,52 @@ class Nav2IntegrationTests(unittest.TestCase):
 
         explorer._initiate_map_finalization.assert_called_once_with()
 
-    def test_return_waits_for_confirmed_slam_lock(self):
+    def test_successful_snapshot_keeps_slam_active_for_return(self):
         explorer = object.__new__(CubeyFrontierExplorerNode)
         explorer.state = "RETURNING_TO_DOCK"
-        explorer.slam_locked_for_return = False
+        explorer.pre_return_save_attempts = 1
+        explorer.pre_return_map_saved = False
+        explorer.pre_return_map_base = "maps/completed"
+        explorer.map_save_succeeded = False
         explorer.get_logger = MagicMock(return_value=MagicMock())
         explorer._queue_reachable_dock_selection = MagicMock()
         explorer._initiate_map_finalization = MagicMock()
+        explorer.pause_slam_client = MagicMock()
         future = MagicMock()
-        future.result.return_value.status = True
+        future.result.return_value.result = 0
+        fake_save_map = MagicMock()
+        fake_save_map.Response.RESULT_SUCCESS = 0
 
-        explorer._on_slam_locked_for_return(future)
+        with patch.object(
+            frontier_explorer_module, "SaveMap", fake_save_map, create=True
+        ):
+            explorer._on_pre_return_map_saved(future)
 
-        self.assertTrue(explorer.slam_locked_for_return)
+        self.assertTrue(explorer.pre_return_map_saved)
+        self.assertTrue(explorer.map_save_succeeded)
         explorer._queue_reachable_dock_selection.assert_called_once_with()
+        explorer.pause_slam_client.wait_for_service.assert_not_called()
         explorer._initiate_map_finalization.assert_not_called()
+
+    def test_slam_is_paused_only_during_completion(self):
+        explorer = object.__new__(CubeyFrontierExplorerNode)
+        explorer.slam_paused_for_completion = False
+        explorer.pause_slam_client = MagicMock()
+        explorer.pause_slam_client.wait_for_service.return_value = True
+        pause_future = MagicMock()
+        explorer.pause_slam_client.call_async.return_value = pause_future
+        explorer.get_logger = MagicMock(return_value=MagicMock())
+
+        explorer._pause_slam_for_completion()
+
+        explorer.pause_slam_client.call_async.assert_called_once()
+        callback = pause_future.add_done_callback.call_args.args[0]
+        completed_future = MagicMock()
+        completed_future.result.return_value.status = True
+        explorer._complete_mapping = MagicMock()
+        callback(completed_future)
+        self.assertTrue(explorer.slam_paused_for_completion)
+        explorer._complete_mapping.assert_called_once_with()
 
     def test_stale_heartbeat_is_not_ready(self):
         service = CubeyNavService()
