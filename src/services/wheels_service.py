@@ -596,9 +596,11 @@ def get_wheels_service() -> WheelsService:
     """Get or create the global shared WheelsService singleton."""
     global _SHARED_WHEELS_SERVICE
     if _SHARED_WHEELS_SERVICE is None:
-        _SHARED_WHEELS_SERVICE = WheelsService()
-        try:
-            _SHARED_WHEELS_SERVICE.connect()
-        except Exception as e:
-            logger.warning("Failed to auto-connect shared WheelsService: %s", e)
+        service = WheelsService()
+        _SHARED_WHEELS_SERVICE = service
+        threading.Thread(
+            target=service.connect,
+            daemon=True,
+            name="WheelsAutoConnect",
+        ).start()
     return _SHARED_WHEELS_SERVICE

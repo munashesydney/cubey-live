@@ -173,8 +173,8 @@ class LidarPage(ctk.CTkFrame):
         # Main Split Content Workspace
         main_content = ctk.CTkFrame(self, fg_color="transparent")
         main_content.pack(fill="both", expand=True, padx=15, pady=(0, 10))
-        main_content.columnconfigure(0, weight=6)  # Left: Radar Canvas & Zoom Toolbar
-        main_content.columnconfigure(1, weight=5)  # Right: Proximity, Telemetry & Logs
+        main_content.columnconfigure(0, weight=1)  # Left: Radar Canvas & Zoom Toolbar (responsive)
+        main_content.columnconfigure(1, weight=0, minsize=420)  # Right: Proximity, Telemetry & Logs (stable)
         main_content.rowconfigure(0, weight=1)
 
         # ---------------- Left Panel: Polar Radar Canvas ----------------
@@ -192,7 +192,8 @@ class LidarPage(ctk.CTkFrame):
             cursor="crosshair",
         )
         self.radar_canvas.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 4))
-        self.radar_canvas.bind("<Configure>", lambda e: self._request_canvas_redraw())
+        self._canvas_resize_timer = None
+        self.radar_canvas.bind("<Configure>", self._on_canvas_configure)
         self.radar_canvas.bind("<Motion>", self._on_canvas_mouse_move)
         self.radar_canvas.bind("<Leave>", self._on_canvas_mouse_leave)
 
@@ -231,7 +232,7 @@ class LidarPage(ctk.CTkFrame):
             ).pack(side="left", padx=2)
 
         # ---------------- Right Panel: Proximity, Telemetry, Controls & Logs ----------------
-        right_panel = ctk.CTkScrollableFrame(
+        right_panel = ctk.CTkFrame(
             main_content, fg_color=COLOR_CRUST, corner_radius=10
         )
         right_panel.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=4)
@@ -543,6 +544,17 @@ class LidarPage(ctk.CTkFrame):
     # ------------------------------------------------------------------
     # Radar Canvas Drawing Engine
     # ------------------------------------------------------------------
+
+    def _on_canvas_configure(self, event=None) -> None:
+        """Debounce canvas redraw during rapid window resizing."""
+        if getattr(self, "_is_destroyed", False):
+            return
+        if hasattr(self, "_canvas_resize_timer") and self._canvas_resize_timer:
+            try:
+                self.after_cancel(self._canvas_resize_timer)
+            except Exception:
+                pass
+        self._canvas_resize_timer = self.after(35, self._redraw_canvas)
 
     def _request_canvas_redraw(self) -> None:
         """Schedule a redraw on the Tk main thread."""
@@ -867,6 +879,12 @@ class LidarPage(ctk.CTkFrame):
         self._is_destroyed = True
         self._is_active = False
         self._log_flush_scheduled = False
+        if hasattr(self, "_canvas_resize_timer") and self._canvas_resize_timer:
+            try:
+                self.after_cancel(self._canvas_resize_timer)
+            except Exception:
+                pass
+            self._canvas_resize_timer = None
         if hasattr(self, "service") and self.service:
             if getattr(self.service, "on_scan_data", None) == self._on_scan_data_received:
                 self.service.on_scan_data = None

@@ -174,12 +174,12 @@ class LivePage(ctk.CTkFrame):
         self.main_grid = ctk.CTkFrame(self, fg_color="transparent")
         self.main_grid.pack(fill="both", expand=True, padx=15, pady=5)
 
-        self.main_grid.columnconfigure(0, weight=4)
-        self.main_grid.columnconfigure(1, weight=6)
+        self.main_grid.columnconfigure(0, weight=0, minsize=380)
+        self.main_grid.columnconfigure(1, weight=1)
         self.main_grid.rowconfigure(0, weight=1)
 
         # Left Panel: Vision & Interruption Controls
-        self.left_panel = ctk.CTkScrollableFrame(
+        self.left_panel = ctk.CTkFrame(
             self.main_grid, corner_radius=10, fg_color="#181825"
         )
         self.left_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=0)
@@ -356,7 +356,7 @@ class LivePage(ctk.CTkFrame):
 
         # Right Panel: Tabs for Video Preview, Transcript, Logs, Conversations
         self.right_panel = ctk.CTkTabview(
-            self.main_grid, corner_radius=10, fg_color="#181825"
+            self.main_grid, corner_radius=10, fg_color="#181825", command=self._on_right_tab_changed
         )
         self.right_panel.grid(row=0, column=1, sticky="nsew", padx=(8, 0), pady=0)
 
@@ -474,6 +474,14 @@ class LivePage(ctk.CTkFrame):
         except Exception as e:
             logger.debug("Async camera device refresh error: %s", e)
 
+    def _on_right_tab_changed(self) -> None:
+        """Lazily load conversations when user switches to the conversations tab."""
+        try:
+            if self.right_panel.get() == "🗂️ Conversations" and not getattr(self, "_conversations_loaded", False):
+                self.refresh_conversations()
+        except Exception:
+            pass
+
     def on_activate(self) -> None:
         """Called when Gemini Live tab is selected."""
         self._is_active = True
@@ -492,8 +500,9 @@ class LivePage(ctk.CTkFrame):
         if getattr(self, "_is_destroyed", False):
             return
 
+        is_cam_running = bool(self.camera_service and self.camera_service.is_running)
         preview_fps = getattr(self.app_config, "camera_preview_fps", 10)
-        loop_interval_ms = max(40, int(1000.0 / max(1, preview_fps)))
+        loop_interval_ms = max(40, int(1000.0 / max(1, preview_fps))) if is_cam_running else 500
 
         # If not active, back off to a relaxed idle cadence
         if not self.winfo_exists() or not getattr(self, "_is_active", True):
@@ -828,14 +837,15 @@ class LivePage(ctk.CTkFrame):
         )
         self.convo_detail_box.grid(row=0, column=1, sticky="nsew")
 
-        self.refresh_conversations()
+        self._conversations_loaded = False
 
     def refresh_conversations(self) -> None:
         """Reload the conversation list from the database."""
+        self._conversations_loaded = True
         try:
             conversations = list_conversations(
                 source=ConversationSource.GEMINI,
-                limit=100,
+                limit=30,
             )
         except Exception as e:
             logger.warning("Failed to load conversations: %s", e)

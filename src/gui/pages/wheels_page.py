@@ -141,12 +141,12 @@ class WheelsPage(ctk.CTkFrame):
         # Main Split Content Area
         main_content = ctk.CTkFrame(self, fg_color="transparent")
         main_content.pack(fill="both", expand=True, padx=15, pady=(0, 10))
-        main_content.columnconfigure(0, weight=5)  # Left column (D-pad & Speed)
-        main_content.columnconfigure(1, weight=6)  # Right column (Motors, Telemetry & Logs)
+        main_content.columnconfigure(0, weight=0, minsize=420)  # Left column (D-pad & Speed, stable width)
+        main_content.columnconfigure(1, weight=1)  # Right column (Motors, Telemetry & Logs, responsive)
         main_content.rowconfigure(0, weight=1)
 
         # ---------------- Left Panel: D-Pad, Modes, Speed ----------------
-        left_panel = ctk.CTkScrollableFrame(
+        left_panel = ctk.CTkFrame(
             main_content, fg_color="#1E1E2E", corner_radius=10
         )
         left_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=4)
@@ -155,7 +155,7 @@ class WheelsPage(ctk.CTkFrame):
         self._build_speed_and_mode_section(left_panel)
 
         # ---------------- Right Panel: Diagnostics, Telemetry, Terminal ----------------
-        right_panel = ctk.CTkScrollableFrame(
+        right_panel = ctk.CTkFrame(
             main_content, fg_color="#1E1E2E", corner_radius=10
         )
         right_panel.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=4)
@@ -178,14 +178,9 @@ class WheelsPage(ctk.CTkFrame):
         )
         section_label.pack(anchor="w", padx=12, pady=(10, 8))
 
-        # D-pad grid container
+        # D-pad grid container — stable dimensions to prevent Canvas recalculation on resize
         dpad_frame = ctk.CTkFrame(parent, fg_color="transparent")
         dpad_frame.pack(padx=12, pady=4)
-
-        for col in range(3):
-            dpad_frame.columnconfigure(col, weight=1, minsize=75)
-        for row in range(3):
-            dpad_frame.rowconfigure(row, weight=1, minsize=60)
 
         # Button specs: (row, col, label, command, color, hover)
         buttons = [
@@ -206,14 +201,14 @@ class WheelsPage(ctk.CTkFrame):
                 dpad_frame,
                 text=label,
                 font=ctk.CTkFont(size=18, weight="bold"),
-                width=75,
-                height=56,
+                width=76,
+                height=54,
                 corner_radius=10,
                 fg_color=fg,
                 hover_color=hover,
                 text_color=txt_color,
             )
-            btn.grid(row=r, column=c, padx=4, pady=4, sticky="nsew")
+            btn.grid(row=r, column=c, padx=4, pady=4)
 
             if cmd == "stop":
                 btn.configure(command=self._on_stop_clicked)
@@ -886,6 +881,7 @@ class WheelsPage(ctk.CTkFrame):
 
     def destroy(self) -> None:
         """Clean up callbacks and scheduled timers on widget destruction."""
+        self._is_destroyed = True
         self._is_active = False
         self._log_flush_scheduled = False
         if hasattr(self, "service") and self.service:
@@ -961,10 +957,16 @@ class WheelsPage(ctk.CTkFrame):
 
     def _on_log_received(self, text: str) -> None:
         """Buffer incoming log line and schedule batched UI flush to prevent GUI freezing."""
+        if getattr(self, "_is_destroyed", False):
+            return
         self._pending_logs.append(text)
         if not self._log_flush_scheduled:
             self._log_flush_scheduled = True
-            self.after(50, self._flush_pending_logs)
+            try:
+                if self.winfo_exists():
+                    self.after(50, self._flush_pending_logs)
+            except Exception:
+                self._log_flush_scheduled = False
 
     def _flush_pending_logs(self) -> None:
         """Batch-insert pending log lines into the embedded terminal."""
