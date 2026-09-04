@@ -98,11 +98,15 @@ class MemoryPage(ctk.CTkFrame):
         )
         self.cards_frame.pack(fill="both", expand=True, padx=15, pady=(5, 15))
 
+    def on_activate(self) -> None:
+        """Reload memories when tab becomes active."""
+        self.refresh_memories()
+
     def refresh_memories(self) -> None:
         """Reload memories from the database and render cards."""
         status = _STATUS_FILTERS.get(self.filter_segment.get(), MemoryStatus.ACTIVE)
         try:
-            memories = list_memories(status=status, limit=500)
+            memories = list_memories(status=status, limit=60)
         except Exception as e:
             logger.warning("Failed to load memories: %s", e)
             return

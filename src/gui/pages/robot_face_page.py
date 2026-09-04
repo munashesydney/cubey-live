@@ -37,8 +37,9 @@ class RobotFacePage(ctk.CTkFrame):
         self.target_fps = max(15, min(int(target_fps), 60))
         if supersampling is not None:
             self.supersampling = max(1, min(int(supersampling), 3))
-        else:
-            self.supersampling = max(1, min(int(os.getenv("GUI_SUPERSAMPLING", "1")), 3))
+        self._base_target_fps = self.target_fps
+        self._base_supersampling = self.supersampling
+        self._is_dev_mode = False
         self._frame_interval = 1.0 / self.target_fps
         self._last_frame_at = time.perf_counter()
 
@@ -128,6 +129,19 @@ class RobotFacePage(ctk.CTkFrame):
         """Handler for corner developer button."""
         if self.on_open_developer_console:
             self.on_open_developer_console()
+
+    def set_dev_mode(self, active: bool) -> None:
+        """Throttle face animation while developer console is open to free UI cycles."""
+        self._is_dev_mode = active
+        if active:
+            self.target_fps = min(10, self._base_target_fps)
+            self.supersampling = 1
+            self._frame_interval = 1.0 / self.target_fps
+        else:
+            self.target_fps = self._base_target_fps
+            self.supersampling = self._base_supersampling
+            self._frame_interval = 1.0 / self.target_fps
+            self._draw_face()
 
     def _on_resize(self, event=None) -> None:
         """Redraw face elements when canvas resizes."""

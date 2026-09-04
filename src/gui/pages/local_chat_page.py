@@ -78,13 +78,15 @@ class LocalChatPage(ctk.CTkFrame):
         # Streaming buffer state
         self._current_assistant_text: str = ""
         self._is_generating: bool = False
+        self._is_active: bool = True
+        self._refresh_after_id = None
 
         self._create_layout()
 
         # Check local engine health and load conversations
         self.after(200, self._check_engine_status)
         self.after(300, self.refresh_conversations_list)
-        self.after(5000, self._schedule_conversation_refresh)
+        self._refresh_after_id = self.after(5000, self._schedule_conversation_refresh)
 
     def _create_layout(self) -> None:
         """Create header controls, settings drawer, chat transcript, and message input."""
@@ -285,14 +287,34 @@ class LocalChatPage(ctk.CTkFrame):
             self.convo_dropdown.set(options[0])
             self._show_conversation(self.conversations_map[options[0]])
 
+    def on_activate(self) -> None:
+        """Refresh conversations on activation."""
+        self._is_active = True
+        self.refresh_conversations_list()
+
+    def on_deactivate(self) -> None:
+        """Mark page as inactive."""
+        self._is_active = False
+
+    def destroy(self) -> None:
+        """Cancel conversation refresh timer on destruction."""
+        self._is_active = False
+        if hasattr(self, "_refresh_after_id") and self._refresh_after_id:
+            try:
+                self.after_cancel(self._refresh_after_id)
+            except Exception:
+                pass
+            self._refresh_after_id = None
+        super().destroy()
+
     def _schedule_conversation_refresh(self) -> None:
         """Keep background task-run conversations visible in the selector."""
         try:
-            if not self.winfo_exists():
+            if not self.winfo_exists() or not getattr(self, "_is_active", True):
                 return
             if self.winfo_ismapped():
                 self.refresh_conversations_list()
-            self.after(5000, self._schedule_conversation_refresh)
+            self._refresh_after_id = self.after(5000, self._schedule_conversation_refresh)
         except Exception:
             pass
 

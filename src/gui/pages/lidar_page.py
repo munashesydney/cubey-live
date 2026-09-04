@@ -74,6 +74,7 @@ class LidarPage(ctk.CTkFrame):
 
         # Canvas rendering throttle
         self._render_pending: bool = False
+        self._is_active: bool = True
 
         self._create_layout()
         self._refresh_port_list()
@@ -845,7 +846,35 @@ class LidarPage(ctk.CTkFrame):
                     text="🔴 Disconnected", text_color=COLOR_DANGER
                 )
 
-        self.after(0, _update)
+        try:
+            if not getattr(self, "_is_destroyed", False) and self.winfo_exists():
+                self.after(0, _update)
+        except Exception:
+            pass
+
+    def on_activate(self) -> None:
+        """Called when this tab is selected in DeveloperWindow."""
+        self._is_active = True
+        if self._latest_scan is not None:
+            self._on_scan_data_received(self._latest_scan)
+
+    def on_deactivate(self) -> None:
+        """Called when navigating away from this tab."""
+        self._is_active = False
+
+    def destroy(self) -> None:
+        """Clean up callbacks and scheduled timers."""
+        self._is_destroyed = True
+        self._is_active = False
+        self._log_flush_scheduled = False
+        if hasattr(self, "service") and self.service:
+            if getattr(self.service, "on_scan_data", None) == self._on_scan_data_received:
+                self.service.on_scan_data = None
+            if getattr(self.service, "on_log", None) == self._on_log_received:
+                self.service.on_log = None
+            if getattr(self.service, "on_connection_change", None) == self._on_connection_changed:
+                self.service.on_connection_change = None
+        super().destroy()
 
     # ------------------------------------------------------------------
     # Telemetry & Scan Callbacks
@@ -860,8 +889,17 @@ class LidarPage(ctk.CTkFrame):
             if len(self._trail_points) > 3:
                 self._trail_points.pop(0)
 
+        # Gate execution: do nothing if page is not active or destroyed
+        if getattr(self, "_is_destroyed", False) or not self.winfo_exists() or not getattr(self, "_is_active", True):
+            return
+
+        if self._render_pending:
+            return
+        self._render_pending = True
+
         def _update_ui():
-            if not self.winfo_exists():
+            self._render_pending = False
+            if getattr(self, "_is_destroyed", False) or not self.winfo_exists() or not getattr(self, "_is_active", True):
                 return
 
             # Update stats
@@ -907,17 +945,29 @@ class LidarPage(ctk.CTkFrame):
             # Redraw canvas
             self._redraw_canvas()
 
-        self.after_idle(_update_ui)
+        try:
+            if not getattr(self, "_is_destroyed", False) and self.winfo_exists():
+                self.after_idle(_update_ui)
+            else:
+                self._render_pending = False
+        except Exception:
+            self._render_pending = False
 
     # ------------------------------------------------------------------
     # Terminal Logging
     # ------------------------------------------------------------------
 
     def _on_log_received(self, text: str) -> None:
+        if getattr(self, "_is_destroyed", False):
+            return
         self._pending_logs.append(text)
         if not self._log_flush_scheduled:
             self._log_flush_scheduled = True
-            self.after(50, self._flush_pending_logs)
+            try:
+                if self.winfo_exists():
+                    self.after(50, self._flush_pending_logs)
+            except Exception:
+                self._log_flush_scheduled = False
 
     def _flush_pending_logs(self) -> None:
         self._log_flush_scheduled = False

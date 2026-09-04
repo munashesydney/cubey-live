@@ -39,10 +39,13 @@ class WheelsPage(ctk.CTkFrame):
 
         self.service = wheels_service or get_wheels_service()
 
-        # Ensure service callbacks point here even if injected
-        self.service.on_telemetry = self._on_telemetry_received
-        self.service.on_log = self._on_log_received
-        self.service.on_connection_change = self._on_connection_changed
+        self._previous_on_telemetry = self.service.on_telemetry
+        self._previous_on_log = self.service.on_log
+        self._previous_on_conn = self.service.on_connection_change
+
+        self.service.on_telemetry = self._dispatch_telemetry
+        self.service.on_log = self._dispatch_log
+        self.service.on_connection_change = self._dispatch_connection_change
 
         self._active_button: Optional[ctk.CTkButton] = None
         self._current_speed: int = 180
@@ -50,6 +53,8 @@ class WheelsPage(ctk.CTkFrame):
         self._control_mode: str = "hold"  # "hold" or "pulse"
         self._pending_logs: List[str] = []
         self._log_flush_scheduled: bool = False
+        self._is_active: bool = True
+        self._latest_telemetry: Optional[TelemetryData] = None
 
         self._create_layout()
         self._bind_keyboard_events()
@@ -745,14 +750,30 @@ class WheelsPage(ctk.CTkFrame):
             for key, cmd in releases:
                 top.bind(key, lambda e, c=cmd: self._handle_key_release(c), add="+")
 
-            top.bind("<space>", lambda e: self._on_stop_clicked(), add="+")
+            top.bind("<space>", lambda e: self._on_space_pressed(), add="+")
         except Exception as e:
             logger.warning("Could not bind keyboard shortcuts: %s", e)
 
+    def _is_text_input_focused(self) -> bool:
+        """Check if active focus is inside any text input widget."""
+        try:
+            focus_widget = self.focus_get()
+            if focus_widget is None:
+                return False
+            if isinstance(focus_widget, (ctk.CTkEntry, ctk.CTkTextbox)):
+                return True
+            cls_name = focus_widget.winfo_class()
+            if cls_name in ("Entry", "Text", "TEntry", "CTkEntry", "CTkTextbox"):
+                return True
+        except Exception:
+            pass
+        return False
+
     def _handle_key_press(self, command: str) -> None:
-        # Ignore if user is currently typing inside an Entry/Textbox widget
-        focus_widget = self.focus_get()
-        if isinstance(focus_widget, (ctk.CTkEntry, ctk.CTkTextbox)):
+        # Ignore if Wheels tab is not active
+        if not self.winfo_exists() or not getattr(self, "_is_active", True):
+            return
+        if self._is_text_input_focused():
             return
 
         if self._control_mode == "hold":
@@ -761,12 +782,20 @@ class WheelsPage(ctk.CTkFrame):
             self.service.pulse(command, self._pulse_duration_ms)
 
     def _handle_key_release(self, command: str) -> None:
-        focus_widget = self.focus_get()
-        if isinstance(focus_widget, (ctk.CTkEntry, ctk.CTkTextbox)):
+        if not self.winfo_exists() or not getattr(self, "_is_active", True):
+            return
+        if self._is_text_input_focused():
             return
 
         if self._control_mode == "hold":
             self.service.stop_continuous()
+
+    def _on_space_pressed(self) -> None:
+        if not self.winfo_exists() or not getattr(self, "_is_active", True):
+            return
+        if self._is_text_input_focused():
+            return
+        self._on_stop_clicked()
 
     # ------------------------------------------------------------------
     # Connection & Port Management
@@ -816,7 +845,57 @@ class WheelsPage(ctk.CTkFrame):
                     text="🔴 Disconnected", text_color=COLOR_DANGER
                 )
 
-        self.after(0, _update)
+    def _dispatch_telemetry(self, data: TelemetryData) -> None:
+        if self._previous_on_telemetry:
+            try:
+                self._previous_on_telemetry(data)
+            except Exception:
+                pass
+        self._on_telemetry_received(data)
+
+    def _dispatch_log(self, text: str) -> None:
+        if self._previous_on_log:
+            try:
+                self._previous_on_log(text)
+            except Exception:
+                pass
+        self._on_log_received(text)
+
+    def _dispatch_connection_change(self, connected: bool, info: str) -> None:
+        if self._previous_on_conn:
+            try:
+                self._previous_on_conn(connected, info)
+            except Exception:
+                pass
+        self._on_connection_changed(connected, info)
+
+    def on_activate(self) -> None:
+        """Called when Wheels tab is activated in DeveloperWindow."""
+        self._is_active = True
+        if self._latest_telemetry:
+            self._on_telemetry_received(self._latest_telemetry)
+
+    def on_deactivate(self) -> None:
+        """Called when navigating away from Wheels tab; safely halts motors."""
+        self._is_active = False
+        if hasattr(self, "service") and self.service and self.service.is_connected:
+            try:
+                self.service.stop()
+            except Exception:
+                pass
+
+    def destroy(self) -> None:
+        """Clean up callbacks and scheduled timers on widget destruction."""
+        self._is_active = False
+        self._log_flush_scheduled = False
+        if hasattr(self, "service") and self.service:
+            if getattr(self.service, "on_telemetry", None) == self._dispatch_telemetry:
+                self.service.on_telemetry = self._previous_on_telemetry
+            if getattr(self.service, "on_log", None) == self._dispatch_log:
+                self.service.on_log = self._previous_on_log
+            if getattr(self.service, "on_connection_change", None) == self._dispatch_connection_change:
+                self.service.on_connection_change = self._previous_on_conn
+        super().destroy()
 
     # ------------------------------------------------------------------
     # Telemetry & Log Callbacks
@@ -824,8 +903,14 @@ class WheelsPage(ctk.CTkFrame):
 
     def _on_telemetry_received(self, data: TelemetryData) -> None:
         """Update live UI telemetry badges (dispatched on main idle)."""
+        self._latest_telemetry = data
+
+        # Skip UI label reconfiguration when Wheels tab is not active
+        if not self.winfo_exists() or not getattr(self, "_is_active", True):
+            return
+
         def _update():
-            if not self.winfo_exists():
+            if not self.winfo_exists() or not getattr(self, "_is_active", True):
                 return
             try:
                 self.front_dist_label.configure(text=f"{data.front_distance_mm} mm")
