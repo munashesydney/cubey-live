@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import MagicMock
 
 import numpy as np
+from PIL import Image
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -105,6 +106,34 @@ class TestFaceRecognitionService(unittest.TestCase):
         varied = np.array([0.85, 0.53, 0, 0], dtype=np.float32)
         self.service._handle_unknown(varied, 0.9, 1.0, np.array([10, 10, 110, 110]))
         self.assertEqual(self.service.enrollment_count, 1)
+
+    def test_analysis_reports_all_recognized_faces(self):
+        class FakeFace:
+            def __init__(self, bbox, embedding):
+                self.bbox = np.array(bbox, dtype=np.float32)
+                self.embedding = np.array(embedding, dtype=np.float32)
+                self.det_score = 0.95
+
+        class FakeAnalyzer:
+            def get(self, _frame):
+                return [
+                    FakeFace((10, 10, 110, 110), [1, 0, 0, 0]),
+                    FakeFace((150, 20, 250, 120), [0, 1, 0, 0]),
+                ]
+
+        events = []
+        self.service.on_event = events.append
+        self.service._analyzer = FakeAnalyzer()
+        self.service._state = "active"
+        self.service._known_vectors = [
+            ("1", "John", np.array([1, 0, 0, 0], dtype=np.float32)),
+            ("2", "Sarah", np.array([0, 1, 0, 0], dtype=np.float32)),
+        ]
+        self.service._analyze_frame(Image.new("RGB", (320, 240)), 1.0)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual([face.name for face in events[0].faces], ["John", "Sarah"])
+        self.assertEqual(events[0].faces[0].bbox, (10.0, 10.0, 110.0, 110.0))
 
 
 if __name__ == "__main__":

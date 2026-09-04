@@ -7,9 +7,9 @@ import threading
 from typing import Optional
 
 import customtkinter as ctk
-from PIL import Image
+from PIL import Image, ImageDraw
 
-from src.services.face_recognition import FaceRecognitionEvent, FaceRecognitionService
+from src.services.face_recognition import FaceMatch, FaceRecognitionEvent, FaceRecognitionService
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +26,7 @@ class FaceRecognitionPage(ctk.CTkFrame):
         self._frame_lock = threading.Lock()
         self._latest_frame: Optional[Image.Image] = None
         self._preview_image: Optional[ctk.CTkImage] = None
+        self._latest_faces: tuple[FaceMatch, ...] = ()
         self._preview_after_id = None
 
         # The page is the UI adapter for the service. The service itself never
@@ -200,13 +201,20 @@ class FaceRecognitionPage(ctk.CTkFrame):
                 if target_height > height:
                     target_height = height
                     target_width = int(height * aspect)
-                frame = self.camera_service.get_latest_frame_pil(
-                    target_size=(target_width, target_height)
-                )
+                frame = self.camera_service.get_latest_frame_pil()
                 if frame is None:
                     with self._frame_lock:
                         frame = self._latest_frame
                 if frame is not None:
+                    source_width, source_height = frame.size
+                    frame = frame.resize(
+                        (target_width, target_height), Image.Resampling.BILINEAR
+                    )
+                    self._draw_face_overlays(
+                        frame,
+                        source_width=source_width,
+                        source_height=source_height,
+                    )
                     self._preview_image = ctk.CTkImage(
                         light_image=frame,
                         dark_image=frame,
@@ -221,17 +229,75 @@ class FaceRecognitionPage(ctk.CTkFrame):
             if not self._is_destroyed and self.winfo_exists():
                 self._preview_after_id = self.after(100, self._render_preview)
 
+    def _draw_face_overlays(
+        self, frame: Image.Image, *, source_width: int, source_height: int
+    ) -> None:
+        """Draw recognition boxes and labels on the UI preview image."""
+        if not self._latest_faces:
+            return
+        draw = ImageDraw.Draw(frame)
+        scale_x = frame.width / max(1, source_width)
+        scale_y = frame.height / max(1, source_height)
+        for result in self._latest_faces:
+            left, top, right, bottom = result.bbox
+            box = (
+                int(left * scale_x),
+                int(top * scale_y),
+                int(right * scale_x),
+                int(bottom * scale_y),
+            )
+            color = "#A6E3A1" if result.state == "recognized" else "#F9E2AF"
+            label = result.name or "Unknown"
+            if result.similarity is not None:
+                label = f"{label} {result.similarity:.2f}"
+            draw.rounded_rectangle(box, radius=5, outline=color, width=3)
+            text_box = draw.textbbox((0, 0), label)
+            text_width = text_box[2] - text_box[0]
+            text_height = text_box[3] - text_box[1]
+            label_left = max(0, box[0])
+            label_top = max(0, box[1] - text_height - 8)
+            draw.rounded_rectangle(
+                (
+                    label_left,
+                    label_top,
+                    label_left + text_width + 8,
+                    label_top + text_height + 6,
+                ),
+                radius=3,
+                fill="#11111B",
+                outline=color,
+            )
+            draw.text(
+                (label_left + 4, label_top + 3),
+                label,
+                fill=color,
+            )
+
     def _on_service_event(self, event: FaceRecognitionEvent) -> None:
         self._dispatch_ui(lambda: self._apply_event(event))
 
     def _apply_event(self, event: FaceRecognitionEvent) -> None:
-        if event.state == "recognized" and event.name:
-            self._set_status(f"Recognized: {event.name} ({event.similarity:.2f})")
-        elif event.message:
+        if event.faces or event.state in {"active", "recognized", "unknown"}:
+            self._latest_faces = event.faces
+        enrollment_state = self.face_service.state
+        if event.state == "recognized" and event.name and enrollment_state not in {"collecting", "awaiting_name", "saving"}:
+            recognized = [face for face in event.faces if face.state == "recognized"]
+            if recognized:
+                self._set_status(
+                    "\n".join(
+                        f"{face.name}: {face.similarity:.2f}"
+                        for face in recognized
+                        if face.name and face.similarity is not None
+                    )
+                )
+            else:
+                self._set_status(f"Recognized: {event.name} ({event.similarity:.2f})")
+        elif event.message and enrollment_state not in {"collecting", "awaiting_name", "saving"}:
             self._set_status(event.message)
         if event.state != "awaiting_name" and event.state != "saving":
             if event.state in {"active", "recognized", "unknown"}:
-                self._hide_name_prompt()
+                if enrollment_state not in {"collecting", "awaiting_name", "saving"}:
+                    self._hide_name_prompt()
         self._update_toggle_button()
 
     def _on_progress(self, count: int, target: int) -> None:

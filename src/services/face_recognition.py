@@ -38,6 +38,18 @@ class FaceRecognitionEvent:
     similarity: Optional[float] = None
     detection_score: Optional[float] = None
     message: str = ""
+    faces: tuple["FaceMatch", ...] = ()
+
+
+@dataclass(frozen=True)
+class FaceMatch:
+    """Recognition result and source-frame bounding box for one detected face."""
+
+    bbox: tuple[float, float, float, float]
+    state: str
+    name: Optional[str] = None
+    similarity: Optional[float] = None
+    detection_score: Optional[float] = None
 
 
 class FaceRecognitionService:
@@ -270,30 +282,78 @@ class FaceRecognitionService:
             self._emit(FaceRecognitionEvent(state="active", message="No face detected."))
             return
 
-        face = max(faces, key=self._face_area)
-        face_bbox = np.asarray(face.bbox, dtype=np.float32).reshape(4)
-        embedding = self._normalize(np.asarray(face.embedding, dtype=np.float32))
-        detection_score = float(getattr(face, "det_score", 0.0) or 0.0)
-        if detection_score < self.config.face_detection_confidence:
-            return
-        if self._face_width(face) < self.config.face_minimum_size:
-            return
+        results: list[FaceMatch] = []
+        unknown_candidates: list[tuple[object, np.ndarray, float]] = []
+        for face in faces:
+            face_bbox = np.asarray(face.bbox, dtype=np.float32).reshape(4)
+            embedding = self._normalize(np.asarray(face.embedding, dtype=np.float32))
+            detection_score = float(getattr(face, "det_score", 0.0) or 0.0)
+            if detection_score < self.config.face_detection_confidence:
+                continue
+            if self._face_width(face) < self.config.face_minimum_size:
+                continue
 
-        match_name, similarity = self._match(embedding)
-        if match_name is not None:
-            self._unknown_streak = 0
-            self._emit(
-                FaceRecognitionEvent(
-                    state="recognized",
-                    name=match_name,
-                    similarity=similarity,
-                    detection_score=detection_score,
-                    message=f"Recognized {match_name} ({similarity:.2f}).",
+            match_name, similarity = self._match(embedding)
+            if match_name is not None:
+                results.append(
+                    FaceMatch(
+                        bbox=tuple(float(value) for value in face_bbox),
+                        state="recognized",
+                        name=match_name,
+                        similarity=similarity,
+                        detection_score=detection_score,
+                    )
                 )
-            )
+            else:
+                results.append(
+                    FaceMatch(
+                        bbox=tuple(float(value) for value in face_bbox),
+                        state="unknown",
+                        similarity=similarity,
+                        detection_score=detection_score,
+                    )
+                )
+                unknown_candidates.append((face, embedding, detection_score))
+
+        if not results:
+            self._unknown_streak = 0
+            self._check_enrollment_timeout(now)
+            self._emit(FaceRecognitionEvent(state="active", message="No good face detected."))
             return
 
-        self._handle_unknown(embedding, detection_score, now, face_bbox)
+        # Enrollment intentionally remains single-person: use the largest
+        # unknown face while still reporting every face to the UI.
+        if unknown_candidates:
+            face, embedding, detection_score = max(
+                unknown_candidates, key=lambda item: self._face_area(item[0])
+            )
+            self._handle_unknown(
+                embedding,
+                detection_score,
+                now,
+                np.asarray(face.bbox, dtype=np.float32).reshape(4),
+                emit_event=False,
+            )
+        else:
+            self._unknown_streak = 0
+
+        recognized = [result for result in results if result.state == "recognized"]
+        names = ", ".join(
+            f"{result.name} ({result.similarity:.2f})"
+            for result in recognized
+            if result.name and result.similarity is not None
+        )
+        state = "recognized" if recognized else "unknown"
+        self._emit(
+            FaceRecognitionEvent(
+                state=state,
+                name=recognized[0].name if recognized else None,
+                similarity=recognized[0].similarity if recognized else None,
+                detection_score=results[0].detection_score,
+                message=(f"Recognized: {names}" if names else f"{len(results)} unknown face(s) detected."),
+                faces=tuple(results),
+            )
+        )
 
     def _handle_unknown(
         self,
@@ -301,6 +361,8 @@ class FaceRecognitionService:
         quality: float,
         now: float,
         bbox: Optional[np.ndarray] = None,
+        *,
+        emit_event: bool = True,
     ) -> None:
         with self._state_lock:
             state = self._state
@@ -312,7 +374,8 @@ class FaceRecognitionService:
                 self._unknown_streak = 1
             else:
                 self._unknown_streak += 1
-            self._emit(FaceRecognitionEvent(state="unknown", message="Unknown face detected."))
+            if emit_event:
+                self._emit(FaceRecognitionEvent(state="unknown", message="Unknown face detected."))
             if self._unknown_streak >= self._UNKNOWN_STABILITY_FRAMES:
                 with self._state_lock:
                     self._state = "collecting"
