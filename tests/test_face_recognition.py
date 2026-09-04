@@ -1,6 +1,7 @@
 """Tests for face-recognition persistence and enrollment state transitions."""
 
 import unittest
+from unittest.mock import patch
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -9,7 +10,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from src.config import AppConfig
-from src.db import Base, create_person_with_embeddings, list_people_with_embeddings
+from src.db import Base, clear_all_people, create_person_with_embeddings, list_people_with_embeddings
 from src.services.face_recognition import FaceRecognitionService
 
 
@@ -54,6 +55,16 @@ class TestPeoplePersistence(unittest.TestCase):
                 " john ", [vector], model_name="buffalo_s", dimension=4, session=self.session
             )
 
+    def test_clear_all_people_removes_people_and_embeddings(self):
+        vector = np.ones(4, dtype=np.float32)
+        create_person_with_embeddings(
+            "John", [vector, vector], model_name="buffalo_s", dimension=4, session=self.session
+        )
+        self.session.commit()
+        self.assertEqual(clear_all_people(session=self.session), (1, 2))
+        self.session.commit()
+        self.assertEqual(list_people_with_embeddings(session=self.session), [])
+
 
 class TestFaceRecognitionService(unittest.TestCase):
     def setUp(self):
@@ -65,10 +76,12 @@ class TestFaceRecognitionService(unittest.TestCase):
             face_enrollment_timeout_seconds=30,
         )
         self.name_required = MagicMock()
+        self.enrollment_ready = MagicMock()
         self.service = FaceRecognitionService(
             self.config,
             self.camera,
             on_name_required=self.name_required,
+            on_enrollment_ready=self.enrollment_ready,
         )
 
     def test_match_uses_cosine_similarity_and_threshold(self):
@@ -91,6 +104,7 @@ class TestFaceRecognitionService(unittest.TestCase):
         self.assertEqual(self.service.state, "awaiting_name")
         self.assertEqual(self.service.enrollment_count, 3)
         self.name_required.assert_called_once()
+        self.enrollment_ready.assert_called_once()
 
     def test_cancel_discards_temporary_embeddings(self):
         self.service._state = "collecting"
@@ -98,6 +112,33 @@ class TestFaceRecognitionService(unittest.TestCase):
         self.service.cancel_enrollment()
         self.assertEqual(self.service.state, "active")
         self.assertEqual(self.service.enrollment_count, 0)
+
+    def test_save_pending_enrollment_persists_embeddings_for_live_tool(self):
+        self.service._state = "awaiting_name"
+        self.service._enrollment_embeddings = [
+            np.array([1, 0, 0, 0], dtype=np.float32),
+            np.array([0.99, 0.01, 0, 0], dtype=np.float32),
+        ]
+        self.service._enrollment_quality = [0.95, 0.90]
+
+        with patch(
+            "src.services.face_recognition.create_person_with_embeddings"
+        ) as create_person, patch.object(self.service, "_load_known_people"):
+            saved, message = self.service.save_pending_enrollment("  John   Doe ")
+
+        self.assertTrue(saved)
+        self.assertEqual(message, "Saved John Doe.")
+        self.assertEqual(self.service.state, "active")
+        self.assertEqual(self.service.enrollment_count, 0)
+        create_person.assert_called_once()
+        self.assertEqual(create_person.call_args.args[0], "John Doe")
+
+    def test_pause_does_not_stop_shared_camera(self):
+        self.service.set_analysis_paused(True)
+        self.assertTrue(self.service.is_analysis_paused)
+        self.camera.stop.assert_not_called()
+        self.service.set_analysis_paused(False)
+        self.assertFalse(self.service.is_analysis_paused)
 
     def test_enrollment_accepts_pose_variation_above_minimum_similarity(self):
         self.service._state = "collecting"
@@ -134,6 +175,26 @@ class TestFaceRecognitionService(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual([face.name for face in events[0].faces], ["John", "Sarah"])
         self.assertEqual(events[0].faces[0].bbox, (10.0, 10.0, 110.0, 110.0))
+
+    def test_selected_unknown_face_is_marked_as_enrolling(self):
+        class FakeFace:
+            bbox = np.array([10, 10, 110, 110], dtype=np.float32)
+            embedding = np.array([1, 0, 0, 0], dtype=np.float32)
+            det_score = 0.95
+
+        class FakeAnalyzer:
+            def get(self, _frame):
+                return [FakeFace()]
+
+        events = []
+        self.service.on_event = events.append
+        self.service._analyzer = FakeAnalyzer()
+        self.service._state = "collecting"
+        self.service._unknown_anchor = np.array([1, 0, 0, 0], dtype=np.float32)
+        self.service._enrollment_started_at = 1.0
+        self.service._analyze_frame(Image.new("RGB", (320, 240)), 1.0)
+
+        self.assertEqual(events[-1].faces[0].state, "enrolling")
 
 
 if __name__ == "__main__":

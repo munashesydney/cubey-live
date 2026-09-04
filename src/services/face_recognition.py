@@ -13,6 +13,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
+from dataclasses import replace
 from typing import Callable, Optional
 
 import numpy as np
@@ -22,6 +23,7 @@ from src.camera.service import CameraService
 from src.config import AppConfig
 from src.db import (
     create_person_with_embeddings,
+    clear_all_people,
     decode_face_embedding,
     list_people_with_embeddings,
 )
@@ -66,6 +68,7 @@ class FaceRecognitionService:
         on_event: Optional[Callable[[FaceRecognitionEvent], None]] = None,
         on_progress: Optional[Callable[[int, int], None]] = None,
         on_name_required: Optional[Callable[[], None]] = None,
+        on_enrollment_ready: Optional[Callable[[], None]] = None,
         on_saved: Optional[Callable[[str], None]] = None,
         on_error: Optional[Callable[[str], None]] = None,
     ):
@@ -74,6 +77,7 @@ class FaceRecognitionService:
         self.on_event = on_event
         self.on_progress = on_progress
         self.on_name_required = on_name_required
+        self.on_enrollment_ready = on_enrollment_ready
         self.on_saved = on_saved
         self.on_error = on_error
 
@@ -82,8 +86,11 @@ class FaceRecognitionService:
         self._state_lock = threading.RLock()
         self._thread: Optional[threading.Thread] = None
         self._owns_camera = False
+        self._analysis_paused = False
+        self._live_active = False
         self._analyzer = None
         self._analyzer_error_reported = False
+        self._clear_lock = threading.Lock()
         self._known_vectors: list[tuple[str, str, np.ndarray]] = []
 
         self._state = "idle"
@@ -111,6 +118,31 @@ class FaceRecognitionService:
         with self._state_lock:
             return len(self._enrollment_embeddings)
 
+    @property
+    def is_analysis_paused(self) -> bool:
+        """Return whether camera frames are temporarily excluded from analysis."""
+        with self._state_lock:
+            return self._analysis_paused
+
+    @property
+    def is_live_active(self) -> bool:
+        """Return whether Gemini Live currently owns the background face mode."""
+        with self._state_lock:
+            return self._live_active
+
+    def set_live_active(self, active: bool) -> None:
+        """Coordinate service lifetime with the logical Gemini Live session."""
+        with self._state_lock:
+            self._live_active = bool(active)
+
+    def set_analysis_paused(self, paused: bool) -> None:
+        """Pause or resume analysis while leaving the shared camera running."""
+        with self._state_lock:
+            self._analysis_paused = bool(paused)
+        if not paused:
+            self._drain_frame_queue()
+        logger.info("Face recognition analysis %s.", "paused" if paused else "resumed")
+
     def start(self) -> bool:
         """Start camera analysis and load known people into memory."""
         if self.is_running:
@@ -128,6 +160,7 @@ class FaceRecognitionService:
         self._reset_enrollment_state()
         with self._state_lock:
             self._state = "active"
+            self._analysis_paused = False
         self.camera_service.add_preview_listener(self._on_camera_frame)
         self._thread = threading.Thread(
             target=self._worker,
@@ -138,8 +171,11 @@ class FaceRecognitionService:
         self._emit(FaceRecognitionEvent(state="active", message="Face recognition active."))
         return True
 
-    def stop(self) -> None:
+    def stop(self, *, force: bool = False) -> None:
         """Stop analysis, discard temporary enrollment data, and release owned camera."""
+        if self.is_live_active and not force:
+            logger.info("Keeping face recognition active for the Gemini Live session.")
+            return
         self._stop_event.set()
         try:
             self.camera_service.remove_preview_listener(self._on_camera_frame)
@@ -155,22 +191,17 @@ class FaceRecognitionService:
         self._reset_enrollment_state()
         with self._state_lock:
             self._state = "idle"
+            self._analysis_paused = False
         if self._owns_camera:
             self.camera_service.stop()
         self._owns_camera = False
 
     def submit_name(self, name: str) -> bool:
         """Persist the completed enrollment without blocking the GUI thread."""
-        display_name = " ".join(name.strip().split())
-        with self._state_lock:
-            if self._state != "awaiting_name":
-                return False
-            if not display_name:
-                self._report_error("Please enter a name before saving.")
-                return False
-            embeddings = [vector.copy() for vector in self._enrollment_embeddings]
-            quality = list(self._enrollment_quality)
-            self._state = "saving"
+        prepared = self._prepare_enrollment_save(name)
+        if prepared is None:
+            return False
+        display_name, embeddings, quality = prepared
 
         threading.Thread(
             target=self._save_enrollment,
@@ -181,6 +212,38 @@ class FaceRecognitionService:
         self._emit(FaceRecognitionEvent(state="saving", message="Saving face embeddings..."))
         return True
 
+    def save_pending_enrollment(self, name: str) -> tuple[bool, str]:
+        """Synchronously save the pending enrollment for an AI tool call.
+
+        Tool dispatch runs this method on a worker thread, so the database write
+        and model-cache refresh do not block Gemini Live's realtime event loop.
+        """
+        prepared = self._prepare_enrollment_save(name)
+        if prepared is None:
+            with self._state_lock:
+                state = self._state
+            if state != "awaiting_name":
+                return False, "There is no face enrollment waiting for a name."
+            return False, "Please provide a non-empty name before saving the face."
+        display_name, embeddings, quality = prepared
+        self._emit(FaceRecognitionEvent(state="saving", message="Saving face embeddings..."))
+        return self._save_enrollment(display_name, embeddings, quality)
+
+    def _prepare_enrollment_save(
+        self, name: str
+    ) -> Optional[tuple[str, list[np.ndarray], list[float]]]:
+        display_name = " ".join(str(name or "").strip().split())
+        with self._state_lock:
+            if self._state != "awaiting_name":
+                return None
+            if not display_name:
+                self._report_error("Please enter a name before saving.")
+                return None
+            embeddings = [vector.copy() for vector in self._enrollment_embeddings]
+            quality = list(self._enrollment_quality)
+            self._state = "saving"
+        return display_name, embeddings, quality
+
     def cancel_enrollment(self) -> None:
         """Discard the current temporary enrollment and resume recognition."""
         with self._state_lock:
@@ -189,8 +252,50 @@ class FaceRecognitionService:
                 self._state = "active"
         self._emit(FaceRecognitionEvent(state="active", message="Enrollment cancelled."))
 
+    def clear_all_faces(self) -> bool:
+        """Delete all persisted faces and clear the in-memory recognition cache."""
+        if not self._clear_lock.acquire(blocking=False):
+            return False
+        with self._state_lock:
+            if self._state == "saving":
+                self._clear_lock.release()
+                self._report_error("Please wait for the current person to finish saving.")
+                return False
+            self._state = "clearing" if self.is_running else "idle"
+        self._emit(FaceRecognitionEvent(state="clearing", message="Clearing all saved faces..."))
+        threading.Thread(
+            target=self._clear_all_faces_worker,
+            daemon=True,
+            name="FaceClearWorker",
+        ).start()
+        return True
+
+    def _clear_all_faces_worker(self) -> None:
+        try:
+            people_deleted, embeddings_deleted = clear_all_people()
+            with self._state_lock:
+                self._known_vectors.clear()
+                self._reset_enrollment_state()
+                self._state = "active" if self.is_running else "idle"
+                state = self._state
+            self._emit(
+                FaceRecognitionEvent(
+                    state=state,
+                    message=(
+                        f"Cleared {people_deleted} people and "
+                        f"{embeddings_deleted} face embeddings."
+                    ),
+                )
+            )
+        except Exception as exc:
+            self._report_error(f"Could not clear saved faces: {exc}")
+        finally:
+            self._clear_lock.release()
+
     def _on_camera_frame(self, frame: Image.Image) -> None:
         """Enqueue the newest frame without allowing backpressure on capture."""
+        if self.is_analysis_paused:
+            return
         try:
             self._frames.put_nowait(frame.copy())
         except queue.Full:
@@ -227,6 +332,8 @@ class FaceRecognitionService:
                 self._check_enrollment_timeout()
                 continue
             now = time.monotonic()
+            if self.is_analysis_paused:
+                continue
             if now < next_analysis:
                 continue
             next_analysis = now + interval
@@ -270,7 +377,7 @@ class FaceRecognitionService:
     def _analyze_frame(self, frame: Image.Image, now: float) -> None:
         with self._state_lock:
             state = self._state
-        if state in {"awaiting_name", "saving"}:
+        if state in {"awaiting_name", "saving", "clearing"}:
             return
 
         rgb = np.asarray(frame.convert("RGB"), dtype=np.uint8)
@@ -327,6 +434,10 @@ class FaceRecognitionService:
             face, embedding, detection_score = max(
                 unknown_candidates, key=lambda item: self._face_area(item[0])
             )
+            enrollment_bbox = tuple(
+                float(value)
+                for value in np.asarray(face.bbox, dtype=np.float32).reshape(4)
+            )
             self._handle_unknown(
                 embedding,
                 detection_score,
@@ -334,6 +445,13 @@ class FaceRecognitionService:
                 np.asarray(face.bbox, dtype=np.float32).reshape(4),
                 emit_event=False,
             )
+            if self.state in {"collecting", "awaiting_name", "saving"}:
+                results = [
+                    replace(result, state="enrolling")
+                    if result.state == "unknown" and result.bbox == enrollment_bbox
+                    else result
+                    for result in results
+                ]
         else:
             self._unknown_streak = 0
 
@@ -423,6 +541,11 @@ class FaceRecognitionService:
             self._emit(FaceRecognitionEvent(state="awaiting_name", message="What's your name?"))
             if self.on_name_required:
                 self.on_name_required()
+            if self.on_enrollment_ready:
+                try:
+                    self.on_enrollment_ready()
+                except Exception:
+                    logger.debug("Face enrollment-ready callback failed", exc_info=True)
 
     def _same_enrollment_face(
         self, embedding: np.ndarray, bbox: Optional[np.ndarray]
@@ -450,7 +573,9 @@ class FaceRecognitionService:
         size_ratio = min(prev_w / curr_w, curr_w / prev_w, prev_h / curr_h, curr_h / prev_h)
         return center_distance <= max(prev_w, prev_h) * 0.75 and size_ratio >= 0.40
 
-    def _save_enrollment(self, name: str, embeddings: list[np.ndarray], quality: list[float]) -> None:
+    def _save_enrollment(
+        self, name: str, embeddings: list[np.ndarray], quality: list[float]
+    ) -> tuple[bool, str]:
         try:
             if not embeddings:
                 raise ValueError("No enrollment embeddings were collected.")
@@ -465,13 +590,16 @@ class FaceRecognitionService:
             with self._state_lock:
                 self._reset_enrollment_state()
                 self._state = "active"
-            self._emit(FaceRecognitionEvent(state="active", name=name, message=f"Saved {name}."))
+            message = f"Saved {name}."
+            self._emit(FaceRecognitionEvent(state="active", name=name, message=message))
             if self.on_saved:
                 self.on_saved(name)
+            return True, message
         except Exception as exc:
             with self._state_lock:
                 self._state = "awaiting_name"
             self._report_error(str(exc))
+            return False, str(exc)
 
     def _match(self, embedding: np.ndarray) -> tuple[Optional[str], Optional[float]]:
         with self._state_lock:
@@ -529,6 +657,13 @@ class FaceRecognitionService:
             self._unknown_streak = 0
             self._last_sample_at = 0.0
             self._enrollment_started_at = 0.0
+
+    def _drain_frame_queue(self) -> None:
+        while True:
+            try:
+                self._frames.get_nowait()
+            except queue.Empty:
+                return
 
     def _emit(self, event: FaceRecognitionEvent) -> None:
         if self.on_event:

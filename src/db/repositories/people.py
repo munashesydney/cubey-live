@@ -140,3 +140,22 @@ def delete_person(person_id: int, session: Optional[Session] = None) -> bool:
         return _delete(session)
     with get_session() as s:
         return _delete(s)
+
+
+def clear_all_people(session: Optional[Session] = None) -> tuple[int, int]:
+    """Delete every face embedding and person row in one transaction.
+
+    Embeddings are deleted explicitly before people so this remains correct
+    even when a database was created without SQLite foreign-key pragmas.
+    Returns ``(people_deleted, embeddings_deleted)``.
+    """
+
+    def _clear(s: Session) -> tuple[int, int]:
+        embeddings_result = s.execute(delete(PersonEmbedding))
+        people_result = s.execute(delete(Person))
+        return int(people_result.rowcount or 0), int(embeddings_result.rowcount or 0)
+
+    if session is not None:
+        return _clear(session)
+    with get_session() as s:
+        return _clear(s)

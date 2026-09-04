@@ -17,7 +17,9 @@ from src.audio.recorder import AudioRecorder
 from src.audio.player import AudioPlayer
 from src.camera.service import CameraService
 from src.client.tools import ToolContext, build_gemini_tools, dispatch_tool_call
+from src.client.tools.camera import stop_active_camera_timer
 from src.services.embeddings import EmbeddingService
+from src.services.face_recognition import FaceRecognitionService
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +46,7 @@ class GeminiLiveClient:
         on_session_ended: Optional[Callable[[], None]] = None,
         embedding_service: Optional[EmbeddingService] = None,
         wheels_service: Optional[Any] = None,
+        face_recognition_service: Optional[FaceRecognitionService] = None,
     ):
         self.config = config
         self.recorder = recorder
@@ -58,6 +61,7 @@ class GeminiLiveClient:
         self.on_session_ended = on_session_ended
         self.embedding_service = embedding_service
         self.wheels_service = wheels_service
+        self.face_recognition_service = face_recognition_service
 
         self.is_connected = False
         self._is_camera_streaming: bool = getattr(
@@ -127,6 +131,9 @@ class GeminiLiveClient:
         self._session_resumption_handle = None
         self._has_connected_once = False
         self._pending_initial_interrupt = initial_interrupt
+        # Gemini's detailed camera feed is opt-in. The physical camera may be
+        # active for local face recognition without streaming frames to Gemini.
+        self.set_camera_streaming(False)
         self._last_user_activity_at = time.monotonic()
         self.set_listening_state(True, force=True)
         self.set_status("Connecting to Gemini Live API...")
@@ -196,6 +203,12 @@ class GeminiLiveClient:
         finally:
             lag_monitor.cancel()
             await asyncio.gather(lag_monitor, return_exceptions=True)
+            stop_active_camera_timer()
+            # End any detailed-vision override before notifying the controller
+            # that the logical Live session has ended. This restores the
+            # background face-recognition mode cleanly.
+            if self._is_camera_streaming:
+                self.set_camera_override(False)
             self.is_connected = False
             self._session = None
             if getattr(self.config, "enable_wake_word", False):
@@ -255,7 +268,7 @@ class GeminiLiveClient:
                         types.StartSensitivity.START_SENSITIVITY_HIGH
                     ),
                     end_of_speech_sensitivity=(
-                        types.EndSensitivity.END_SENSITIVITY_LOW
+                        types.EndSensitivity.END_SENSITIVITY_HIGH
                     ),
                     prefix_padding_ms=self.config.vad_prefix_padding_ms,
                     silence_duration_ms=self.config.vad_silence_duration_ms,
@@ -392,16 +405,33 @@ class GeminiLiveClient:
             except Exception:
                 logger.exception("Vision state change callback failed")
 
-    def _handle_tool_camera_toggle(self, enabled: Optional[bool] = None) -> bool:
-        """Callback invoked when AI calls the 'camera' tool to turn camera on/off."""
+    def set_camera_override(self, enabled: Optional[bool] = None) -> bool:
+        """Set Gemini's temporary detailed-vision override.
+
+        Face recognition remains the background camera mode. Turning the
+        override on pauses only InsightFace analysis; turning it off resumes
+        analysis while keeping the shared physical camera running.
+        """
         target_state = not self._is_camera_streaming if enabled is None else enabled
         if self.camera_service:
             if target_state:
                 self.camera_service.start()
             else:
-                self.camera_service.stop()
+                # The physical camera belongs to the background face mode when
+                # Live is active, so it must not be stopped here.
+                if (
+                    self.face_recognition_service is None
+                    or not self.face_recognition_service.is_running
+                ):
+                    self.camera_service.stop()
+        if self.face_recognition_service is not None:
+            self.face_recognition_service.set_analysis_paused(target_state)
         self.set_camera_streaming(target_state)
         return target_state
+
+    def _handle_tool_camera_toggle(self, enabled: Optional[bool] = None) -> bool:
+        """Callback invoked when AI calls the ``camera`` tool."""
+        return self.set_camera_override(enabled)
 
     async def send_visual_snapshot(
         self, jpeg_bytes: bytes, prompt: Optional[str] = None
@@ -586,7 +616,8 @@ class GeminiLiveClient:
                                     camera_service=self.camera_service,
                                     on_toggle_camera=self._handle_tool_camera_toggle,
                                     live_client=self,
-                                ),
+                                    face_recognition_service=self.face_recognition_service,
+                                    ),
                             )
                             self.log(
                                 f"🔧 [AI Tool Call]: {fn_call.name} -> {result_dict.get('status')}"

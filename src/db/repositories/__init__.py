@@ -56,6 +56,7 @@ from src.db.repositories.tasks import (
     update_task,
 )
 from src.db.repositories.people import (
+    clear_all_people,
     create_person_with_embeddings,
     decode_face_embedding,
     delete_person,
@@ -107,6 +108,7 @@ __all__ = [
     "list_people_with_embeddings",
     "normalize_person_name",
     "create_person_with_embeddings",
+    "clear_all_people",
     "decode_face_embedding",
     "list_tasks",
     "save_memory_embedding",

@@ -8,6 +8,7 @@ from typing import Optional
 
 import customtkinter as ctk
 from PIL import Image, ImageDraw
+from tkinter import messagebox
 
 from src.services.face_recognition import FaceMatch, FaceRecognitionEvent, FaceRecognitionService
 
@@ -71,6 +72,18 @@ class FaceRecognitionPage(ctk.CTkFrame):
             command=self._toggle_recognition,
         )
         self.toggle_button.pack(side="right", padx=15, pady=12)
+        self.clear_button = ctk.CTkButton(
+            header,
+            text="🗑 Clear All Faces",
+            width=150,
+            height=34,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            fg_color="#F38BA8",
+            hover_color="#E78284",
+            text_color="#11111B",
+            command=self._clear_all_faces,
+        )
+        self.clear_button.pack(side="right", padx=(0, 0), pady=12)
 
         self.content = ctk.CTkFrame(self, fg_color="transparent")
         self.content.pack(fill="both", expand=True, padx=15, pady=5)
@@ -246,11 +259,19 @@ class FaceRecognitionPage(ctk.CTkFrame):
                 int(right * scale_x),
                 int(bottom * scale_y),
             )
-            color = "#A6E3A1" if result.state == "recognized" else "#F9E2AF"
+            if result.state == "recognized":
+                color = "#A6E3A1"
+            elif result.state == "enrolling":
+                color = "#F38BA8"
+            else:
+                color = "#F9E2AF"
             label = result.name or "Unknown"
             if result.similarity is not None:
                 label = f"{label} {result.similarity:.2f}"
-            draw.rounded_rectangle(box, radius=5, outline=color, width=3)
+            if result.state == "enrolling":
+                self._draw_dashed_rectangle(draw, box, color)
+            else:
+                draw.rounded_rectangle(box, radius=5, outline=color, width=3)
             text_box = draw.textbbox((0, 0), label)
             text_width = text_box[2] - text_box[0]
             text_height = text_box[3] - text_box[1]
@@ -272,6 +293,19 @@ class FaceRecognitionPage(ctk.CTkFrame):
                 label,
                 fill=color,
             )
+
+    @staticmethod
+    def _draw_dashed_rectangle(draw: ImageDraw.ImageDraw, box, color: str) -> None:
+        """Draw a pink dashed rectangle using Pillow's line primitives."""
+        left, top, right, bottom = box
+        dash = 8
+        gap = 5
+        for start in range(left, right, dash + gap):
+            draw.line((start, top, min(start + dash, right), top), fill=color, width=3)
+            draw.line((start, bottom, min(start + dash, right), bottom), fill=color, width=3)
+        for start in range(top, bottom, dash + gap):
+            draw.line((left, start, left, min(start + dash, bottom)), fill=color, width=3)
+            draw.line((right, start, right, min(start + dash, bottom)), fill=color, width=3)
 
     def _on_service_event(self, event: FaceRecognitionEvent) -> None:
         self._dispatch_ui(lambda: self._apply_event(event))
@@ -342,6 +376,17 @@ class FaceRecognitionPage(ctk.CTkFrame):
         self.name_entry.delete(0, "end")
         self._hide_name_prompt()
         self.progress_label.configure(text="")
+
+    def _clear_all_faces(self) -> None:
+        """Confirm and clear both face-recognition tables."""
+        if not messagebox.askyesno(
+            "Clear all faces",
+            "Delete every saved person and face embedding? This cannot be undone.",
+            parent=self,
+        ):
+            return
+        if self.face_service.clear_all_faces():
+            self._set_status("Clearing all saved faces...")
 
     def _set_status(self, text: str) -> None:
         if self.winfo_exists():

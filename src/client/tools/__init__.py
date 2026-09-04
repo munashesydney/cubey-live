@@ -15,6 +15,7 @@ from src.client.tools.current_time import (
     CURRENT_TIME_TOOL_DECLARATION,
     execute_current_time_tool,
 )
+from src.client.tools.people import ADD_FACE_TOOL_DECLARATION, execute_add_face_tool
 from src.client.tools.registry import (
     MODEL_TOOL_POLICY,
     TOOL_SCHEMAS,
@@ -29,6 +30,7 @@ from src.client.tools.registry import (
 
 __all__ = [
     "CAMERA_TOOL_DECLARATION",
+    "ADD_FACE_TOOL_DECLARATION",
     "MEMORIES_TOOL_DECLARATION",
     "MESSAGES_TOOL_DECLARATION",
     "MOVE_TOOL_DECLARATION",
@@ -43,6 +45,7 @@ __all__ = [
     "build_llama_tools",
     "dispatch_tool_call",
     "execute_camera_tool",
+    "execute_add_face_tool",
     "execute_memories_tool",
     "execute_messages_tool",
     "execute_move_tool",
