@@ -37,6 +37,7 @@ class GeminiLiveApp(ctk.CTk):
         on_send_interruption: Callable[[str], None],
         embedding_service: EmbeddingService,
         camera_service: Optional[Any] = None,
+        face_service: Optional[Any] = None,
         on_toggle_camera: Optional[Callable[[Optional[bool]], bool]] = None,
         on_set_camera_device: Optional[Callable[[int], None]] = None,
         on_send_snapshot: Optional[Callable[[Optional[str]], None]] = None,
@@ -50,6 +51,7 @@ class GeminiLiveApp(ctk.CTk):
         self.on_send_interruption = on_send_interruption
         self.embedding_service = embedding_service
         self.camera_service = camera_service
+        self.face_service = face_service
         self.on_toggle_camera = on_toggle_camera
         self.on_set_camera_device = on_set_camera_device
         self.on_send_snapshot = on_send_snapshot
@@ -222,6 +224,7 @@ class GeminiLiveApp(ctk.CTk):
                 is_session_active=self.is_session_active,
                 embedding_service=self.embedding_service,
                 camera_service=self.camera_service,
+                face_service=self.face_service,
                 on_toggle_camera=self.on_toggle_camera,
                 on_set_camera_device=self.on_set_camera_device,
                 on_send_snapshot=self.on_send_snapshot,

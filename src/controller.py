@@ -27,6 +27,7 @@ from src.db import (
     create_conversation,
 )
 from src.services.embeddings import EmbeddingService
+from src.services.face_recognition import FaceRecognitionService
 from src.gui.windows.app_window import GeminiLiveApp
 from src.services.task_scheduler import TaskScheduler
 from src.services.transcript_persistence import TranscriptPersistenceService
@@ -63,6 +64,7 @@ class ApplicationController:
         self.recorder: Optional[AudioRecorder] = None
         self.player: Optional[AudioPlayer] = None
         self.camera_service: Optional[CameraService] = None
+        self.face_recognition_service: Optional[FaceRecognitionService] = None
         self.client: Optional[GeminiLiveClient] = None
         self.gui: Optional[GeminiLiveApp] = None
         self.wake_word_service: Optional[WakeWordService] = None
@@ -104,12 +106,16 @@ class ApplicationController:
 
         # 2. Instantiate Camera video capture service
         self.camera_service = CameraService(self.config)
+        self.face_recognition_service = FaceRecognitionService(
+            self.config, self.camera_service
+        )
 
         # 3. Create CustomTkinter GUI app with Startup loading screen
         self.gui = GeminiLiveApp(
             config=self.config,
             async_loop=self.async_loop,
             camera_service=self.camera_service,
+            face_service=self.face_recognition_service,
             on_start_session=self.start_live_session,
             on_stop_session=self.stop_live_session,
             on_send_interruption=self.send_interruption,
@@ -135,6 +141,8 @@ class ApplicationController:
                 self.web_server.should_exit = True
             if self.wake_word_service:
                 self.wake_word_service.stop()
+            if self.face_recognition_service:
+                self.face_recognition_service.stop()
             if self.camera_service:
                 self.camera_service.stop()
             if self.recorder:

@@ -143,6 +143,24 @@ class AppConfig:
         "CAMERA_AUTO_START_WITH_LIVE", "false"
     ).strip().lower() not in {"0", "false", "no", "off"}
 
+    # Local InsightFace recognition/enrollment parameters.
+    face_model_name: str = os.getenv("FACE_MODEL_NAME", "buffalo_s")
+    face_detection_size: int = int(os.getenv("FACE_DETECTION_SIZE", "640"))
+    face_detection_confidence: float = float(os.getenv("FACE_DETECTION_CONFIDENCE", "0.70"))
+    face_match_threshold: float = float(os.getenv("FACE_MATCH_THRESHOLD", "0.45"))
+    face_enrollment_target_frames: int = int(os.getenv("FACE_ENROLLMENT_TARGET_FRAMES", "18"))
+    face_enrollment_timeout_seconds: float = float(
+        os.getenv("FACE_ENROLLMENT_TIMEOUT_SECONDS", "45.0")
+    )
+    face_minimum_size: int = int(os.getenv("FACE_MINIMUM_SIZE", "80"))
+    face_analysis_fps: float = float(os.getenv("FACE_ANALYSIS_FPS", "5.0"))
+    face_enrollment_consistency_threshold: float = float(
+        os.getenv("FACE_ENROLLMENT_CONSISTENCY_THRESHOLD", "0.75")
+    )
+    face_enrollment_min_similarity: float = float(
+        os.getenv("FACE_ENROLLMENT_MIN_SIMILARITY", "0.55")
+    )
+
     # ESP32-S3 Mecanum Wheels & Motors UART Parameters
     wheels_port: str = os.getenv("WHEELS_PORT", "")
     wheels_baudrate: int = int(os.getenv("WHEELS_BAUDRATE", "115200"))

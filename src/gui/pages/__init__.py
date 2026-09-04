@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from .home_page import HomePage
     from .lidar_page import LidarPage
     from .live_page import LivePage
+    from .face_recognition_page import FaceRecognitionPage
     from .local_chat_page import LocalChatPage
     from .memory_page import MemoryPage
     from .startup_page import StartupPage
@@ -22,6 +23,7 @@ __all__ = [
     "HomePage",
     "LidarPage",
     "LivePage",
+    "FaceRecognitionPage",
     "LocalChatPage",
     "MemoryPage",
     "StartupPage",
@@ -33,6 +35,7 @@ _PAGE_MODULES = {
     "HomePage": ".home_page",
     "LidarPage": ".lidar_page",
     "LivePage": ".live_page",
+    "FaceRecognitionPage": ".face_recognition_page",
     "LocalChatPage": ".local_chat_page",
     "MemoryPage": ".memory_page",
     "StartupPage": ".startup_page",

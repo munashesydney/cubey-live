@@ -1,0 +1,481 @@
+"""Local face detection, recognition, and one-person enrollment service.
+
+The service deliberately owns no GUI objects. Camera callbacks only enqueue a
+bounded number of frames; InsightFace inference and database writes happen on
+worker threads so neither the camera capture thread nor Tk's event loop can be
+blocked by model work.
+"""
+
+from __future__ import annotations
+
+import logging
+import queue
+import threading
+import time
+from dataclasses import dataclass
+from typing import Callable, Optional
+
+import numpy as np
+from PIL import Image
+
+from src.camera.service import CameraService
+from src.config import AppConfig
+from src.db import (
+    create_person_with_embeddings,
+    decode_face_embedding,
+    list_people_with_embeddings,
+)
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class FaceRecognitionEvent:
+    """One result emitted by the background face-analysis worker."""
+
+    state: str
+    name: Optional[str] = None
+    similarity: Optional[float] = None
+    detection_score: Optional[float] = None
+    message: str = ""
+
+
+class FaceRecognitionService:
+    """Run InsightFace locally and enroll unknown people on demand."""
+
+    _UNKNOWN_STABILITY_FRAMES = 3
+    _QUEUE_SIZE = 2
+
+    def __init__(
+        self,
+        config: AppConfig,
+        camera_service: CameraService,
+        *,
+        on_event: Optional[Callable[[FaceRecognitionEvent], None]] = None,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+        on_name_required: Optional[Callable[[], None]] = None,
+        on_saved: Optional[Callable[[str], None]] = None,
+        on_error: Optional[Callable[[str], None]] = None,
+    ):
+        self.config = config
+        self.camera_service = camera_service
+        self.on_event = on_event
+        self.on_progress = on_progress
+        self.on_name_required = on_name_required
+        self.on_saved = on_saved
+        self.on_error = on_error
+
+        self._frames: queue.Queue[Image.Image] = queue.Queue(maxsize=self._QUEUE_SIZE)
+        self._stop_event = threading.Event()
+        self._state_lock = threading.RLock()
+        self._thread: Optional[threading.Thread] = None
+        self._owns_camera = False
+        self._analyzer = None
+        self._analyzer_error_reported = False
+        self._known_vectors: list[tuple[str, str, np.ndarray]] = []
+
+        self._state = "idle"
+        self._enrollment_embeddings: list[np.ndarray] = []
+        self._enrollment_quality: list[float] = []
+        self._unknown_anchor: Optional[np.ndarray] = None
+        self._enrollment_last_bbox: Optional[np.ndarray] = None
+        self._unknown_streak = 0
+        self._last_sample_at = 0.0
+        self._enrollment_started_at = 0.0
+
+    @property
+    def is_running(self) -> bool:
+        """Return whether the face-analysis worker is active."""
+        return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def state(self) -> str:
+        """Return the current enrollment/recognition state."""
+        with self._state_lock:
+            return self._state
+
+    @property
+    def enrollment_count(self) -> int:
+        with self._state_lock:
+            return len(self._enrollment_embeddings)
+
+    def start(self) -> bool:
+        """Start camera analysis and load known people into memory."""
+        if self.is_running:
+            return True
+
+        if not self.camera_service.is_running:
+            self._owns_camera = True
+            # CameraService initializes its capture worker asynchronously; do
+            # not hold the GUI thread waiting for hardware probing here.
+            self.camera_service.start(wait_ready=False)
+        else:
+            self._owns_camera = False
+
+        self._stop_event.clear()
+        self._reset_enrollment_state()
+        with self._state_lock:
+            self._state = "active"
+        self.camera_service.add_preview_listener(self._on_camera_frame)
+        self._thread = threading.Thread(
+            target=self._worker,
+            daemon=True,
+            name="FaceRecognitionWorker",
+        )
+        self._thread.start()
+        self._emit(FaceRecognitionEvent(state="active", message="Face recognition active."))
+        return True
+
+    def stop(self) -> None:
+        """Stop analysis, discard temporary enrollment data, and release owned camera."""
+        self._stop_event.set()
+        try:
+            self.camera_service.remove_preview_listener(self._on_camera_frame)
+        except Exception:
+            logger.debug("Could not unregister face camera listener", exc_info=True)
+        try:
+            self._frames.put_nowait(Image.new("RGB", (1, 1)))
+        except queue.Full:
+            pass
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+        self._thread = None
+        self._reset_enrollment_state()
+        with self._state_lock:
+            self._state = "idle"
+        if self._owns_camera:
+            self.camera_service.stop()
+        self._owns_camera = False
+
+    def submit_name(self, name: str) -> bool:
+        """Persist the completed enrollment without blocking the GUI thread."""
+        display_name = " ".join(name.strip().split())
+        with self._state_lock:
+            if self._state != "awaiting_name":
+                return False
+            if not display_name:
+                self._report_error("Please enter a name before saving.")
+                return False
+            embeddings = [vector.copy() for vector in self._enrollment_embeddings]
+            quality = list(self._enrollment_quality)
+            self._state = "saving"
+
+        threading.Thread(
+            target=self._save_enrollment,
+            args=(display_name, embeddings, quality),
+            daemon=True,
+            name="FaceEnrollmentSaveWorker",
+        ).start()
+        self._emit(FaceRecognitionEvent(state="saving", message="Saving face embeddings..."))
+        return True
+
+    def cancel_enrollment(self) -> None:
+        """Discard the current temporary enrollment and resume recognition."""
+        with self._state_lock:
+            if self._state in {"collecting", "awaiting_name"}:
+                self._reset_enrollment_state()
+                self._state = "active"
+        self._emit(FaceRecognitionEvent(state="active", message="Enrollment cancelled."))
+
+    def _on_camera_frame(self, frame: Image.Image) -> None:
+        """Enqueue the newest frame without allowing backpressure on capture."""
+        try:
+            self._frames.put_nowait(frame.copy())
+        except queue.Full:
+            try:
+                self._frames.get_nowait()
+                self._frames.put_nowait(frame.copy())
+            except queue.Empty:
+                pass
+
+    def _worker(self) -> None:
+        try:
+            # Model loading may download a model pack on first use, so it must
+            # never happen on Tk's UI thread.
+            self._load_known_people()
+            self._get_analyzer()
+        except Exception as exc:
+            self._report_error(f"InsightFace could not start: {exc}")
+            try:
+                self.camera_service.remove_preview_listener(self._on_camera_frame)
+            except Exception:
+                pass
+            if self._owns_camera:
+                self.camera_service.stop()
+            with self._state_lock:
+                self._state = "error"
+            return
+
+        interval = 1.0 / max(0.5, float(self.config.face_analysis_fps))
+        next_analysis = 0.0
+        while not self._stop_event.is_set():
+            try:
+                frame = self._frames.get(timeout=0.25)
+            except queue.Empty:
+                self._check_enrollment_timeout()
+                continue
+            now = time.monotonic()
+            if now < next_analysis:
+                continue
+            next_analysis = now + interval
+            try:
+                self._analyze_frame(frame, now)
+            except Exception:
+                logger.exception("Face analysis failed for a camera frame")
+                self._report_error("Face analysis failed; recognition is still running.")
+
+    def _get_analyzer(self):
+        if self._analyzer is not None:
+            return self._analyzer
+        try:
+            from insightface.app import FaceAnalysis
+        except ImportError as exc:
+            raise RuntimeError(
+                "insightface is not installed. Install the cubeyLive requirements."
+            ) from exc
+        detector_size = max(160, int(self.config.face_detection_size))
+        analyzer = FaceAnalysis(
+            name=self.config.face_model_name,
+            providers=["CPUExecutionProvider"],
+        )
+        analyzer.prepare(ctx_id=0, det_size=(detector_size, detector_size))
+        self._analyzer = analyzer
+        return analyzer
+
+    def _load_known_people(self) -> None:
+        people = list_people_with_embeddings(model_name=self.config.face_model_name)
+        vectors: list[tuple[str, str, np.ndarray]] = []
+        for person in people:
+            for sample in person.embeddings:
+                vector = decode_face_embedding(sample.embedding, sample.dimension)
+                vector = self._normalize(vector)
+                if np.linalg.norm(vector) > 0:
+                    vectors.append((str(person.id), person.name, vector))
+        with self._state_lock:
+            self._known_vectors = vectors
+        logger.info("Loaded %d face embeddings for %d people.", len(vectors), len(people))
+
+    def _analyze_frame(self, frame: Image.Image, now: float) -> None:
+        with self._state_lock:
+            state = self._state
+        if state in {"awaiting_name", "saving"}:
+            return
+
+        rgb = np.asarray(frame.convert("RGB"), dtype=np.uint8)
+        bgr = rgb[:, :, ::-1]
+        faces = self._get_analyzer().get(bgr)
+        if not faces:
+            self._unknown_streak = 0
+            self._check_enrollment_timeout(now)
+            self._emit(FaceRecognitionEvent(state="active", message="No face detected."))
+            return
+
+        face = max(faces, key=self._face_area)
+        face_bbox = np.asarray(face.bbox, dtype=np.float32).reshape(4)
+        embedding = self._normalize(np.asarray(face.embedding, dtype=np.float32))
+        detection_score = float(getattr(face, "det_score", 0.0) or 0.0)
+        if detection_score < self.config.face_detection_confidence:
+            return
+        if self._face_width(face) < self.config.face_minimum_size:
+            return
+
+        match_name, similarity = self._match(embedding)
+        if match_name is not None:
+            self._unknown_streak = 0
+            self._emit(
+                FaceRecognitionEvent(
+                    state="recognized",
+                    name=match_name,
+                    similarity=similarity,
+                    detection_score=detection_score,
+                    message=f"Recognized {match_name} ({similarity:.2f}).",
+                )
+            )
+            return
+
+        self._handle_unknown(embedding, detection_score, now, face_bbox)
+
+    def _handle_unknown(
+        self,
+        embedding: np.ndarray,
+        quality: float,
+        now: float,
+        bbox: Optional[np.ndarray] = None,
+    ) -> None:
+        with self._state_lock:
+            state = self._state
+        if state == "idle":
+            return
+        if state == "active":
+            if self._unknown_anchor is None or self._cosine(self._unknown_anchor, embedding) < self.config.face_enrollment_consistency_threshold:
+                self._unknown_anchor = embedding.copy()
+                self._unknown_streak = 1
+            else:
+                self._unknown_streak += 1
+            self._emit(FaceRecognitionEvent(state="unknown", message="Unknown face detected."))
+            if self._unknown_streak >= self._UNKNOWN_STABILITY_FRAMES:
+                with self._state_lock:
+                    self._state = "collecting"
+                self._enrollment_started_at = now
+                self._enrollment_embeddings.clear()
+                self._enrollment_quality.clear()
+                self._enrollment_last_bbox = bbox.copy() if bbox is not None else None
+                self._append_enrollment(embedding, quality, now, bbox)
+                return
+        elif state == "collecting":
+            if self._same_enrollment_face(embedding, bbox):
+                self._append_enrollment(embedding, quality, now, bbox)
+        self._check_enrollment_timeout(now)
+
+    def _append_enrollment(
+        self,
+        embedding: np.ndarray,
+        quality: float,
+        now: float,
+        bbox: Optional[np.ndarray] = None,
+    ) -> None:
+        if now - self._last_sample_at < 0.18:
+            return
+        target = max(1, int(self.config.face_enrollment_target_frames))
+        with self._state_lock:
+            if self._state != "collecting":
+                return
+            self._enrollment_embeddings.append(embedding.copy())
+            self._enrollment_quality.append(quality)
+            count = len(self._enrollment_embeddings)
+            # A running centroid accommodates ordinary pose and expression
+            # changes while retaining a stable identity anchor.
+            self._unknown_anchor = self._normalize(
+                np.mean(self._enrollment_embeddings, axis=0)
+            )
+            if bbox is not None:
+                self._enrollment_last_bbox = bbox.copy()
+        self._last_sample_at = now
+        if self.on_progress:
+            self.on_progress(count, target)
+        self._emit(FaceRecognitionEvent(state="collecting", message=f"Collecting {count} / {target} good frames."))
+        if count >= target:
+            with self._state_lock:
+                self._state = "awaiting_name"
+            self._emit(FaceRecognitionEvent(state="awaiting_name", message="What's your name?"))
+            if self.on_name_required:
+                self.on_name_required()
+
+    def _same_enrollment_face(
+        self, embedding: np.ndarray, bbox: Optional[np.ndarray]
+    ) -> bool:
+        """Accept normal pose movement without accepting an unrelated face."""
+        if self._unknown_anchor is None:
+            return True
+        similarity = self._cosine(self._unknown_anchor, embedding)
+        if similarity >= self.config.face_enrollment_min_similarity:
+            return True
+        if bbox is None or self._enrollment_last_bbox is None:
+            return False
+        return self._bbox_continuity(self._enrollment_last_bbox, bbox)
+
+    @staticmethod
+    def _bbox_continuity(previous: np.ndarray, current: np.ndarray) -> bool:
+        """Check that the tracked face moved plausibly between samples."""
+        prev = np.asarray(previous, dtype=np.float32)
+        curr = np.asarray(current, dtype=np.float32)
+        prev_w, prev_h = max(1.0, prev[2] - prev[0]), max(1.0, prev[3] - prev[1])
+        curr_w, curr_h = max(1.0, curr[2] - curr[0]), max(1.0, curr[3] - curr[1])
+        prev_center = np.array([(prev[0] + prev[2]) / 2, (prev[1] + prev[3]) / 2])
+        curr_center = np.array([(curr[0] + curr[2]) / 2, (curr[1] + curr[3]) / 2])
+        center_distance = float(np.linalg.norm(curr_center - prev_center))
+        size_ratio = min(prev_w / curr_w, curr_w / prev_w, prev_h / curr_h, curr_h / prev_h)
+        return center_distance <= max(prev_w, prev_h) * 0.75 and size_ratio >= 0.40
+
+    def _save_enrollment(self, name: str, embeddings: list[np.ndarray], quality: list[float]) -> None:
+        try:
+            if not embeddings:
+                raise ValueError("No enrollment embeddings were collected.")
+            create_person_with_embeddings(
+                name,
+                embeddings,
+                model_name=self.config.face_model_name,
+                dimension=int(embeddings[0].size),
+                quality_scores=quality,
+            )
+            self._load_known_people()
+            with self._state_lock:
+                self._reset_enrollment_state()
+                self._state = "active"
+            self._emit(FaceRecognitionEvent(state="active", name=name, message=f"Saved {name}."))
+            if self.on_saved:
+                self.on_saved(name)
+        except Exception as exc:
+            with self._state_lock:
+                self._state = "awaiting_name"
+            self._report_error(str(exc))
+
+    def _match(self, embedding: np.ndarray) -> tuple[Optional[str], Optional[float]]:
+        with self._state_lock:
+            known = list(self._known_vectors)
+        if not known:
+            return None, None
+        best_person: Optional[str] = None
+        best_score = -1.0
+        for _person_id, name, stored in known:
+            score = self._cosine(embedding, stored)
+            if score > best_score:
+                best_person, best_score = name, score
+        if best_score >= self.config.face_match_threshold:
+            return best_person, best_score
+        return None, best_score
+
+    @staticmethod
+    def _normalize(vector: np.ndarray) -> np.ndarray:
+        vector = np.asarray(vector, dtype=np.float32).reshape(-1)
+        norm = float(np.linalg.norm(vector))
+        return vector / norm if norm > 0 else vector
+
+    @staticmethod
+    def _cosine(left: np.ndarray, right: np.ndarray) -> float:
+        return float(np.dot(left, right))
+
+    @staticmethod
+    def _face_area(face) -> float:
+        bbox = np.asarray(face.bbox, dtype=np.float32)
+        return max(0.0, float(bbox[2] - bbox[0])) * max(0.0, float(bbox[3] - bbox[1]))
+
+    @staticmethod
+    def _face_width(face) -> float:
+        bbox = np.asarray(face.bbox, dtype=np.float32)
+        return max(0.0, float(bbox[2] - bbox[0]))
+
+    def _check_enrollment_timeout(self, now: Optional[float] = None) -> None:
+        with self._state_lock:
+            if self._state != "collecting":
+                return
+        current = now if now is not None else time.monotonic()
+        if current - self._enrollment_started_at <= self.config.face_enrollment_timeout_seconds:
+            return
+        self._reset_enrollment_state()
+        with self._state_lock:
+            self._state = "active"
+        self._report_error("Enrollment timed out; please look at the camera and try again.")
+
+    def _reset_enrollment_state(self) -> None:
+        with self._state_lock:
+            self._enrollment_embeddings.clear()
+            self._enrollment_quality.clear()
+            self._unknown_anchor = None
+            self._enrollment_last_bbox = None
+            self._unknown_streak = 0
+            self._last_sample_at = 0.0
+            self._enrollment_started_at = 0.0
+
+    def _emit(self, event: FaceRecognitionEvent) -> None:
+        if self.on_event:
+            try:
+                self.on_event(event)
+            except Exception:
+                logger.debug("Face-recognition event callback failed", exc_info=True)
+
+    def _report_error(self, message: str) -> None:
+        logger.warning("Face recognition: %s", message)
+        self._emit(FaceRecognitionEvent(state="error", message=message))
+        if self.on_error:
+            self.on_error(message)
