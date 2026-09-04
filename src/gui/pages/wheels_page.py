@@ -39,10 +39,13 @@ class WheelsPage(ctk.CTkFrame):
 
         self.service = wheels_service or get_wheels_service()
 
-        # Ensure service callbacks point here even if injected
-        self.service.on_telemetry = self._on_telemetry_received
-        self.service.on_log = self._on_log_received
-        self.service.on_connection_change = self._on_connection_changed
+        self._previous_on_telemetry = self.service.on_telemetry
+        self._previous_on_log = self.service.on_log
+        self._previous_on_conn = self.service.on_connection_change
+
+        self.service.on_telemetry = self._dispatch_telemetry
+        self.service.on_log = self._dispatch_log
+        self.service.on_connection_change = self._dispatch_connection_change
 
         self._active_button: Optional[ctk.CTkButton] = None
         self._current_speed: int = 180
@@ -50,6 +53,8 @@ class WheelsPage(ctk.CTkFrame):
         self._control_mode: str = "hold"  # "hold" or "pulse"
         self._pending_logs: List[str] = []
         self._log_flush_scheduled: bool = False
+        self._is_active: bool = True
+        self._latest_telemetry: Optional[TelemetryData] = None
 
         self._create_layout()
         self._bind_keyboard_events()
@@ -136,12 +141,12 @@ class WheelsPage(ctk.CTkFrame):
         # Main Split Content Area
         main_content = ctk.CTkFrame(self, fg_color="transparent")
         main_content.pack(fill="both", expand=True, padx=15, pady=(0, 10))
-        main_content.columnconfigure(0, weight=5)  # Left column (D-pad & Speed)
-        main_content.columnconfigure(1, weight=6)  # Right column (Motors, Telemetry & Logs)
+        main_content.columnconfigure(0, weight=0, minsize=420)  # Left column (D-pad & Speed, stable width)
+        main_content.columnconfigure(1, weight=1)  # Right column (Motors, Telemetry & Logs, responsive)
         main_content.rowconfigure(0, weight=1)
 
         # ---------------- Left Panel: D-Pad, Modes, Speed ----------------
-        left_panel = ctk.CTkScrollableFrame(
+        left_panel = ctk.CTkFrame(
             main_content, fg_color="#1E1E2E", corner_radius=10
         )
         left_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=4)
@@ -150,7 +155,7 @@ class WheelsPage(ctk.CTkFrame):
         self._build_speed_and_mode_section(left_panel)
 
         # ---------------- Right Panel: Diagnostics, Telemetry, Terminal ----------------
-        right_panel = ctk.CTkScrollableFrame(
+        right_panel = ctk.CTkFrame(
             main_content, fg_color="#1E1E2E", corner_radius=10
         )
         right_panel.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=4)
@@ -173,14 +178,9 @@ class WheelsPage(ctk.CTkFrame):
         )
         section_label.pack(anchor="w", padx=12, pady=(10, 8))
 
-        # D-pad grid container
+        # D-pad grid container — stable dimensions to prevent Canvas recalculation on resize
         dpad_frame = ctk.CTkFrame(parent, fg_color="transparent")
         dpad_frame.pack(padx=12, pady=4)
-
-        for col in range(3):
-            dpad_frame.columnconfigure(col, weight=1, minsize=75)
-        for row in range(3):
-            dpad_frame.rowconfigure(row, weight=1, minsize=60)
 
         # Button specs: (row, col, label, command, color, hover)
         buttons = [
@@ -201,14 +201,14 @@ class WheelsPage(ctk.CTkFrame):
                 dpad_frame,
                 text=label,
                 font=ctk.CTkFont(size=18, weight="bold"),
-                width=75,
-                height=56,
+                width=76,
+                height=54,
                 corner_radius=10,
                 fg_color=fg,
                 hover_color=hover,
                 text_color=txt_color,
             )
-            btn.grid(row=r, column=c, padx=4, pady=4, sticky="nsew")
+            btn.grid(row=r, column=c, padx=4, pady=4)
 
             if cmd == "stop":
                 btn.configure(command=self._on_stop_clicked)
@@ -745,14 +745,30 @@ class WheelsPage(ctk.CTkFrame):
             for key, cmd in releases:
                 top.bind(key, lambda e, c=cmd: self._handle_key_release(c), add="+")
 
-            top.bind("<space>", lambda e: self._on_stop_clicked(), add="+")
+            top.bind("<space>", lambda e: self._on_space_pressed(), add="+")
         except Exception as e:
             logger.warning("Could not bind keyboard shortcuts: %s", e)
 
+    def _is_text_input_focused(self) -> bool:
+        """Check if active focus is inside any text input widget."""
+        try:
+            focus_widget = self.focus_get()
+            if focus_widget is None:
+                return False
+            if isinstance(focus_widget, (ctk.CTkEntry, ctk.CTkTextbox)):
+                return True
+            cls_name = focus_widget.winfo_class()
+            if cls_name in ("Entry", "Text", "TEntry", "CTkEntry", "CTkTextbox"):
+                return True
+        except Exception:
+            pass
+        return False
+
     def _handle_key_press(self, command: str) -> None:
-        # Ignore if user is currently typing inside an Entry/Textbox widget
-        focus_widget = self.focus_get()
-        if isinstance(focus_widget, (ctk.CTkEntry, ctk.CTkTextbox)):
+        # Ignore if Wheels tab is not active
+        if not self.winfo_exists() or not getattr(self, "_is_active", True):
+            return
+        if self._is_text_input_focused():
             return
 
         if self._control_mode == "hold":
@@ -761,12 +777,20 @@ class WheelsPage(ctk.CTkFrame):
             self.service.pulse(command, self._pulse_duration_ms)
 
     def _handle_key_release(self, command: str) -> None:
-        focus_widget = self.focus_get()
-        if isinstance(focus_widget, (ctk.CTkEntry, ctk.CTkTextbox)):
+        if not self.winfo_exists() or not getattr(self, "_is_active", True):
+            return
+        if self._is_text_input_focused():
             return
 
         if self._control_mode == "hold":
             self.service.stop_continuous()
+
+    def _on_space_pressed(self) -> None:
+        if not self.winfo_exists() or not getattr(self, "_is_active", True):
+            return
+        if self._is_text_input_focused():
+            return
+        self._on_stop_clicked()
 
     # ------------------------------------------------------------------
     # Connection & Port Management
@@ -816,7 +840,58 @@ class WheelsPage(ctk.CTkFrame):
                     text="🔴 Disconnected", text_color=COLOR_DANGER
                 )
 
-        self.after(0, _update)
+    def _dispatch_telemetry(self, data: TelemetryData) -> None:
+        if self._previous_on_telemetry:
+            try:
+                self._previous_on_telemetry(data)
+            except Exception:
+                pass
+        self._on_telemetry_received(data)
+
+    def _dispatch_log(self, text: str) -> None:
+        if self._previous_on_log:
+            try:
+                self._previous_on_log(text)
+            except Exception:
+                pass
+        self._on_log_received(text)
+
+    def _dispatch_connection_change(self, connected: bool, info: str) -> None:
+        if self._previous_on_conn:
+            try:
+                self._previous_on_conn(connected, info)
+            except Exception:
+                pass
+        self._on_connection_changed(connected, info)
+
+    def on_activate(self) -> None:
+        """Called when Wheels tab is activated in DeveloperWindow."""
+        self._is_active = True
+        if self._latest_telemetry:
+            self._on_telemetry_received(self._latest_telemetry)
+
+    def on_deactivate(self) -> None:
+        """Called when navigating away from Wheels tab; safely halts motors."""
+        self._is_active = False
+        if hasattr(self, "service") and self.service and self.service.is_connected:
+            try:
+                self.service.stop()
+            except Exception:
+                pass
+
+    def destroy(self) -> None:
+        """Clean up callbacks and scheduled timers on widget destruction."""
+        self._is_destroyed = True
+        self._is_active = False
+        self._log_flush_scheduled = False
+        if hasattr(self, "service") and self.service:
+            if getattr(self.service, "on_telemetry", None) == self._dispatch_telemetry:
+                self.service.on_telemetry = self._previous_on_telemetry
+            if getattr(self.service, "on_log", None) == self._dispatch_log:
+                self.service.on_log = self._previous_on_log
+            if getattr(self.service, "on_connection_change", None) == self._dispatch_connection_change:
+                self.service.on_connection_change = self._previous_on_conn
+        super().destroy()
 
     # ------------------------------------------------------------------
     # Telemetry & Log Callbacks
@@ -824,8 +899,14 @@ class WheelsPage(ctk.CTkFrame):
 
     def _on_telemetry_received(self, data: TelemetryData) -> None:
         """Update live UI telemetry badges (dispatched on main idle)."""
+        self._latest_telemetry = data
+
+        # Skip UI label reconfiguration when Wheels tab is not active
+        if not self.winfo_exists() or not getattr(self, "_is_active", True):
+            return
+
         def _update():
-            if not self.winfo_exists():
+            if not self.winfo_exists() or not getattr(self, "_is_active", True):
                 return
             try:
                 self.front_dist_label.configure(text=f"{data.front_distance_mm} mm")
@@ -876,10 +957,16 @@ class WheelsPage(ctk.CTkFrame):
 
     def _on_log_received(self, text: str) -> None:
         """Buffer incoming log line and schedule batched UI flush to prevent GUI freezing."""
+        if getattr(self, "_is_destroyed", False):
+            return
         self._pending_logs.append(text)
         if not self._log_flush_scheduled:
             self._log_flush_scheduled = True
-            self.after(50, self._flush_pending_logs)
+            try:
+                if self.winfo_exists():
+                    self.after(50, self._flush_pending_logs)
+            except Exception:
+                self._log_flush_scheduled = False
 
     def _flush_pending_logs(self) -> None:
         """Batch-insert pending log lines into the embedded terminal."""

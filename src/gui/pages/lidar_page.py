@@ -74,6 +74,7 @@ class LidarPage(ctk.CTkFrame):
 
         # Canvas rendering throttle
         self._render_pending: bool = False
+        self._is_active: bool = True
 
         self._create_layout()
         self._refresh_port_list()
@@ -172,8 +173,8 @@ class LidarPage(ctk.CTkFrame):
         # Main Split Content Workspace
         main_content = ctk.CTkFrame(self, fg_color="transparent")
         main_content.pack(fill="both", expand=True, padx=15, pady=(0, 10))
-        main_content.columnconfigure(0, weight=6)  # Left: Radar Canvas & Zoom Toolbar
-        main_content.columnconfigure(1, weight=5)  # Right: Proximity, Telemetry & Logs
+        main_content.columnconfigure(0, weight=1)  # Left: Radar Canvas & Zoom Toolbar (responsive)
+        main_content.columnconfigure(1, weight=0, minsize=420)  # Right: Proximity, Telemetry & Logs (stable)
         main_content.rowconfigure(0, weight=1)
 
         # ---------------- Left Panel: Polar Radar Canvas ----------------
@@ -191,7 +192,8 @@ class LidarPage(ctk.CTkFrame):
             cursor="crosshair",
         )
         self.radar_canvas.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 4))
-        self.radar_canvas.bind("<Configure>", lambda e: self._request_canvas_redraw())
+        self._canvas_resize_timer = None
+        self.radar_canvas.bind("<Configure>", self._on_canvas_configure)
         self.radar_canvas.bind("<Motion>", self._on_canvas_mouse_move)
         self.radar_canvas.bind("<Leave>", self._on_canvas_mouse_leave)
 
@@ -230,7 +232,7 @@ class LidarPage(ctk.CTkFrame):
             ).pack(side="left", padx=2)
 
         # ---------------- Right Panel: Proximity, Telemetry, Controls & Logs ----------------
-        right_panel = ctk.CTkScrollableFrame(
+        right_panel = ctk.CTkFrame(
             main_content, fg_color=COLOR_CRUST, corner_radius=10
         )
         right_panel.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=4)
@@ -543,6 +545,17 @@ class LidarPage(ctk.CTkFrame):
     # Radar Canvas Drawing Engine
     # ------------------------------------------------------------------
 
+    def _on_canvas_configure(self, event=None) -> None:
+        """Debounce canvas redraw during rapid window resizing."""
+        if getattr(self, "_is_destroyed", False):
+            return
+        if hasattr(self, "_canvas_resize_timer") and self._canvas_resize_timer:
+            try:
+                self.after_cancel(self._canvas_resize_timer)
+            except Exception:
+                pass
+        self._canvas_resize_timer = self.after(35, self._redraw_canvas)
+
     def _request_canvas_redraw(self) -> None:
         """Schedule a redraw on the Tk main thread."""
         if not self._render_pending and self.winfo_exists():
@@ -845,7 +858,41 @@ class LidarPage(ctk.CTkFrame):
                     text="🔴 Disconnected", text_color=COLOR_DANGER
                 )
 
-        self.after(0, _update)
+        try:
+            if not getattr(self, "_is_destroyed", False) and self.winfo_exists():
+                self.after(0, _update)
+        except Exception:
+            pass
+
+    def on_activate(self) -> None:
+        """Called when this tab is selected in DeveloperWindow."""
+        self._is_active = True
+        if self._latest_scan is not None:
+            self._on_scan_data_received(self._latest_scan)
+
+    def on_deactivate(self) -> None:
+        """Called when navigating away from this tab."""
+        self._is_active = False
+
+    def destroy(self) -> None:
+        """Clean up callbacks and scheduled timers."""
+        self._is_destroyed = True
+        self._is_active = False
+        self._log_flush_scheduled = False
+        if hasattr(self, "_canvas_resize_timer") and self._canvas_resize_timer:
+            try:
+                self.after_cancel(self._canvas_resize_timer)
+            except Exception:
+                pass
+            self._canvas_resize_timer = None
+        if hasattr(self, "service") and self.service:
+            if getattr(self.service, "on_scan_data", None) == self._on_scan_data_received:
+                self.service.on_scan_data = None
+            if getattr(self.service, "on_log", None) == self._on_log_received:
+                self.service.on_log = None
+            if getattr(self.service, "on_connection_change", None) == self._on_connection_changed:
+                self.service.on_connection_change = None
+        super().destroy()
 
     # ------------------------------------------------------------------
     # Telemetry & Scan Callbacks
@@ -860,8 +907,17 @@ class LidarPage(ctk.CTkFrame):
             if len(self._trail_points) > 3:
                 self._trail_points.pop(0)
 
+        # Gate execution: do nothing if page is not active or destroyed
+        if getattr(self, "_is_destroyed", False) or not self.winfo_exists() or not getattr(self, "_is_active", True):
+            return
+
+        if self._render_pending:
+            return
+        self._render_pending = True
+
         def _update_ui():
-            if not self.winfo_exists():
+            self._render_pending = False
+            if getattr(self, "_is_destroyed", False) or not self.winfo_exists() or not getattr(self, "_is_active", True):
                 return
 
             # Update stats
@@ -907,17 +963,29 @@ class LidarPage(ctk.CTkFrame):
             # Redraw canvas
             self._redraw_canvas()
 
-        self.after_idle(_update_ui)
+        try:
+            if not getattr(self, "_is_destroyed", False) and self.winfo_exists():
+                self.after_idle(_update_ui)
+            else:
+                self._render_pending = False
+        except Exception:
+            self._render_pending = False
 
     # ------------------------------------------------------------------
     # Terminal Logging
     # ------------------------------------------------------------------
 
     def _on_log_received(self, text: str) -> None:
+        if getattr(self, "_is_destroyed", False):
+            return
         self._pending_logs.append(text)
         if not self._log_flush_scheduled:
             self._log_flush_scheduled = True
-            self.after(50, self._flush_pending_logs)
+            try:
+                if self.winfo_exists():
+                    self.after(50, self._flush_pending_logs)
+            except Exception:
+                self._log_flush_scheduled = False
 
     def _flush_pending_logs(self) -> None:
         self._log_flush_scheduled = False

@@ -66,6 +66,7 @@ class LivePage(ctk.CTkFrame):
         self._latest_pil_frame: Optional[Image.Image] = None
         self._preview_tk_img: Optional[ImageTk.PhotoImage] = None
         self._preview_scheduled = False
+        self._is_active = True
 
         self._create_layout()
 
@@ -75,6 +76,7 @@ class LivePage(ctk.CTkFrame):
 
         # Start preview render loop
         self._preview_after_id = self.after(50, self._render_preview_loop)
+
 
     def _create_layout(self) -> None:
         """Header controls and main live-console grid."""
@@ -172,12 +174,12 @@ class LivePage(ctk.CTkFrame):
         self.main_grid = ctk.CTkFrame(self, fg_color="transparent")
         self.main_grid.pack(fill="both", expand=True, padx=15, pady=5)
 
-        self.main_grid.columnconfigure(0, weight=4)
-        self.main_grid.columnconfigure(1, weight=6)
+        self.main_grid.columnconfigure(0, weight=0, minsize=380)
+        self.main_grid.columnconfigure(1, weight=1)
         self.main_grid.rowconfigure(0, weight=1)
 
         # Left Panel: Vision & Interruption Controls
-        self.left_panel = ctk.CTkScrollableFrame(
+        self.left_panel = ctk.CTkFrame(
             self.main_grid, corner_radius=10, fg_color="#181825"
         )
         self.left_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=0)
@@ -231,6 +233,13 @@ class LivePage(ctk.CTkFrame):
             button_color="#45475A",
         )
         self.device_menu.pack(fill="x", pady=(0, 6))
+
+        # Refresh device list asynchronously in the background if empty
+        if not devices:
+            threading.Thread(
+                target=self._async_refresh_devices, daemon=True, name="LiveCamAsyncProbe"
+            ).start()
+
 
         # Toggle Button and Snapshot Button row
         btn_row = ctk.CTkFrame(v_ctrls, fg_color="transparent")
@@ -347,7 +356,7 @@ class LivePage(ctk.CTkFrame):
 
         # Right Panel: Tabs for Video Preview, Transcript, Logs, Conversations
         self.right_panel = ctk.CTkTabview(
-            self.main_grid, corner_radius=10, fg_color="#181825"
+            self.main_grid, corner_radius=10, fg_color="#181825", command=self._on_right_tab_changed
         )
         self.right_panel.grid(row=0, column=1, sticky="nsew", padx=(8, 0), pady=0)
 
@@ -449,13 +458,56 @@ class LivePage(ctk.CTkFrame):
         with self._preview_lock:
             self._latest_pil_frame = pil_img
 
+    def _async_refresh_devices(self) -> None:
+        """Background worker enumerating camera devices without freezing UI."""
+        try:
+            devices = list_camera_devices(force_refresh=True)
+            if not devices:
+                return
+            dev_names = [f"Index {d['index']}: {d['name']}" for d in devices]
+            def _update():
+                if self.winfo_exists() and hasattr(self, "device_menu"):
+                    self.device_menu.configure(values=dev_names)
+                    if self.device_var.get() not in dev_names and dev_names:
+                        self.device_var.set(dev_names[0])
+            self.after_idle(_update)
+        except Exception as e:
+            logger.debug("Async camera device refresh error: %s", e)
+
+    def _on_right_tab_changed(self) -> None:
+        """Lazily load conversations when user switches to the conversations tab."""
+        try:
+            if self.right_panel.get() == "🗂️ Conversations" and not getattr(self, "_conversations_loaded", False):
+                self.refresh_conversations()
+        except Exception:
+            pass
+
+    def on_activate(self) -> None:
+        """Called when Gemini Live tab is selected."""
+        self._is_active = True
+        if hasattr(self, "_render_preview_loop"):
+            self.after_idle(self._render_preview_loop)
+
+    def on_deactivate(self) -> None:
+        """Called when navigating away from Gemini Live tab."""
+        self._is_active = False
+
     def _render_preview_loop(self) -> None:
         """
         Periodic Tk mainloop task refreshing the video preview widget.
         Optimized with tab-visibility gating and fast OpenCV hardware-accelerated scaling.
         """
+        if getattr(self, "_is_destroyed", False):
+            return
+
+        is_cam_running = bool(self.camera_service and self.camera_service.is_running)
         preview_fps = getattr(self.app_config, "camera_preview_fps", 10)
-        loop_interval_ms = max(40, int(1000.0 / max(1, preview_fps)))
+        loop_interval_ms = max(40, int(1000.0 / max(1, preview_fps))) if is_cam_running else 500
+
+        # If not active, back off to a relaxed idle cadence
+        if not self.winfo_exists() or not getattr(self, "_is_active", True):
+            self._preview_after_id = self.after(500, self._render_preview_loop)
+            return
 
         try:
             if self.winfo_exists():
@@ -530,6 +582,7 @@ class LivePage(ctk.CTkFrame):
                         )
                 except Exception:
                     pass
+
 
     def destroy(self) -> None:
         """Unregister preview listener and cancel timer on widget teardown."""
@@ -697,7 +750,9 @@ class LivePage(ctk.CTkFrame):
     def update_mic_level(self, level: float) -> None:
         """Thread-safe update to mic volume meter."""
         try:
-            if self.winfo_exists() and hasattr(self, "mic_meter") and self.mic_meter.winfo_exists():
+            if not self.winfo_exists() or not getattr(self, "_is_active", True):
+                return
+            if hasattr(self, "mic_meter") and self.mic_meter.winfo_exists():
                 self.mic_meter.set(level)
         except Exception:
             pass
@@ -782,14 +837,15 @@ class LivePage(ctk.CTkFrame):
         )
         self.convo_detail_box.grid(row=0, column=1, sticky="nsew")
 
-        self.refresh_conversations()
+        self._conversations_loaded = False
 
     def refresh_conversations(self) -> None:
         """Reload the conversation list from the database."""
+        self._conversations_loaded = True
         try:
             conversations = list_conversations(
                 source=ConversationSource.GEMINI,
-                limit=100,
+                limit=30,
             )
         except Exception as e:
             logger.warning("Failed to load conversations: %s", e)

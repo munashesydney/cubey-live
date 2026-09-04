@@ -801,8 +801,10 @@ def get_lidar_service() -> LidarService:
     global _SHARED_LIDAR_SERVICE
     if _SHARED_LIDAR_SERVICE is None:
         _SHARED_LIDAR_SERVICE = LidarService()
-        try:
-            _SHARED_LIDAR_SERVICE.connect()
-        except Exception as e:
-            logger.warning("Auto-connection for LidarService deferred: %s", e)
+        threading.Thread(
+            target=_SHARED_LIDAR_SERVICE.connect,
+            daemon=True,
+            name="LidarAutoConnectWorker",
+        ).start()
     return _SHARED_LIDAR_SERVICE
+

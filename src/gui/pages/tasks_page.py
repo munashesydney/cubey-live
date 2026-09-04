@@ -52,6 +52,8 @@ def _format_when(value) -> str:
         return str(value)
 
 
+
+
 class TasksPage(ctk.CTkFrame):
     """Dedicated Task Manager Page."""
 
@@ -59,21 +61,45 @@ class TasksPage(ctk.CTkFrame):
         super().__init__(master, fg_color="transparent", **kwargs)
 
         self._refreshing = False
+        self._is_active = True
+        self._is_destroyed = False
+        self._auto_refresh_after_id = None
 
         self._create_layout()
         self.refresh_tasks()
         # Keep the list live so scheduled runs / results show up on their own.
         self._schedule_auto_refresh()
 
+    def on_activate(self) -> None:
+        """Refresh tasks when activated."""
+        self._is_active = True
+        self.refresh_tasks()
+
+    def on_deactivate(self) -> None:
+        """Mark page as inactive."""
+        self._is_active = False
+
+    def destroy(self) -> None:
+        """Cancel background refresh timer on destruction."""
+        self._is_destroyed = True
+        self._is_active = False
+        if self._auto_refresh_after_id:
+            try:
+                self.after_cancel(self._auto_refresh_after_id)
+            except Exception:
+                pass
+            self._auto_refresh_after_id = None
+        super().destroy()
+
     def _schedule_auto_refresh(self) -> None:
-        if not self.winfo_exists():
+        if not self.winfo_exists() or self._is_destroyed:
             return
         try:
-            if self.winfo_ismapped():
+            if getattr(self, "_is_active", True):
                 self.refresh_tasks()
         except Exception:
             pass
-        self.after(5000, self._schedule_auto_refresh)
+        self._auto_refresh_after_id = self.after(5000, self._schedule_auto_refresh)
 
     def _create_layout(self) -> None:
         """Header (filter + refresh) and the scrollable task list."""

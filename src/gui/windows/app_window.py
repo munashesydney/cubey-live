@@ -201,9 +201,17 @@ class GeminiLiveApp(ctk.CTk):
         if hasattr(self, "robot_face") and not self.robot_face.winfo_ismapped():
             self.robot_face.pack(fill="both", expand=True)
 
+    def _on_dev_window_closed(self) -> None:
+        """Handler for developer console close."""
+        if hasattr(self, "robot_face"):
+            self.robot_face.set_dev_mode(False)
+        self.dev_window = None
+
     def toggle_developer_console(self) -> None:
         """Open or focus the Developer Control Window."""
         if self.dev_window is None or not self.dev_window.winfo_exists():
+            if hasattr(self, "robot_face"):
+                self.robot_face.set_dev_mode(True)
             self.dev_window = DeveloperWindow(
                 master=self,
                 config=self.config,
@@ -217,6 +225,7 @@ class GeminiLiveApp(ctk.CTk):
                 on_toggle_camera=self.on_toggle_camera,
                 on_set_camera_device=self.on_set_camera_device,
                 on_send_snapshot=self.on_send_snapshot,
+                on_close=self._on_dev_window_closed,
             )
         else:
             self.dev_window.lift()
