@@ -20,6 +20,9 @@ from src.gui.pages.animations import EyeAnimationEngine
 
 logger = logging.getLogger(__name__)
 
+FACE_BACKGROUND_COLOR = "#000000"
+FACE_BACKGROUND_RGB = (0, 0, 0)
+
 
 class RobotFacePage(ctk.CTkFrame):
     """Page displaying Cubeo's animated OLED robot face with 2x SSAA anti-aliased Pillow rendering."""
@@ -32,7 +35,7 @@ class RobotFacePage(ctk.CTkFrame):
         supersampling: Optional[int] = None,
         **kwargs,
     ):
-        super().__init__(master, fg_color="#0A0A0F", corner_radius=0, **kwargs)
+        super().__init__(master, fg_color=FACE_BACKGROUND_COLOR, corner_radius=0, **kwargs)
         self.on_open_developer_console = on_open_developer_console
         self.target_fps = max(15, min(int(target_fps), 60))
         if supersampling is not None:
@@ -74,7 +77,7 @@ class RobotFacePage(ctk.CTkFrame):
         # Create 100% full-bleed drawing canvas
         self.canvas = tk.Canvas(
             self,
-            bg="#0A0A0F",
+            bg=FACE_BACKGROUND_COLOR,
             bd=0,
             highlightthickness=0,
             relief="ridge",
@@ -188,7 +191,7 @@ class RobotFacePage(ctk.CTkFrame):
         now = time.time()
 
         # Create PIL native-resolution canvas with OLED pitch black background
-        pil_img = Image.new("RGB", (w, h), (10, 10, 15))
+        pil_img = Image.new("RGB", (w, h), FACE_BACKGROUND_RGB)
         draw_main = ImageDraw.Draw(pil_img)
 
         # Calculate responsive eye base scale
