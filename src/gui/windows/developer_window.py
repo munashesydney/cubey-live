@@ -14,6 +14,7 @@ import customtkinter as ctk
 
 from src.config import AppConfig
 from src.gui.pages import (
+    FaceRecognitionPage,
     HomePage,
     LidarPage,
     LivePage,
@@ -36,6 +37,7 @@ class DeveloperWindow(ctk.CTkToplevel):
         ("wheels", "🛞 Wheels"),
         ("lidar", "📡 LiDAR"),
         ("live", "✨ Gemini Live"),
+        ("faces", "👤 Face Recognition"),
         ("local", "🦙 Local Chat"),
         ("memories", "🧠 Memories"),
         ("tasks", "⏰ Tasks"),
@@ -52,6 +54,7 @@ class DeveloperWindow(ctk.CTkToplevel):
         embedding_service: EmbeddingService,
         is_session_active: bool = False,
         camera_service: Optional[Any] = None,
+        face_service: Optional[Any] = None,
         on_toggle_camera: Optional[Callable[[Optional[bool]], bool]] = None,
         on_set_camera_device: Optional[Callable[[int], None]] = None,
         on_send_snapshot: Optional[Callable[[Optional[str]], None]] = None,
@@ -67,6 +70,7 @@ class DeveloperWindow(ctk.CTkToplevel):
         self.embedding_service = embedding_service
         self.is_session_active = is_session_active
         self.camera_service = camera_service
+        self.face_service = face_service
         self.on_toggle_camera = on_toggle_camera
         self.on_set_camera_device = on_set_camera_device
         self.on_send_snapshot = on_send_snapshot
@@ -154,6 +158,10 @@ class DeveloperWindow(ctk.CTkToplevel):
             on_toggle_camera=self.on_toggle_camera,
             on_set_camera_device=self.on_set_camera_device,
             on_send_snapshot=self.on_send_snapshot,
+        )
+        self._page_factories["faces"] = lambda: FaceRecognitionPage(
+            self.page_container,
+            face_service=self.face_service,
         )
         self._page_factories["local"] = lambda: LocalChatPage(
             self.page_container,

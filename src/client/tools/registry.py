@@ -328,6 +328,24 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             },
         },
     },
+    "add_face": {
+        "name": "add_face",
+        "description": (
+            "Save the currently detected and collected unknown face under the exact "
+            "name provided by the user. Use this only after the face-detection event "
+            "has been received and the person has stated their name."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "The exact name the person just provided.",
+                },
+            },
+            "required": ["name"],
+        },
+    },
 }
 
 # ---------------------------------------------------------------------------
@@ -336,7 +354,16 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
 
 MODEL_TOOL_POLICY: dict[str, list[str]] = {
     # Gemini Live: full robot agent with physical movement, reactions, memory, history, tasks, camera.
-    "live_model": ["react", "move", "messages", "memories", "current_time", "tasks", "camera"],
+    "live_model": [
+        "react",
+        "move",
+        "messages",
+        "memories",
+        "current_time",
+        "tasks",
+        "camera",
+        "add_face",
+    ],
     # Interactive local Qwen (no physical movement or camera tool per design).
     "local_model": ["messages", "memories", "current_time", "tasks"],
     # Scheduled runs execute an existing task.
@@ -435,6 +462,7 @@ class ToolContext:
     camera_service: Optional[Any] = None
     on_toggle_camera: Optional[Callable[[Optional[bool]], bool]] = None
     live_client: Optional[Any] = None
+    face_recognition_service: Optional[Any] = None
 
 
 def validate_tool_call(name: str, args: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -610,6 +638,14 @@ def dispatch_tool_call(name: str, args: dict[str, Any], context: ToolContext) ->
                 on_toggle_camera=context.on_toggle_camera,
                 camera_service=context.camera_service,
                 live_client=context.live_client,
+            )
+
+        if name == "add_face":
+            from src.client.tools.people import execute_add_face_tool
+
+            return execute_add_face_tool(
+                name=args.get("name", ""),
+                face_recognition_service=context.face_recognition_service,
             )
     except Exception as e:
         logger.exception("Tool dispatch failed for '%s': %s", name, e)

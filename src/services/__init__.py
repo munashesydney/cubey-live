@@ -7,10 +7,12 @@ On-device AI and robot hardware services:
   - message_service: semantic search over stored messages
   - memory_service:  durable memories (add/update/search)
   - local_llm:       llama.cpp local chat model
+  - face_recognition: local InsightFace detection and enrollment
 """
 
 __all__ = [
     "EmbeddingService",
+    "FaceRecognitionService",
     "TelemetryData",
     "WakeWordService",
     "WheelsService",
@@ -31,6 +33,9 @@ def __getattr__(name: str):
     if name == "EmbeddingService":
         from src.services.embeddings import EmbeddingService
         return EmbeddingService
+    if name == "FaceRecognitionService":
+        from src.services.face_recognition import FaceRecognitionService
+        return FaceRecognitionService
     if name in ("add_memory", "search_memories", "update_memory"):
         from src.services import memory_service
         return getattr(memory_service, name)

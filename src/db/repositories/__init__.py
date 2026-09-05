@@ -55,6 +55,16 @@ from src.db.repositories.tasks import (
     list_tasks,
     update_task,
 )
+from src.db.repositories.people import (
+    clear_all_people,
+    create_person_with_embeddings,
+    decode_face_embedding,
+    delete_person,
+    encode_face_embedding,
+    list_people,
+    list_people_with_embeddings,
+    normalize_person_name,
+)
 
 __all__ = [
     "archive_memory",
@@ -74,9 +84,11 @@ __all__ = [
     "delete_map",
     "delete_memory_embeddings",
     "delete_message_embeddings",
+    "delete_person",
     "delete_task",
     "due_tasks",
     "encode_embedding",
+    "encode_face_embedding",
     "end_conversation",
     "get_active_map",
     "get_conversation",
@@ -92,6 +104,12 @@ __all__ = [
     "list_memories",
     "list_memory_embeddings",
     "list_messages",
+    "list_people",
+    "list_people_with_embeddings",
+    "normalize_person_name",
+    "create_person_with_embeddings",
+    "clear_all_people",
+    "decode_face_embedding",
     "list_tasks",
     "save_memory_embedding",
     "save_message_embedding",

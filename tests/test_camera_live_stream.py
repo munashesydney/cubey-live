@@ -52,6 +52,26 @@ class TestCameraLiveStream(unittest.IsolatedAsyncioTestCase):
         self.client.set_camera_streaming(True)
         self.assertTrue(self.client.is_camera_streaming)
 
+    def test_camera_override_pauses_face_analysis_without_stopping_shared_camera(self):
+        camera = MagicMock()
+        face_service = MagicMock()
+        face_service.is_running = True
+        client = GeminiLiveClient(
+            config=self.config,
+            recorder=self.recorder,
+            player=self.player,
+            camera_service=camera,
+            face_recognition_service=face_service,
+        )
+
+        self.assertTrue(client.set_camera_override(True))
+        camera.start.assert_called_once()
+        face_service.set_analysis_paused.assert_called_once_with(True)
+
+        self.assertFalse(client.set_camera_override(False))
+        camera.stop.assert_not_called()
+        face_service.set_analysis_paused.assert_called_with(False)
+
     async def test_send_visual_snapshot_dispatches_blob_and_prompt(self):
         """send_visual_snapshot should send realtime input blob and client content prompt."""
         mock_session = AsyncMock()

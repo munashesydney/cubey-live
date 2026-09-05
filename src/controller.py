@@ -27,6 +27,7 @@ from src.db import (
     create_conversation,
 )
 from src.services.embeddings import EmbeddingService
+from src.services.face_recognition import FaceRecognitionService
 from src.gui.windows.app_window import GeminiLiveApp
 from src.services.task_scheduler import TaskScheduler
 from src.services.transcript_persistence import TranscriptPersistenceService
@@ -63,6 +64,7 @@ class ApplicationController:
         self.recorder: Optional[AudioRecorder] = None
         self.player: Optional[AudioPlayer] = None
         self.camera_service: Optional[CameraService] = None
+        self.face_recognition_service: Optional[FaceRecognitionService] = None
         self.client: Optional[GeminiLiveClient] = None
         self.gui: Optional[GeminiLiveApp] = None
         self.wake_word_service: Optional[WakeWordService] = None
@@ -81,6 +83,7 @@ class ApplicationController:
         # Active DB-backed conversation for the current live session.
         self._active_conversation_id: Optional[int] = None
         self._conversation_titled: bool = False
+        self._pending_face_enrollment_event = False
 
     def start(self) -> None:
         """Start background asyncio loop thread, launch GUI immediately, and run startup diagnostics."""
@@ -104,12 +107,18 @@ class ApplicationController:
 
         # 2. Instantiate Camera video capture service
         self.camera_service = CameraService(self.config)
+        self.face_recognition_service = FaceRecognitionService(
+            self.config,
+            self.camera_service,
+            on_enrollment_ready=self._on_face_enrollment_ready,
+        )
 
         # 3. Create CustomTkinter GUI app with Startup loading screen
         self.gui = GeminiLiveApp(
             config=self.config,
             async_loop=self.async_loop,
             camera_service=self.camera_service,
+            face_service=self.face_recognition_service,
             on_start_session=self.start_live_session,
             on_stop_session=self.stop_live_session,
             on_send_interruption=self.send_interruption,
@@ -135,6 +144,9 @@ class ApplicationController:
                 self.web_server.should_exit = True
             if self.wake_word_service:
                 self.wake_word_service.stop()
+            if self.face_recognition_service:
+                self.face_recognition_service.set_live_active(False)
+                self.face_recognition_service.stop(force=True)
             if self.camera_service:
                 self.camera_service.stop()
             if self.recorder:
@@ -344,6 +356,7 @@ class ApplicationController:
                 on_session_ended=self._on_session_ended,
                 embedding_service=self.embedding_service,
                 wheels_service=get_wheels_service(),
+                face_recognition_service=self.face_recognition_service,
             )
             if self.gui:
                 self.gui.client = self.client
@@ -404,6 +417,10 @@ class ApplicationController:
 
                 self.transcript_persistence.set_realtime_active(True)
                 self._begin_conversation()
+                if self.face_recognition_service:
+                    self.face_recognition_service.set_live_active(True)
+                    self.face_recognition_service.set_analysis_paused(False)
+                    self.face_recognition_service.start()
                 logger.info("Scheduling Gemini Live session start...")
                 self._session_task = asyncio.run_coroutine_threadsafe(
                     self.client.start_session(initial_interrupt=initial_interrupt),
@@ -486,6 +503,18 @@ class ApplicationController:
         if not self.camera_service:
             return False
 
+        if (
+            self.client
+            and self.face_recognition_service
+            and self.face_recognition_service.is_live_active
+        ):
+            target_state = (
+                not self.client.is_camera_streaming
+                if enabled is None
+                else bool(enabled)
+            )
+            return self.client.set_camera_override(target_state)
+
         target_state = (not self.camera_service.is_running) if enabled is None else enabled
         if target_state:
             self.camera_service.start()
@@ -562,6 +591,31 @@ class ApplicationController:
         """Callback when Live client connection status changes."""
         if self.gui:
             self.gui.post_status(status)
+        if (
+            self._pending_face_enrollment_event
+            and self.client
+            and self.client.is_connected
+            and "Live" in status
+        ):
+            self._pending_face_enrollment_event = False
+            self.send_interruption(self._face_enrollment_prompt())
+
+    @staticmethod
+    def _face_enrollment_prompt() -> str:
+        return (
+            "[SYSTEM NOTIFICATION]: A new unknown person has been detected and face enrollment is ready. "
+            "Ask the person their name, then call the 'add_face' tool with the exact name they provide. "
+            "Do not guess the name and do not call 'add_face' until they provide it."
+        )
+
+    def _on_face_enrollment_ready(self) -> None:
+        """Forward one completed unknown-face enrollment to Gemini Live."""
+        if not self.face_recognition_service or not self.face_recognition_service.is_live_active:
+            return
+        if self.client and self.client.is_connected:
+            self.send_interruption(self._face_enrollment_prompt())
+        else:
+            self._pending_face_enrollment_event = True
 
     def _on_transcript_received(self, role: str, text: str) -> None:
         """Callback when transcript text is received from Gemini or User event.
@@ -610,6 +664,10 @@ class ApplicationController:
         if conversation_id is not None:
             self.transcript_persistence.enqueue_end(conversation_id)
         self.transcript_persistence.set_realtime_active(False)
+        self._pending_face_enrollment_event = False
+        if self.face_recognition_service:
+            self.face_recognition_service.set_live_active(False)
+            self.face_recognition_service.stop()
 
         # Clear active listening visual state on robot face
         if self.gui:

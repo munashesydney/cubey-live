@@ -128,6 +128,25 @@ print("Embedding model ready.")
 PY
 
 # ---------------------------------------------------------------------------
+# Pre-download InsightFace model pack
+# ---------------------------------------------------------------------------
+FACE_MODEL_NAME="${FACE_MODEL_NAME:-buffalo_s}"
+
+echo "==> Pre-downloading InsightFace model (${FACE_MODEL_NAME})..."
+"${VENV}/bin/python" - "${FACE_MODEL_NAME}" <<'PY'
+import sys
+
+from insightface.app import FaceAnalysis
+
+analyzer = FaceAnalysis(
+    name=sys.argv[1],
+    providers=["CPUExecutionProvider"],
+)
+analyzer.prepare(ctx_id=0, det_size=(640, 640))
+print("InsightFace model ready.")
+PY
+
+# ---------------------------------------------------------------------------
 # Pre-download Local LLM model (Qwen 2B GGUF)
 # ---------------------------------------------------------------------------
 echo "==> Pre-downloading Local LLM model..."

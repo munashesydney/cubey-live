@@ -36,7 +36,10 @@ def _on_camera_timer_expired(
     with _timer_lock:
         _active_camera_timer = None
 
-    logger.info("⏱️ [Camera Timer Expired]: Visual feed window elapsed. Turning off camera.")
+    logger.info(
+        "⏱️ [Camera Timer Expired]: Detailed visual feed window elapsed; "
+        "returning to background face recognition."
+    )
 
     try:
         if on_toggle_camera:
@@ -53,9 +56,9 @@ def _on_camera_timer_expired(
     try:
         if live_client and getattr(live_client, "is_connected", False):
             prompt = (
-                "[SYSTEM NOTIFICATION]: The camera observation feed has ended and the camera is now closed. "
-                "Please report and summarize what you observed out loud to the user now, "
-                "or call the 'camera' tool again if you still need visual input to answer their request."
+                "[SYSTEM NOTIFICATION]: The camera observation feed has ended and detailed camera streaming is now closed. "
+                "Background facial recognition remains active. Please report and summarize what you observed "
+                "out loud to the user now, or call the 'camera' tool again if you still need detailed visual input."
             )
             loop = getattr(live_client, "_loop", None)
             if loop and loop.is_running():
@@ -126,7 +129,7 @@ def execute_camera_tool(
             "camera_active": True,
             "duration_seconds": timeout,
             "message": (
-                f"Camera is now active and streaming visual feed. "
+                f"Camera is now active and streaming detailed visual feed. "
                 f"The feed will automatically turn off in {timeout} seconds. "
                 f"If you need visual input again after it shuts off, call the camera tool again to re-enable it."
             ),
@@ -147,7 +150,7 @@ def execute_camera_tool(
             "status": "camera_deactivated",
             "action": "turn_off",
             "camera_active": False,
-            "message": "Camera feed has been turned off.",
+            "message": "Detailed camera feed has been turned off; background facial recognition remains active during Live.",
         }
 
     else:  # status
