@@ -1,6 +1,6 @@
 # Cubey: IMU heading, autonomous room mapping, and return to start
 
-Status: implementation plan only. Application, ROS, and firmware code have not been changed or tested on the robot as part of this review.
+Status: implemented on `feat/imu-mapping-return-home`. See `ros2/IMU_NAVIGATION.md` for bring-up and validation. Stationary robot verification is in progress; physical mapping/return acceptance remains an operator test.
 
 ## Intended behavior
 

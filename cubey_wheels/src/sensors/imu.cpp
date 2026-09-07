@@ -18,7 +18,28 @@ unsigned long lastImuUpdate = 0;
 
 // Use -1 for constructor reset_pin so Adafruit library doesn't execute its rushed 10ms reset.
 // Hardware reset is handled explicitly with proper SH-2 bootloader delay (200ms).
-static Adafruit_BNO08x bno08x(-1);
+// Adafruit's I2C HAL does not populate its t_us output. SH2 then builds
+// timestamps around zero (observed on Cubey as 4294965xxx, often regressing).
+// Supply the host acquisition time before SH2 applies the report's own delay.
+// Keep this adapter in the sketch rather than modifying the installed library.
+class TimestampedBNO08x : public Adafruit_BNO08x {
+ public:
+  TimestampedBNO08x() : Adafruit_BNO08x(-1) {}
+ protected:
+  bool _init(int32_t sensor_id) override {
+    originalRead = _HAL.read;
+    _HAL.read = timedRead;
+    return Adafruit_BNO08x::_init(sensor_id);
+  }
+ private:
+  static int (*originalRead)(sh2_Hal_t *, uint8_t *, unsigned, uint32_t *);
+  static int timedRead(sh2_Hal_t *hal, uint8_t *buffer, unsigned length, uint32_t *timestamp) {
+    *timestamp = micros();
+    return originalRead(hal, buffer, length, timestamp);
+  }
+};
+int (*TimestampedBNO08x::originalRead)(sh2_Hal_t *, uint8_t *, unsigned, uint32_t *) = nullptr;
+static TimestampedBNO08x bno08x;
 static sh2_SensorValue_t sensorValue;
 static bool imuConnected = false;
 static bool reportEnabled = false;
@@ -169,7 +190,7 @@ void updateIMU() {
       newSample = true;
     }
   }
-  if ((newSample && millis() - lastImuPush >= 20) || millis() - lastImuPush >= 250) {
+  if (newSample || millis() - lastImuPush >= 250) {
     lastImuPush = millis();
     sendIMUSnapshot();
   }

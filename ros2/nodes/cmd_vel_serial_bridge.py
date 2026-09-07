@@ -290,7 +290,8 @@ class CmdVelSerialBridgeNode(Node):
         try:
             status = json.loads(msg.data)
             self.motion_state = status["state"]
-            self.motion_ready = status.get("ready") is True
+            age = self.get_clock().now().nanoseconds/1e9-float(status.get("timestamp", 0))
+            self.motion_ready = status.get("ready") is True and 0 <= age < 0.3
             self.motion_status_time = time.monotonic()
         except (ValueError, KeyError, TypeError):
             self.motion_ready = False

@@ -163,18 +163,28 @@ class CubeyNavService:
         mapping_svc = get_mapping_service()
         last_state = "IDLE"
         last_healthy_heartbeat = time.time()
+        monitored_mission = self._pending_mission_id
 
-        while self._is_exploring:
+        while self._is_exploring and self._pending_mission_id == monitored_mission:
             try:
                 data = self._read_ros2_status()
-                if data:
+                if data and (monitored_mission is None or data.get("mission_id") == monitored_mission):
                     try:
                         heartbeat_age = time.time() - float(data.get("timestamp", 0.0))
                     except (TypeError, ValueError):
                         heartbeat_age = ROS2_HEARTBEAT_MAX_AGE_S + 1.0
 
-                    if heartbeat_age <= ROS2_HEARTBEAT_MAX_AGE_S:
+                    if 0 <= heartbeat_age <= ROS2_HEARTBEAT_MAX_AGE_S:
                         last_healthy_heartbeat = time.time()
+                    else:
+                        if time.time()-last_healthy_heartbeat > ROS2_HEARTBEAT_MAX_AGE_S:
+                            self.stop_navigation()
+                            mapping_svc.pause_mapping()
+                            self.telemetry.state = "ERROR"
+                            self.telemetry.failure_reason = "Navigation heartbeat expired"
+                            break
+                        time.sleep(0.1)
+                        continue
 
                     st = data.get("state", "EXPLORING")
                     if st != last_state:
@@ -255,17 +265,20 @@ class CubeyNavService:
             return False
 
         mapping_svc = get_mapping_service()
-        mapping_svc.start_mapping(external_pose=True)
 
         with self._lock:
+            if request_generation != self._request_generation:
+                return False
+            mapping_svc.start_mapping(external_pose=True)
             self._is_exploring = True
             self._is_navigating_goal = False
             self.telemetry.state = "PREPARING"
             self.telemetry.failure_reason = ""
             self.telemetry.mode = "autonomous"
+            sent_at = time.time()
+            sent = self._send_ros2_command("start", mission_id=mission_id)
 
-        sent_at = time.time()
-        accepted = self._send_ros2_command("start", mission_id=mission_id) and self._wait_for_ros2_state(
+        accepted = sent and self._wait_for_ros2_state(
             {"PREPARING", "RESETTING", "EXPLORING"}, sent_at, mission_id=mission_id)
         if request_generation != self._request_generation:
             return False  # A concurrent Stop superseded this start.
@@ -305,8 +318,9 @@ class CubeyNavService:
 
         sent_at = time.time()
         if not self._send_ros2_command("reset") or not self._wait_for_ros2_state(
-            {"IDLE"}, sent_at
+            {"IDLE"}, sent_at, timeout_s=27.0
         ):
+            self._send_ros2_command("stop")
             self._emit_log("SLAM Toolbox did not acknowledge the map reset.")
             return False
 

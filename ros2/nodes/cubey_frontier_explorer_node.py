@@ -447,8 +447,9 @@ class CubeyFrontierExplorerNode(Node):
             self.odom_health = {}
 
     def _sensors_ready(self):
+        age = self.get_clock().now().nanoseconds/1e9-float(self.odom_health.get("timestamp", 0))
         return (self.odom_health.get("ready") is True
-                and time.monotonic()-self.odom_health_time < 0.35)
+                and 0 <= age < 0.35 and time.monotonic()-self.odom_health_time < 0.35)
 
     def _pose_fresh(self):
         now = self.get_clock().now().nanoseconds/1e9
@@ -457,7 +458,7 @@ class CubeyFrontierExplorerNode(Node):
     def _hold_motion(self):
         self.pub_stop.publish(Twist())
         msg = String()
-        msg.data = json.dumps({"ready": False, "state": self.state})
+        msg.data = json.dumps({"ready": False, "state": self.state, "timestamp": self.get_clock().now().nanoseconds/1e9})
         self.pub_motion.publish(msg)
 
     def _fail_mission(self, reason):
@@ -516,7 +517,7 @@ class CubeyFrontierExplorerNode(Node):
                 self._handle_goal_failure(self.GOAL_RETURN)
         else:
             motion = String()
-            motion.data = json.dumps({"ready": ready, "state": self.state})
+            motion.data = json.dumps({"ready": ready, "state": self.state, "timestamp": self.get_clock().now().nanoseconds/1e9})
             self.pub_motion.publish(motion)
         self._export_live_pose()
 
@@ -1225,13 +1226,17 @@ class CubeyFrontierExplorerNode(Node):
         )
 
     def _on_backup_goal_response(self, future, generation: int) -> None:
-        if generation != self.recovery_generation or self.state != "RECOVERING_STUCK":
-            return
         try:
             goal_handle = future.result()
         except Exception as error:
+            if generation != self.recovery_generation:
+                return
             self.get_logger().warn(f"Nav2 backup request failed: {error}")
             self._finish_stuck_recovery(False, generation)
+            return
+        if generation != self.recovery_generation or self.state != "RECOVERING_STUCK":
+            if goal_handle.accepted:
+                goal_handle.cancel_goal_async()
             return
         if not goal_handle.accepted:
             self.get_logger().warn("Nav2 rejected the backup recovery.")
