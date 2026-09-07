@@ -2,6 +2,7 @@
 #include <WebServer.h>
 #include <Wire.h>
 #include <Adafruit_VL53L0X.h>
+#include <Adafruit_BNO08x.h>
 
 #include "src/config/config.h"
 #include "src/comm/status_led.h"
@@ -9,6 +10,7 @@
 #include "src/motion/motors.h"
 #include "src/sensors/battery.h"
 #include "src/sensors/cliff_sensors.h"
+#include "src/sensors/imu.h"
 #include "src/web/webpage.h"
 #include "src/web/web_server.h"
 
@@ -37,6 +39,9 @@ void setup() {
   // Start front and back cliff sensors
   setupCliffSensors();
 
+  // Start BNO08x IMU
+  setupIMU();
+
   WiFi.mode(WIFI_AP);
 
   if (!WiFi.softAP(WIFI_NAME, WIFI_PASSWORD)) {
@@ -61,7 +66,9 @@ void setup() {
   serialPrint(String(RPI_RX_PIN));
   serialPrint(" | TX=GPIO ");
   serialPrintln(String(RPI_TX_PIN));
-  serialPrintln("Also listening on: Serial (USB) + Serial0");
+  serialPrint("IMU (BNO08x): ");
+  serialPrintln(imuReady ? "CONNECTED (Wire1: SDA=40, SCL=41)" : "NOT FOUND / OFF");
+  serialPrintln("Also listening on: Serial (USB)");
   serialPrint("Wi-Fi: ");
   serialPrintln(WIFI_NAME);
   serialPrint("Password: ");
@@ -75,6 +82,7 @@ void loop() {
   server.handleClient();
   processSerialCommands();
   updateCliffSafety();
+  updateIMU();
 
   // Autonomous high-speed telemetry push (4 times a second)
   if (millis() - lastTelemetryPush >= TELEMETRY_PUSH_INTERVAL_MS) {

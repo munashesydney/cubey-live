@@ -35,6 +35,14 @@ constexpr const char* WIFI_PASSWORD = "cubey123";
 #define FRONT_XSHUT 48
 #define BACK_XSHUT  47
 
+// ---------------- BNO08x IMU Sensor ----------------
+#define IMU_SDA 40
+#define IMU_SCL 41
+#define IMU_INT 38
+#define IMU_RST 39
+#define IMU_I2C_ADDR 0x4A
+constexpr unsigned long IMU_REPORT_INTERVAL_US = 20000; // 20ms (50Hz)
+
 // ---------------- Onboard Status RGB LED ----------------
 #ifndef RGB_BUILTIN
 #define RGB_BUILTIN 48
@@ -138,6 +146,17 @@ extern unsigned long lastTelemetryTime;
 extern String serialRxBuffer;
 extern String serial0RxBuffer;
 extern String serial1RxBuffer;
+
+// IMU state
+extern bool imuReady;
+extern float imuYaw;
+extern float imuPitch;
+extern float imuRoll;
+extern float imuQuatReal;
+extern float imuQuatI;
+extern float imuQuatJ;
+extern float imuQuatK;
+extern unsigned long lastImuUpdate;
 
 // Web server
 extern WebServer server;

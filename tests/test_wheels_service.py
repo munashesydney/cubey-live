@@ -92,6 +92,21 @@ class WheelsServiceProtocolTests(unittest.TestCase):
         self.assertEqual(t.battery_voltage, 7.85)
         self.assertEqual(t.battery_pct, 72)
 
+    def test_imu_telemetry_parsing(self):
+        telemetry_events = []
+        self.service.on_telemetry = lambda telem: telemetry_events.append(telem)
+
+        raw_line = "TELEMETRY:front_dist=50,back_dist=50,front_cliff=0,back_cliff=0,motion=STOPPED,speed=180,batt_v=8.10,batt_pct=85,charging=0,estop=0,imu_ok=1,yaw=42.50,pitch=-3.20,roll=1.15"
+        self.service._parse_incoming_line(raw_line)
+
+        self.assertEqual(len(telemetry_events), 1)
+        t = telemetry_events[0]
+        self.assertTrue(t.imu_ok)
+        self.assertAlmostEqual(t.yaw, 42.50)
+        self.assertAlmostEqual(t.pitch, -3.20)
+        self.assertAlmostEqual(t.roll, 1.15)
+        self.assertEqual(t.to_dict()["yaw"], 42.50)
+
     def test_ping_and_status(self):
         sent_lines = []
         self.service._emit_log = lambda text: sent_lines.append(text)

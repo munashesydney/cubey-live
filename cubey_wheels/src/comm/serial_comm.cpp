@@ -16,25 +16,16 @@ String serial1RxBuffer = "";
 void serialPrint(const String &s) {
   Serial.print(s);
   Serial1.print(s);
-  #if defined(ESP32)
-  Serial0.print(s);
-  #endif
 }
 
 void serialPrintln(const String &s) {
   Serial.println(s);
   Serial1.println(s);
-  #if defined(ESP32)
-  Serial0.println(s);
-  #endif
 }
 
 void serialPrintln() {
   Serial.println();
   Serial1.println();
-  #if defined(ESP32)
-  Serial0.println();
-  #endif
 }
 
 void reportChargingDiagnostic(
@@ -163,15 +154,16 @@ void sendTelemetry(bool broadcast) {
                ",batt_pct=" + String(bPct) +
                ",charging=" + (isCharging ? "1" : "0");
   msg += ",estop=" + String(emergencyStopLatched ? "1" : "0");
+  msg += ",imu_ok=" + String(imuReady ? "1" : "0") +
+         ",yaw=" + String(imuYaw, 1) +
+         ",pitch=" + String(imuPitch, 1) +
+         ",roll=" + String(imuRoll, 1);
   // The Pi consumes the continuous stream on the dedicated hardware UART.
   // Keep USB Serial and UART0 readable; they receive telemetry only when a
   // STATUS command explicitly requests a snapshot.
   Serial1.println(msg);
   if (broadcast) {
     Serial.println(msg);
-    #if defined(ESP32)
-    Serial0.println(msg);
-    #endif
   }
 }
 
@@ -246,6 +238,17 @@ void handleIncomingLine(String line) {
   }
   else if (line.equalsIgnoreCase("STATUS")) {
     sendTelemetry(true);
+  }
+  else if (line.equalsIgnoreCase("IMU")) {
+    String resp = "IMU:ok=" + String(imuReady ? "1" : "0") +
+                  ",yaw=" + String(imuYaw, 2) +
+                  ",pitch=" + String(imuPitch, 2) +
+                  ",roll=" + String(imuRoll, 2) +
+                  ",qw=" + String(imuQuatReal, 4) +
+                  ",qx=" + String(imuQuatI, 4) +
+                  ",qy=" + String(imuQuatJ, 4) +
+                  ",qz=" + String(imuQuatK, 4);
+    serialPrintln(resp);
   }
   else {
     // Fallback: direct command name like "forward", "stop", etc.

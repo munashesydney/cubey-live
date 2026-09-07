@@ -41,6 +41,10 @@ class TelemetryData:
     battery_pct: int = 0
     is_charging: bool = False
     timestamp: float = field(default_factory=time.time)
+    imu_ok: bool = False
+    yaw: float = 0.0
+    pitch: float = 0.0
+    roll: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -54,6 +58,10 @@ class TelemetryData:
             "battery_pct": self.battery_pct,
             "is_charging": self.is_charging,
             "timestamp": self.timestamp,
+            "imu_ok": self.imu_ok,
+            "yaw": self.yaw,
+            "pitch": self.pitch,
+            "roll": self.roll,
         }
 
 
@@ -507,6 +515,10 @@ class WheelsService:
                 battery_pct=batt_pct,
                 is_charging=self._is_charging,
                 timestamp=now,
+                imu_ok=kv.get("imu_ok", "0") in ("1", "true", "True"),
+                yaw=float(kv.get("yaw", self.telemetry.yaw)),
+                pitch=float(kv.get("pitch", self.telemetry.pitch)),
+                roll=float(kv.get("roll", self.telemetry.roll)),
             )
 
             if self.on_telemetry:
