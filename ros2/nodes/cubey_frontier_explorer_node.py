@@ -8,8 +8,8 @@ prioritizes exploration goals by utility (size vs. distance),
 dispatches action goals to Nav2 (NavigateToPose),
 and executes an autonomous 4-stage Auto-Stop protocol:
   1. Detects 0 reachable frontiers (space fully explored).
-  2. Freezes SLAM measurements (/slam_toolbox/pause_new_measurements).
-  3. Navigates robot back to a planner-verified approach near the starting dock.
+  2. Saves a checkpoint while keeping SLAM localization running.
+  3. Navigates back to the captured starting position AND heading.
   4. Optimizes pose graph and saves map (/slam_toolbox/save_map).
 """
 
@@ -39,12 +39,13 @@ try:
     from rclpy.time import Time
     from nav_msgs.msg import OccupancyGrid, Odometry
     from sensor_msgs.msg import LaserScan
-    from geometry_msgs.msg import PoseStamped
+    from geometry_msgs.msg import PoseStamped, Twist
     from std_msgs.msg import String
     from std_srvs.srv import Trigger
     from nav2_msgs.action import BackUp, ComputePathToPose, NavigateToPose
     from action_msgs.msg import GoalStatus
-    from slam_toolbox.srv import Pause, Reset, SaveMap
+    from slam_toolbox.srv import Reset, SaveMap, SerializePoseGraph
+    from robot_localization.srv import SetPose
     from tf2_ros import Buffer, TransformException, TransformListener
 except ImportError as e:
     print(f"Error: ROS 2 dependencies missing: {e}. Run inside Pixi environment.", file=sys.stderr)
@@ -92,6 +93,25 @@ class CubeyFrontierExplorerNode(Node):
         # States: IDLE, EXPLORING, RETURNING_TO_DOCK, FINALIZING_MAP,
         # COMPLETED, COMPLETED_AWAY_FROM_DOCK
         self.state = "IDLE"
+        self.mission_generation = 0
+        self.mission_id = None
+        self.failure_reason = ""
+        self.odom_health = {}
+        self.odom_health_time = 0.0
+        self.pose_stamp = 0.0
+        self.odom_stamp = 0.0
+        self.odom_speed = float("inf")
+        self.odom_turn_rate = float("inf")
+        self.last_motion_time = time.time()
+        self.preparation_stage = ""
+        self.preparation_deadline = 0.0
+        self.reset_completed_stamp = 0.0
+        self.awaiting_home_settle = False
+        self.home_settle_since = None
+        self.return_attempts = 0
+        self.home_captured = False
+        self.last_map_time = 0.0
+        self.operation_deadline = 0.0
         self.finalization_at_dock: bool = False
         self.exploration_start_time: float = 0.0
         self.robot_pose: Optional[Tuple[float, float, float]] = None  # map-frame x, y, theta_rad
@@ -167,6 +187,9 @@ class CubeyFrontierExplorerNode(Node):
             "/cubey/exploration_status",
             10
         )
+        self.pub_stop = self.create_publisher(Twist, "/cmd_vel", 10)
+        self.pub_motion = self.create_publisher(String, "/cubey/motion_status", 10)
+        self.sub_health = self.create_subscription(String, "/cubey/odometry_status", self._on_odometry_health, 10)
 
         # Service Servers to trigger start/stop
         self.srv_start = self.create_service(
@@ -191,7 +214,8 @@ class CubeyFrontierExplorerNode(Node):
         self.backup_client = ActionClient(self, BackUp, "backup")
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
-        self.pause_slam_client = self.create_client(Pause, "/slam_toolbox/pause_new_measurements")
+        self.reset_filter_client = self.create_client(SetPose, "/set_pose")
+        self.serialize_client = self.create_client(SerializePoseGraph, "/slam_toolbox/serialize_map")
         self.reset_slam_client = self.create_client(Reset, "/slam_toolbox/reset")
         self.save_map_client = self.create_client(SaveMap, "/slam_toolbox/save_map")
         self.reset_odom_client = self.create_client(Trigger, "/cubey/reset_odometry")
@@ -201,6 +225,7 @@ class CubeyFrontierExplorerNode(Node):
 
         # Fast status publish timer (2 Hz)
         self.status_timer = self.create_timer(0.5, self._publish_status)
+        self.safety_timer = self.create_timer(0.1, self._safety_tick)
 
         # UDP only transports commands; ROS work is executed on the node thread.
         self._command_queue: queue.Queue[Dict[str, object]] = queue.Queue()
@@ -222,7 +247,7 @@ class CubeyFrontierExplorerNode(Node):
 
         if self.autostart:
             self.get_logger().info("Autostart enabled. Waiting for /map and Nav2 action server...")
-            self.state = "EXPLORING"
+            self._start_exploration()
 
     def _udp_trigger_loop(self):
         """Listens for {"command": "start"} or {"command": "stop"} on 127.0.0.1:9877."""
@@ -256,12 +281,16 @@ class CubeyFrontierExplorerNode(Node):
 
             command = str(message.get("command", "")).lower()
             if command == "start":
+                self.mission_id = message.get("mission_id")
                 self._start_exploration()
             elif command == "stop":
                 self._stop_exploration()
             elif command == "reset":
                 self._reset_mapping(start_after_reset=False)
             elif command == "navigate":
+                if not self._sensors_ready() or not self._pose_fresh():
+                    self._fail_mission("Cannot navigate without fresh IMU, LiDAR and localization")
+                    continue
                 try:
                     x_m = float(message["x_m"])
                     y_m = float(message["y_m"])
@@ -283,8 +312,11 @@ class CubeyFrontierExplorerNode(Node):
         self._reset_mapping(start_after_reset=True)
 
     def _stop_exploration(self):
+        self.mission_generation += 1
         self._cancel_active_nav_goal()
         self.state = "IDLE"
+        self._hold_motion()
+        self.awaiting_home_settle = False
         self.current_goal_coord = None
         self.current_frontier_coord = None
         self.get_logger().info("Native Nav2 navigation stopped.")
@@ -292,7 +324,17 @@ class CubeyFrontierExplorerNode(Node):
     def _reset_mapping(self, start_after_reset: bool):
         """Reset real SLAM Toolbox state and local odometry, then optionally explore."""
         self._cancel_active_nav_goal()
-        self.state = "RESETTING"
+        self.mission_generation += 1
+        self.state = "PREPARING"
+        self.preparation_stage = "STOPPING"
+        self.start_after_reset = start_after_reset
+        self.preparation_deadline = time.time()+25.0
+        self.last_motion_time = time.time()
+        self.failure_reason = ""
+        self.home_captured = False
+        self.awaiting_home_settle = False
+        self.return_attempts = 0
+        self._hold_motion()
         self.current_goal_coord = None
         self.latest_map = None
         self.robot_pose = None
@@ -330,26 +372,49 @@ class CubeyFrontierExplorerNode(Node):
         except OSError as e:
             self.get_logger().warn(f"Could not clear live scan IPC file: {e}")
 
-        def request_slam_reset(_=None):
-            if not self.reset_slam_client.wait_for_service(timeout_sec=2.0):
-                self.state = "ERROR"
-                self.get_logger().error("SLAM Toolbox reset service is unavailable.")
-                return
+    def _begin_reset(self):
+        clients = (self.reset_odom_client, self.reset_filter_client, self.reset_slam_client)
+        if not all(client.service_is_ready() for client in clients):
+            return  # Preparation deadline bounds service startup.
+        self.state = "RESETTING"
+        self.preparation_stage = "RESETTING"
+        generation = self.mission_generation
+        future = self.reset_odom_client.call_async(Trigger.Request())
+        future.add_done_callback(lambda f: self._on_measurements_reset(f, generation))
+
+    def _on_measurements_reset(self, future, generation):
+        if generation != self.mission_generation or self.state != "RESETTING":
+            return
+        try:
+            if not future.result().success:
+                raise RuntimeError("Measurement reset rejected")
+            request = SetPose.Request()
+            request.pose.header.frame_id = "odom"
+            request.pose.header.stamp = self.get_clock().now().to_msg()
+            request.pose.pose.pose.orientation.w = 1.0
+            for index in (0, 7, 14, 21, 28, 35):
+                request.pose.pose.covariance[index] = 0.0001
+            reset = self.reset_filter_client.call_async(request)
+            reset.add_done_callback(lambda f: self._on_filter_reset(f, generation))
+        except Exception as error:
+            self._fail_mission(f"Odometry reset failed: {error}")
+
+    def _on_filter_reset(self, future, generation):
+        if generation != self.mission_generation or self.state != "RESETTING":
+            return
+        try:
+            future.result()  # SetPose has an empty success response.
+            self.tf_buffer.clear()
             request = Reset.Request()
             request.pause_new_measurements = False
-            future = self.reset_slam_client.call_async(request)
-            future.add_done_callback(
-                lambda completed: self._on_mapping_reset(completed, start_after_reset)
-            )
+            reset = self.reset_slam_client.call_async(request)
+            reset.add_done_callback(lambda f: self._on_mapping_reset(f, self.start_after_reset, generation))
+        except Exception as error:
+            self._fail_mission(f"Filter reset failed: {error}")
 
-        if self.reset_odom_client.wait_for_service(timeout_sec=2.0):
-            odom_future = self.reset_odom_client.call_async(Trigger.Request())
-            odom_future.add_done_callback(request_slam_reset)
-        else:
-            self.get_logger().warn("Odometry reset service unavailable; resetting SLAM only.")
-            request_slam_reset()
-
-    def _on_mapping_reset(self, future, start_after_reset: bool):
+    def _on_mapping_reset(self, future, start_after_reset: bool, generation=None):
+        if generation is not None and generation != self.mission_generation:
+            return
         try:
             response = future.result()
             if response.result != Reset.Response.RESULT_SUCCESS:
@@ -361,20 +426,120 @@ class CubeyFrontierExplorerNode(Node):
             self.get_logger().error(f"SLAM reset failed: {e}")
             return
 
-        self.start_pose = (0.0, 0.0, 0.0)
-        if start_after_reset:
-            self.state = "EXPLORING"
-            self.exploration_start_time = time.time()
-            self.get_logger().info("Fresh SLAM map ready; native Nav2 exploration started.")
-        else:
-            self.state = "IDLE"
-            self.get_logger().info("SLAM map and odometry reset to a blank origin.")
+        self.start_after_reset = start_after_reset
+        self.state = "PREPARING"
+        self.preparation_stage = "LOCALIZING"
+        self.reset_completed_stamp = self.get_clock().now().nanoseconds/1e9
+        self.latest_map = None
+        self.robot_pose = None
+        self.tf_buffer.clear()
+        self.last_motion_time = time.time()
 
     # ------------------------------------------------------------------
     # Telemetry & Callbacks
     # ------------------------------------------------------------------
 
+    def _on_odometry_health(self, msg):
+        try:
+            self.odom_health = json.loads(msg.data)
+            self.odom_health_time = time.monotonic()
+        except (TypeError, ValueError):
+            self.odom_health = {}
+
+    def _sensors_ready(self):
+        return (self.odom_health.get("ready") is True
+                and time.monotonic()-self.odom_health_time < 0.35)
+
+    def _pose_fresh(self):
+        now = self.get_clock().now().nanoseconds/1e9
+        return self.robot_pose is not None and 0 <= now-self.pose_stamp < 0.4 and 0 <= now-self.odom_stamp < 0.4
+
+    def _hold_motion(self):
+        self.pub_stop.publish(Twist())
+        msg = String()
+        msg.data = json.dumps({"ready": False, "state": self.state})
+        self.pub_motion.publish(msg)
+
+    def _fail_mission(self, reason):
+        self.mission_generation += 1
+        self._cancel_active_nav_goal()
+        self.state = "ERROR"
+        self.failure_reason = reason
+        self.awaiting_home_settle = False
+        self._hold_motion()
+        self.get_logger().error(reason)
+
+    def _safety_tick(self):
+        self._update_robot_pose_from_tf()
+        ready = self._sensors_ready() and self._pose_fresh()
+        now = time.time()
+        if self.state in ("PREPARING", "RESETTING"):
+            self._hold_motion()
+            if now > self.preparation_deadline:
+                self._fail_mission("Mapping preparation timed out: " + self.odom_health.get("reason", "waiting for localization"))
+            elif self.preparation_stage == "STOPPING":
+                # Stop commands have been enforced by the bridge before resetting
+                # frames. A sensor fault is recoverable through this explicit reset.
+                if now-self.last_motion_time >= 0.75 and self.odom_health.get("imu_available"):
+                    self._begin_reset()
+            elif self.preparation_stage == "LOCALIZING" and ready:
+                if self.odom_speed > 0.02 or self.odom_turn_rate > 0.05:
+                    self.last_motion_time = now
+                if (self.latest_map is not None and self.pose_stamp > self.reset_completed_stamp
+                        and now-self.last_motion_time >= 1.0
+                        and self.nav_client.server_is_ready() and self.planner_client.server_is_ready()):
+                    self.start_pose = self.robot_pose
+                    self.home_captured = True
+                    self.state = "EXPLORING" if self.start_after_reset else "IDLE"
+                    self.exploration_start_time = now
+                    self.get_logger().info(f"Starting pose captured: {self.start_pose}")
+            self._export_live_pose()
+            return
+        active = self.state in ("EXPLORING", "NAVIGATING", "RETURNING_TO_DOCK", "RECOVERING_STUCK")
+        if active and (not ready or now-self.last_map_time > 5.0):
+            self._fail_mission(self.odom_health.get("reason") or "Localization or map became stale")
+        if (self.state == "FINALIZING_MAP" or
+                (self.state == "RETURNING_TO_DOCK" and not self.pre_return_map_saved)) and now > self.operation_deadline:
+            self._fail_mission("Map save operation timed out; robot stopped")
+        if self.awaiting_home_settle:
+            self._hold_motion()
+            if self._dock_is_physically_reached() and self.odom_speed <= 0.02 and self.odom_turn_rate <= 0.05:
+                if self.home_settle_since is None:
+                    self.home_settle_since = now
+                elif now-self.home_settle_since >= 0.75:
+                    self.awaiting_home_settle = False
+                    self._initiate_map_finalization(at_dock=True)
+            else:
+                self.home_settle_since = None
+            if self.awaiting_home_settle and now-self.home_wait_started > 5.0:
+                self.awaiting_home_settle = False
+                self._handle_goal_failure(self.GOAL_RETURN)
+        else:
+            motion = String()
+            motion.data = json.dumps({"ready": ready, "state": self.state})
+            self.pub_motion.publish(motion)
+        self._export_live_pose()
+
+    def _export_live_pose(self):
+        pose = None
+        if self.robot_pose is not None:
+            pose = {"x_m": self.robot_pose[0], "y_m": self.robot_pose[1], "theta_deg": math.degrees(self.robot_pose[2])}
+        data = {"pose": pose, "pose_fresh": self._pose_fresh(), "home": list(self.start_pose) if self.home_captured else None,
+                "trajectory": self.trajectory, "imu_ok": self.odom_health.get("imu_ok", False),
+                "nav_state": self.state, "failure_reason": self.failure_reason,
+                "mission_id": self.mission_id, "timestamp": time.time()}
+        try:
+            path = "/tmp/cubey_nav2_live_pose.json"
+            with open(path+".tmp", "w") as stream:
+                json.dump(data, stream)
+            os.replace(path+".tmp", path)
+        except OSError:
+            pass
+
     def _on_odom(self, msg: Odometry):
+        self.odom_stamp = msg.header.stamp.sec+msg.header.stamp.nanosec/1e9
+        self.odom_speed = math.hypot(msg.twist.twist.linear.x, msg.twist.twist.linear.y)
+        self.odom_turn_rate = abs(msg.twist.twist.angular.z)
         pos = msg.pose.pose.position
         ori = msg.pose.pose.orientation
         # Compute yaw from quaternion (Z, W)
@@ -441,6 +606,11 @@ class CubeyFrontierExplorerNode(Node):
             return
 
         translation = transform.transform.translation
+        stamp = transform.header.stamp.sec+transform.header.stamp.nanosec/1e9
+        now = self.get_clock().now().nanoseconds/1e9
+        if not 0 <= now-stamp < 0.4:
+            return
+        self.pose_stamp = stamp
         rotation = transform.transform.rotation
         siny_cosp = 2.0 * (rotation.w * rotation.z + rotation.x * rotation.y)
         cosy_cosp = 1.0 - 2.0 * (rotation.y * rotation.y + rotation.z * rotation.z)
@@ -460,6 +630,7 @@ class CubeyFrontierExplorerNode(Node):
         if self.state == "RESETTING":
             return
         self.latest_map = msg
+        self.last_map_time = time.time()
         self._update_robot_pose_from_tf()
 
         # Export live map & pose directly for Cubey Web Panel Canvas
@@ -902,17 +1073,17 @@ class CubeyFrontierExplorerNode(Node):
             elif purpose == self.GOAL_MANUAL:
                 self.state = "REACHED"
             elif purpose == self.GOAL_RETURN:
-                if self._goal_is_physically_reached(
-                    self.current_goal_coord, tolerance_m=0.20
-                ) and self._dock_is_physically_reached():
-                    self._initiate_map_finalization(at_dock=True)
+                self._update_robot_pose_from_tf()
+                if self._dock_is_physically_reached():
+                    self.awaiting_home_settle = True
+                    self.home_settle_since = None
+                    self.home_wait_started = time.time()
+                    self._hold_motion()
                 else:
-                    dock_distance = self._distance_to_goal(self.start_pose[:2])
-                    self.get_logger().warn(
-                        f"Nav2 reported dock success but Cubey remains {dock_distance:.2f}m from origin; "
-                        "saving at the current safe position."
-                    )
-                    self._initiate_map_finalization()
+                    # An approach point is a waypoint, never the final home pose.
+                    self._clear_current_goal(generation)
+                    self._queue_reachable_dock_selection()
+                    return
         else:
             self.get_logger().warn(f"Nav2 {purpose} goal terminated with status: {status}.")
             self._handle_goal_failure(purpose)
@@ -924,10 +1095,11 @@ class CubeyFrontierExplorerNode(Node):
             if self.current_frontier_coord or self.current_goal_coord:
                 self._blacklist_coord(self.current_frontier_coord or self.current_goal_coord)
         elif purpose == self.GOAL_RETURN:
-            self.get_logger().warn(
-                "Return-to-dock failed; saving the map at the current safe position."
-            )
-            self._initiate_map_finalization()
+            if self.return_attempts < 3:
+                self._queue_reachable_dock_selection()
+            else:
+                self.failure_reason = "Home could not be reached after three planned attempts"
+                self._initiate_map_finalization()
         elif purpose == self.GOAL_MANUAL:
             self.state = "BLOCKED"
 
@@ -955,8 +1127,10 @@ class CubeyFrontierExplorerNode(Node):
         return self._distance_to_goal(goal) <= tolerance_m
 
     def _dock_is_physically_reached(self) -> bool:
-        """A planner-selected approach within 35 cm counts as safely returned."""
-        return self._distance_to_goal(self.start_pose[:2]) <= 0.35
+        """Require a fresh map pose at the original position AND heading."""
+        return (self.home_captured and self._pose_fresh()
+                and self._distance_to_goal(self.start_pose[:2]) <= 0.10
+                and self._angular_distance(self.robot_pose[2], self.start_pose[2]) <= math.radians(5))
 
     def _cancel_active_nav_goal(self):
         # Invalidate callbacks before requesting cancellation. A delayed result
@@ -1222,7 +1396,7 @@ class CubeyFrontierExplorerNode(Node):
     # ------------------------------------------------------------------
 
     def _trigger_auto_stop_sequence(self):
-        """Save and freeze the completed map, then use a verified dock approach."""
+        """Save a checkpoint and return with live SLAM correction."""
         self.get_logger().info("=========================================================")
         self.get_logger().info("🎉 ALL ACCESSIBLE FRONTIERS FULLY EXPLORED!")
         self.get_logger().info("🤖 Phase 1: Initiating Return-to-Dock Sequence.")
@@ -1230,12 +1404,13 @@ class CubeyFrontierExplorerNode(Node):
 
         self._cancel_active_nav_goal()
         self.state = "RETURNING_TO_DOCK"
+        self.operation_deadline = time.time()+20.0
         self.dock_escape_attempted = False
 
         os.makedirs(self.map_save_dir, exist_ok=True)
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.pre_return_map_base = os.path.join(
-            self.map_save_dir, f"cubey_floorplan_{timestamp_str}"
+            self.map_save_dir, f"cubey_floorplan_{timestamp_str}_checkpoint"
         )
         self.pre_return_save_attempts = 0
         self._request_pre_return_map_save()
@@ -1254,14 +1429,15 @@ class CubeyFrontierExplorerNode(Node):
         request.name.data = self.pre_return_map_base
         self.pre_return_save_attempts += 1
         save_future = self.save_map_client.call_async(request)
-        save_future.add_done_callback(self._on_pre_return_map_saved)
+        generation = self.mission_generation
+        save_future.add_done_callback(lambda f: self._on_pre_return_map_saved(f, generation))
         self.get_logger().info(
             f"Saving completed map before return-to-dock "
             f"(attempt {self.pre_return_save_attempts}/2)."
         )
 
-    def _on_pre_return_map_saved(self, future) -> None:
-        if self.state != "RETURNING_TO_DOCK":
+    def _on_pre_return_map_saved(self, future, generation=None) -> None:
+        if self.state != "RETURNING_TO_DOCK" or (generation is not None and generation != self.mission_generation):
             return
         save_error: Optional[str] = None
         try:
@@ -1290,47 +1466,14 @@ class CubeyFrontierExplorerNode(Node):
         self.get_logger().info(
             f"💾 Completed map safely saved before return: {self.pre_return_map_base}"
         )
-        self._lock_slam_for_return()
-
-    def _lock_slam_for_return(self) -> None:
-        if self.state != "RETURNING_TO_DOCK":
-            return
-
-        # Do not let return-path recovery spins or backups deform a map that is
-        # already complete. Nav2 can continue navigating on the last published
-        # occupancy grid while SLAM scan matching is paused.
-        if self.pause_slam_client.wait_for_service(timeout_sec=2.0):
-            pause_future = self.pause_slam_client.call_async(Pause.Request())
-            pause_future.add_done_callback(self._on_slam_locked_for_return)
-            self.get_logger().info("Locking completed SLAM map before return-to-dock.")
-        else:
-            self.get_logger().warn(
-                "SLAM pause service unavailable; stopping safely instead of risking the completed map."
-            )
-            self._initiate_map_finalization()
-
-    def _on_slam_locked_for_return(self, future) -> None:
-        if self.state != "RETURNING_TO_DOCK":
-            return
-        try:
-            response = future.result()
-            if not response.status:
-                raise RuntimeError("SLAM Toolbox did not confirm the pause")
-        except Exception as error:
-            self.get_logger().warn(
-                f"Could not lock SLAM before return ({error}); preserving the map and stopping."
-            )
-            self._initiate_map_finalization()
-            return
-
-        self.slam_locked_for_return = True
-        self.get_logger().info("Completed SLAM map locked; selecting a reachable dock approach.")
         self._queue_reachable_dock_selection()
 
     def _dock_candidates(self) -> List[Tuple[float, float, float]]:
         """Return exact dock first, followed by nearby approach poses."""
         dock_x, dock_y, dock_yaw = self.start_pose
         candidates = [(dock_x, dock_y, dock_yaw)]
+        if getattr(self, "return_attempts", 0) > 1:
+            return candidates  # After an approach waypoint, finish at actual home.
         robot_x, robot_y = self.robot_pose[:2] if self.robot_pose else (dock_x, dock_y)
         approach_angle = math.atan2(robot_y - dock_y, robot_x - dock_x)
         angle_offsets = (0.0, math.pi / 4.0, -math.pi / 4.0, math.pi / 2.0,
@@ -1350,6 +1493,11 @@ class CubeyFrontierExplorerNode(Node):
     def _queue_reachable_dock_selection(self) -> None:
         if self.state != "RETURNING_TO_DOCK":
             return
+        if self.return_attempts >= 3:
+            self.failure_reason = "Unable to finish the final home approach"
+            self._initiate_map_finalization()
+            return
+        self.return_attempts += 1
         if not self.planner_client.wait_for_server(timeout_sec=1.0):
             self.get_logger().warn(
                 "Nav2 planner unavailable for dock preflight; preserving the map and stopping."
@@ -1484,7 +1632,10 @@ class CubeyFrontierExplorerNode(Node):
         if self.state in ("FINALIZING_MAP", "COMPLETED", "COMPLETED_AWAY_FROM_DOCK"):
             return
         self.finalization_at_dock = at_dock
+        self._cancel_active_nav_goal()
         self.state = "FINALIZING_MAP"
+        self.operation_deadline = time.time()+20.0
+        self._hold_motion()
         self.get_logger().info("=========================================================")
         if at_dock:
             self.get_logger().info("🏁 Robot arrived safely at dock. Finalizing SLAM map...")
@@ -1498,7 +1649,8 @@ class CubeyFrontierExplorerNode(Node):
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         final_map_base = os.path.join(self.map_save_dir, f"cubey_floorplan_{timestamp_str}")
 
-        if self.pre_return_map_saved:
+        self.final_map_base = final_map_base
+        if self.pre_return_map_saved and not at_dock:
             self.get_logger().info(
                 f"Using completed map saved before return: {self.pre_return_map_base}"
             )
@@ -1518,15 +1670,25 @@ class CubeyFrontierExplorerNode(Node):
         request = SaveMap.Request()
         request.name.data = final_map_base
         save_future = self.save_map_client.call_async(request)
-        save_future.add_done_callback(lambda future: self._on_map_saved(future, final_map_base))
+        generation = self.mission_generation
+        save_future.add_done_callback(lambda future: self._on_map_saved(future, final_map_base, generation))
 
-    def _on_map_saved(self, future, final_map_base: str):
+    def _on_map_saved(self, future, final_map_base: str, generation=None):
+        if generation is not None and (generation != self.mission_generation or self.state != "FINALIZING_MAP"):
+            return
         try:
             response = future.result()
             if response.result == SaveMap.Response.RESULT_SUCCESS:
                 self.map_save_succeeded = True
                 self.get_logger().info(f"💾 Map saved via SLAM Toolbox to: {final_map_base}")
-                self._complete_mapping()
+                if not self.serialize_client.service_is_ready():
+                    self._fail_mission("Occupancy map saved, but SLAM graph serialization is unavailable")
+                    return
+                request = SerializePoseGraph.Request()
+                request.filename = final_map_base
+                operation = self.serialize_client.call_async(request)
+                current = self.mission_generation
+                operation.add_done_callback(lambda f: self._on_graph_saved(f, current))
             else:
                 self.get_logger().error(f"SLAM Toolbox map save failed with result code {response.result}.")
                 self.state = "ERROR"
@@ -1534,8 +1696,23 @@ class CubeyFrontierExplorerNode(Node):
             self.get_logger().error(f"SLAM Toolbox map save failed: {e}")
             self.state = "ERROR"
 
+    def _on_graph_saved(self, future, generation):
+        if generation != self.mission_generation or self.state != "FINALIZING_MAP":
+            return
+        try:
+            if future.result().result != SerializePoseGraph.Response.RESULT_SUCCESS:
+                raise RuntimeError("Graph serialization failed")
+            metadata = {"home": list(self.start_pose), "returned_home": self.finalization_at_dock,
+                        "mission_id": self.mission_id, "timestamp": time.time()}
+            with open(self.final_map_base+".session.json", "w") as stream:
+                json.dump(metadata, stream, indent=2)
+            self._complete_mapping()
+        except Exception as error:
+            self._fail_mission(f"Final map graph/session save failed: {error}")
+
     def _complete_mapping(self):
         self.state = "COMPLETED" if self.finalization_at_dock else "COMPLETED_AWAY_FROM_DOCK"
+        self._hold_motion()
         self.get_logger().info("=========================================================")
         if self.finalization_at_dock:
             self.get_logger().info("✅ ROOM MAPPING, RETURN-TO-DOCK & AUTO-STOP FULLY COMPLETE!")
@@ -1559,14 +1736,13 @@ class CubeyFrontierExplorerNode(Node):
                 self.current_goal_coord[1] - self.robot_pose[1]
             )
 
-        status_json = (
-            f'{{"state": "{self.state}", '
-            f'"goal_x": {round(self.current_goal_coord[0], 2) if self.current_goal_coord else "null"}, '
-            f'"goal_y": {round(self.current_goal_coord[1], 2) if self.current_goal_coord else "null"}, '
-            f'"distance_remaining_m": {round(dist_m, 2)}, '
-            f'"frontiers_completed": {self.total_frontiers_mapped}, '
-            f'"timestamp": {time.time()}}}'
-        )
+        status_json = json.dumps({"state": self.state,
+            "goal_x": self.current_goal_coord[0] if self.current_goal_coord else None,
+            "goal_y": self.current_goal_coord[1] if self.current_goal_coord else None,
+            "distance_remaining_m": dist_m, "frontiers_completed": self.total_frontiers_mapped,
+            "mission_id": self.mission_id, "failure_reason": self.failure_reason,
+            "imu_ok": self.odom_health.get("imu_ok", False),
+            "ready": self._sensors_ready() and self._pose_fresh(), "timestamp": time.time()})
 
         msg = String()
         msg.data = status_json

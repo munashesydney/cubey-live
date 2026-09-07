@@ -19,6 +19,14 @@ int backCliffCount = 0;
 unsigned long lastSensorCheck = 0;
 bool safetyMovementRunning = false;
 
+struct FloorSample {
+  uint16_t distance = 0;
+  bool valid = false;
+  unsigned long timestamp = 0;
+};
+static FloorSample frontSample;
+static FloorSample backSample;
+
 // ============================================================
 // CLIFF SENSOR SETUP
 // ============================================================
@@ -40,6 +48,7 @@ void setupCliffSensors() {
   delay(100);
 
   frontSensorReady = frontSensor.begin(0x30, false, &Wire);
+  if (frontSensorReady) frontSensorReady = frontSensor.startRangeContinuous(SENSOR_INTERVAL_MS);
 
   if (!frontSensorReady) {
     serialPrintln("WARNING: Front cliff sensor failed");
@@ -52,6 +61,7 @@ void setupCliffSensors() {
   delay(100);
 
   backSensorReady = backSensor.begin(0x31, false, &Wire);
+  if (backSensorReady) backSensorReady = backSensor.startRangeContinuous(SENSOR_INTERVAL_MS);
 
   if (!backSensorReady) {
     serialPrintln("WARNING: Back cliff sensor failed");
@@ -72,14 +82,17 @@ bool readFloorSensor(
   Adafruit_VL53L0X &sensor,
   uint16_t &distance
 ) {
-  VL53L0X_RangingMeasurementData_t measurement;
-
-  sensor.rangingTest(&measurement, false);
-
-  distance = measurement.RangeMilliMeter;
-
-  // RangeStatus 4 means no usable target / out of range.
-  return measurement.RangeStatus != 4;
+  // Single-shot rangingTest blocks for each exposure and starves 50 Hz IMU
+  // acquisition. Continuous ranging lets safety and telemetry share a fresh
+  // cached measurement without waiting for another exposure.
+  FloorSample &sample = (&sensor == &frontSensor) ? frontSample : backSample;
+  if (sensor.isRangeComplete()) {
+    sample.distance = sensor.readRangeResult();
+    sample.valid = sensor.readRangeStatus() == 0 && sample.distance != 0xffff;
+    sample.timestamp = millis();
+  }
+  distance = sample.distance;
+  return sample.valid && millis() - sample.timestamp <= 150;
 }
 
 // ============================================================

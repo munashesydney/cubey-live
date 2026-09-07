@@ -17,7 +17,9 @@ from typing import List, Optional, Tuple
 try:
     import rclpy
     from rclpy.node import Node
-    from sensor_msgs.msg import LaserScan
+    from sensor_msgs.msg import LaserScan, Imu
+    from rclpy.time import Time
+    from rclpy.qos import qos_profile_sensor_data
 except ImportError:
     print("Warning: rclpy / sensor_msgs not found in host Python. Run within Pixi environment.", file=sys.stderr)
     Node = object
@@ -26,6 +28,11 @@ try:
     import serial
 except ImportError:
     serial = None
+
+try:
+    from .imu_support import HeadingHistory, yaw
+except ImportError:
+    from imu_support import HeadingHistory, yaw
 
 
 # Slamtec RPLIDAR Protocol Constants
@@ -58,12 +65,19 @@ class RPLidarC1Node(Node):
         self.angle_compensate = bool(self.get_parameter("angle_compensate").value)
 
         self.pub_scan = self.create_publisher(LaserScan, "/scan", 10)
+        self.headings = HeadingHistory()
+        self.sub_imu = self.create_subscription(Imu, "/imu/data", self._on_imu, qos_profile_sensor_data)
 
         self.serial_conn: Optional[serial.Serial] = None
         self._running = False
         self._worker_thread: Optional[threading.Thread] = None
 
         self._start_lidar()
+
+    def _on_imu(self, msg):
+        q = msg.orientation
+        self.headings.add(msg.header.stamp.sec+msg.header.stamp.nanosec/1e9,
+                          yaw((q.x, q.y, q.z, q.w)))
 
     def _start_lidar(self):
         """Open serial connection and send START_SCAN command."""
@@ -159,7 +173,7 @@ class RPLidarC1Node(Node):
                         rad += 2.0 * math.pi
                     while rad > math.pi:
                         rad -= 2.0 * math.pi
-                    accumulated_points.append((rad, dist_m, quality))
+                    accumulated_points.append((rad, dist_m, quality, self.get_clock().now().nanoseconds/1e9))
 
             except Exception as e:
                 if self._running:
@@ -174,13 +188,25 @@ class RPLidarC1Node(Node):
 
         num_readings = 360
         angle_min = -math.pi
-        angle_max = math.pi
-        angle_increment = (angle_max - angle_min) / num_readings
+        angle_increment = 2*math.pi / num_readings
+        angle_max = angle_min+(num_readings-1)*angle_increment
+        # Rebinning reverses acquisition order. Deskew rotations into the last
+        # beam's frame and publish a common-time snapshot, not fictitious beam times.
+        stamp = points[-1][3]
+        reference_yaw = self.headings.at(stamp)
 
         ranges = [float("inf")] * num_readings
         intensities = [0.0] * num_readings
 
-        for angle_rad, dist_m, quality in points:
+        for angle_rad, dist_m, quality, beam_stamp in points:
+            beam_yaw = self.headings.at(beam_stamp)
+            if reference_yaw is not None and beam_yaw is not None:
+                delta = beam_yaw-reference_yaw
+                bx = dist_m*math.cos(angle_rad)-0.035
+                by = dist_m*math.sin(angle_rad)
+                lx = bx*math.cos(delta)-by*math.sin(delta)+0.035
+                ly = bx*math.sin(delta)+by*math.cos(delta)
+                angle_rad, dist_m = math.atan2(ly, lx), math.hypot(lx, ly)
             if self.min_range <= dist_m <= self.max_range:
                 idx = int((angle_rad - angle_min) / angle_increment)
                 if 0 <= idx < num_readings:
@@ -189,12 +215,12 @@ class RPLidarC1Node(Node):
                         intensities[idx] = float(quality)
 
         msg = LaserScan()
-        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.stamp = Time(nanoseconds=int(stamp*1e9)).to_msg()
         msg.header.frame_id = self.frame_id
         msg.angle_min = angle_min
         msg.angle_max = angle_max
         msg.angle_increment = angle_increment
-        msg.time_increment = (scan_time / num_readings) if scan_time > 0 else 0.0
+        msg.time_increment = 0.0
         msg.scan_time = scan_time if scan_time > 0 else 0.1
         msg.range_min = self.min_range
         msg.range_max = self.max_range

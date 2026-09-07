@@ -18,6 +18,7 @@ from src.services.lidar_service import get_lidar_service
 from src.services.mapping_service import get_mapping_service
 from src.services.wheels_service import get_wheels_service
 from src.services.navigation.cubey_nav_service import get_nav_service
+from src.services.navigation.live_pose import read_live_pose
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +131,8 @@ async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(
                 }
 
                 # If ROS 2 SLAM Toolbox has a live map, use one consistent set of
+                if getattr(mapping_svc, "external_pose", False):
+                    payload.update(pose=None, trajectory=[], laser_scan=[], grid_compressed_b64=None)
                 # ROS dimensions on every frame. Alternating legacy/ROS metadata
                 # makes the canvas reject its existing grid and visibly blink.
                 nav2_map_file = "/tmp/cubey_nav2_live_map.json"
@@ -168,6 +171,15 @@ async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(
                     except Exception:
                         pass
 
+                live_pose = read_live_pose()
+                payload["pose_fresh"] = live_pose.get("pose_fresh", False)
+                payload["imu_ok"] = live_pose.get("imu_ok", False)
+                payload["home"] = live_pose.get("home")
+                if live_pose.get("timestamp"):
+                    payload["pose"] = live_pose.get("pose")
+                    payload["trajectory"] = live_pose.get("trajectory", [])
+                    payload["nav_state"] = live_pose.get("nav_state", payload["nav_state"])
+                    payload["failure_reason"] = live_pose.get("failure_reason", "")
                 await websocket.send_json(payload)
                 await asyncio.sleep(0.10)  # 10 Hz stream
             except Exception:
@@ -199,11 +211,12 @@ async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(
                 nav_svc.stop_navigation()
 
             elif mtype == "start_mapping":
-                mode = (msg.get("mode") or "manual").lower()
+                mode = (msg.get("mode") or "autonomous").lower()
                 if mode == "autonomous":
-                    nav_svc.start_exploration()
+                    started = await asyncio.to_thread(nav_svc.start_exploration)
                 else:
-                    nav_svc.start_manual_mapping()
+                    started = await asyncio.to_thread(nav_svc.start_manual_mapping)
+                await websocket.send_json({"type": "mapping_ack", "accepted": started})
 
             elif mtype in ("pause_mapping", "stop_mapping"):
                 nav_svc.stop_navigation()
@@ -215,7 +228,7 @@ async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(
                 nav_svc.navigate_to(x_m=x, y_m=y)
 
             elif mtype == "reset_map":
-                nav_svc.reset_mapping()
+                await asyncio.to_thread(nav_svc.reset_mapping)
 
     except WebSocketDisconnect:
         pass

@@ -3,6 +3,7 @@
 #include "../motion/motors.h"
 #include "../sensors/battery.h"
 #include "../sensors/cliff_sensors.h"
+#include "../sensors/imu.h"
 
 // State definitions
 unsigned long lastTelemetryTime = 0;
@@ -249,6 +250,7 @@ void handleIncomingLine(String line) {
                   ",qy=" + String(imuQuatJ, 4) +
                   ",qz=" + String(imuQuatK, 4);
     serialPrintln(resp);
+    sendIMUSnapshot(true);
   }
   else {
     // Fallback: direct command name like "forward", "stop", etc.
@@ -264,7 +266,7 @@ void processSerialCommands() {
     if (c == '\r') continue;
     if (c == '\n') {
       if (serial1RxBuffer.length() > 0) {
-        serialPrintln("[ESP-RPI-CMD] " + serial1RxBuffer);
+        if (!serial1RxBuffer.startsWith("TWIST:")) serialPrintln("[ESP-RPI-CMD] " + serial1RxBuffer);
         handleIncomingLine(serial1RxBuffer);
       }
       serial1RxBuffer = "";

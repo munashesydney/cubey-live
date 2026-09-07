@@ -16,6 +16,9 @@
   let activeMapName = "Live Floorplan";
 
   let robotPose = { x_m: 0.0, y_m: 0.0, theta_deg: 0.0 };
+  let homePose = null;
+  let poseFresh = false;
+  let mappingRequestPending = false;
   let trajectory = [];
   let laserScan = [];
 
@@ -153,6 +156,8 @@
   }
 
   function handleMapUpdate(data) {
+    homePose = data.home ?? null;
+    poseFresh = data.pose_fresh === true;
     robotPose = data.pose ?? robotPose;
     trajectory = data.trajectory ?? trajectory;
     laserScan = data.laser_scan ?? laserScan;
@@ -187,7 +192,9 @@
     const navMode = data.nav_mode || "manual";
 
     lblActiveMapName.textContent = activeMapName;
-    if (isMapping || navState === "EXPLORING" || navState === "NAVIGATING") {
+    const activeStates = ["PREPARING", "RESETTING", "EXPLORING", "NAVIGATING", "RETURNING_TO_DOCK", "RECOVERING_STUCK", "FINALIZING_MAP"];
+    isMapping = activeStates.includes(navState) || (isMapping && navState === "MANUAL");
+    if (isMapping) {
       pillStatus.classList.add("active");
       if (navState === "EXPLORING" || navMode === "autonomous") {
         lblMappingState.textContent = "🤖 Auto Mapping";
@@ -204,6 +211,15 @@
       btnMappingText.textContent = "Start Mapping";
       btnToggleMapping.className = "btn btn-primary";
     }
+    const phaseLabels = {
+      PREPARING: "Checking sensors and recording home…", RESETTING: "Preparing a fresh map…",
+      EXPLORING: "Mapping room", RETURNING_TO_DOCK: "Returning home",
+      RECOVERING_STUCK: "Finding a clear route", FINALIZING_MAP: "Saving map",
+      COMPLETED: "Home · Map saved", COMPLETED_AWAY_FROM_DOCK: "Map saved · Could not reach home",
+      ERROR: data.failure_reason || "Mapping stopped: check sensors"
+    };
+    if (phaseLabels[navState]) lblMappingState.textContent = phaseLabels[navState];
+    lblMappingState.title = `IMU: ${data.imu_ok ? "live" : "unavailable"}`;
 
     if (data.battery_pct !== undefined) {
       lblBatteryPct.textContent = `${data.battery_pct}%`;
@@ -213,6 +229,7 @@
     }
 
     lblPoseText.textContent = `X: ${robotPose.x_m.toFixed(2)}m Y: ${robotPose.y_m.toFixed(2)}m ${robotPose.theta_deg.toFixed(0)}°`;
+    if (!poseFresh) lblPoseText.textContent = "Waiting for live localization";
 
     render();
   }
@@ -351,7 +368,8 @@
     // Rotate by heading: theta_deg (0° points along Cartesian +X / East, counter-clockwise)
     ctx.rotate((-robotPose.theta_deg * Math.PI) / 180.0);
 
-    // Robot body circle
+    // Robot body circle (dim when the localization sample has expired).
+    ctx.globalAlpha = poseFresh ? 1 : 0.3;
     ctx.fillStyle = "#89B4FA";
     ctx.beginPath();
     ctx.arc(0, 0, rRadius, 0, Math.PI * 2);
@@ -371,6 +389,16 @@
 
     ctx.restore();
 
+    if (homePose) {
+      const h = { x: homePose[0] * viewScale, y: -homePose[1] * viewScale };
+      ctx.strokeStyle = "#A6E3A1";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(h.x, h.y, 9, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.fillStyle = "#A6E3A1";
+      ctx.fillText("Home", h.x + 13, h.y - 8);
+    }
     ctx.restore();
   }
 
@@ -617,15 +645,7 @@
     if (isMapping) {
       fetch("/api/mapping/pause", { method: "POST" });
     } else {
-      if (modalModeSelect) {
-        modalModeSelect.classList.remove("hidden");
-      } else {
-        fetch("/api/mapping/start", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ mode: "autonomous" }),
-        });
-      }
+      startAutonomousMapping();
     }
   });
 
@@ -635,9 +655,10 @@
     });
   }
 
-  if (btnStartAuto) {
-    btnStartAuto.addEventListener("click", async () => {
-      modalModeSelect.classList.add("hidden");
+  async function startAutonomousMapping() {
+      if (mappingRequestPending) return;
+      mappingRequestPending = true;
+      if (modalModeSelect) modalModeSelect.classList.add("hidden");
       try {
         const response = await fetch("/api/mapping/start", {
           method: "POST",
@@ -651,9 +672,11 @@
       } catch (e) {
         console.error("Failed to start autonomous mapping:", e);
         alert(`Autonomous mapping did not start: ${e.message}`);
+      } finally {
+        mappingRequestPending = false;
       }
-    });
   }
+  if (btnStartAuto) btnStartAuto.addEventListener("click", startAutonomousMapping);
 
   if (btnStartManual) {
     btnStartManual.addEventListener("click", async () => {

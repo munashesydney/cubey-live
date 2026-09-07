@@ -3,6 +3,7 @@
 #include "../comm/serial_comm.h"
 #include <Wire.h>
 #include <Adafruit_BNO08x.h>
+#include <esp_system.h>
 
 // State definitions
 bool imuReady = false;
@@ -19,11 +20,34 @@ unsigned long lastImuUpdate = 0;
 // Hardware reset is handled explicitly with proper SH-2 bootloader delay (200ms).
 static Adafruit_BNO08x bno08x(-1);
 static sh2_SensorValue_t sensorValue;
+static bool imuConnected = false;
+static bool reportEnabled = false;
+static uint32_t imuBoot = 0;
+static uint32_t imuEpoch = 0;
+static uint32_t imuSequence = 0;
+static uint64_t imuSampleUs = 0;
+static uint8_t imuAccuracy = 0;
+static unsigned long lastImuPush = 0;
+static unsigned long lastReportRetry = 0;
+
+void sendIMUSnapshot(bool usb) {
+  char packet[220];
+  const bool fresh = imuReady && millis() - lastImuUpdate <= 200;
+  snprintf(packet, sizeof(packet),
+    "IMU:ok=%u,boot=%lu,epoch=%lu,seq=%lu,t_us=%llu,age_ms=%lu,cal=%u,qw=%.6f,qx=%.6f,qy=%.6f,qz=%.6f",
+    fresh ? 1 : 0, (unsigned long)imuBoot, (unsigned long)imuEpoch,
+    (unsigned long)imuSequence, (unsigned long long)imuSampleUs,
+    millis() - lastImuUpdate, imuAccuracy,
+    imuQuatReal, imuQuatI, imuQuatJ, imuQuatK);
+  Serial1.println(packet);
+  if (usb) Serial.println(packet);
+}
 
 // ============================================================
 // IMU SETUP (Dedicated Wire1 hardware bus: SDA=40, SCL=41)
 // ============================================================
 void setupIMU() {
+  imuBoot = esp_random();
   serialPrintln("Starting BNO08x IMU on Wire1 (SDA=40, SCL=41)...");
 
   // 1. Hardware Reset: BNO08x Hillcrest firmware requires >= 150-200ms to boot from reset
@@ -66,26 +90,40 @@ void setupIMU() {
   serialPrintln("BNO08x IMU connected!");
 
   // 4. Enable Game Rotation Vector (quaternions fused from gyro & accel, immune to magnetic distortion)
-  if (!bno08x.enableReport(SH2_GAME_ROTATION_VECTOR, IMU_REPORT_INTERVAL_US)) {
+  imuConnected = true;
+  reportEnabled = bno08x.enableReport(SH2_GAME_ROTATION_VECTOR, IMU_REPORT_INTERVAL_US);
+  if (!reportEnabled) {
     serialPrintln("WARNING: Could not enable BNO08x game rotation vector");
   }
 
-  imuReady = true;
+  imuReady = false; // A detected device is not yet a fresh orientation sample.
 }
 
 // ============================================================
 // IMU UPDATE LOOP (NON-BLOCKING EVENT POLL)
 // ============================================================
 void updateIMU() {
-  if (!imuReady) return;
+  if (!imuConnected) return;
+  if (millis() - lastImuUpdate > 200) imuReady = false;
 
   // Detect hardware/watchdog reset and restore report subscription
   if (bno08x.wasReset()) {
+    imuReady = false;
+    ++imuEpoch;
+    imuSampleUs = 0;
     serialPrintln("BNO08x reset detected! Restoring reports...");
-    bno08x.enableReport(SH2_GAME_ROTATION_VECTOR, IMU_REPORT_INTERVAL_US);
+    reportEnabled = bno08x.enableReport(SH2_GAME_ROTATION_VECTOR, IMU_REPORT_INTERVAL_US);
+    sendIMUSnapshot();
   }
 
-  while (bno08x.getSensorEvent(&sensorValue)) {
+  if (!reportEnabled && millis() - lastReportRetry > 1000) {
+    lastReportRetry = millis();
+    reportEnabled = bno08x.enableReport(SH2_GAME_ROTATION_VECTOR, IMU_REPORT_INTERVAL_US);
+  }
+
+  bool newSample = false;
+  // Bound work so a sensor backlog cannot starve motor/cliff supervision.
+  for (int events = 0; events < 4 && bno08x.getSensorEvent(&sensorValue); ++events) {
     if (sensorValue.sensorId == SH2_GAME_ROTATION_VECTOR) {
       imuQuatReal = sensorValue.un.gameRotationVector.real;
       imuQuatI    = sensorValue.un.gameRotationVector.i;
@@ -97,6 +135,13 @@ void updateIMU() {
       float x = imuQuatI;
       float y = imuQuatJ;
       float z = imuQuatK;
+      float norm = sqrtf(w*w + x*x + y*y + z*z);
+      if (!isfinite(norm) || norm < 0.8f || norm > 1.2f) {
+        imuReady = false;
+        continue;
+      }
+      w /= norm; x /= norm; y /= norm; z /= norm;
+      imuQuatReal = w; imuQuatI = x; imuQuatJ = y; imuQuatK = z;
 
       // Roll (x-axis rotation: [-180..180])
       float sinr_cosp = 2.0f * (w * x + y * z);
@@ -117,6 +162,15 @@ void updateIMU() {
       imuYaw = atan2f(siny_cosp, cosy_cosp) * (180.0f / PI);
 
       lastImuUpdate = millis();
+      imuSampleUs = sensorValue.timestamp;
+      imuAccuracy = sensorValue.status & 3;
+      ++imuSequence;
+      imuReady = true;
+      newSample = true;
     }
+  }
+  if ((newSample && millis() - lastImuPush >= 20) || millis() - lastImuPush >= 250) {
+    lastImuPush = millis();
+    sendIMUSnapshot();
   }
 }

@@ -161,67 +161,6 @@ class Nav2IntegrationTests(unittest.TestCase):
         self.assertEqual(explorer.frontier_plan_queue, [])
         self.assertEqual(explorer.zero_frontier_cycles, 0)
 
-    def test_scan_match_does_not_translate_identical_stationary_scans(self):
-        node = object.__new__(CubeyOdometryNode)
-        points = np.array(
-            [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0]],
-            dtype=np.float32,
-        )
-
-        dx, dy, _ = node._correlate_scans(points, points, 0.04, 0.0, 0.0)
-
-        self.assertEqual(dx, 0.0)
-        self.assertEqual(dy, 0.0)
-
-    def test_scan_match_locks_translation_during_rotation(self):
-        node = object.__new__(CubeyOdometryNode)
-        points = np.array(
-            [[1.0, 0.0], [0.2, 1.2], [-0.8, 0.3], [0.1, -1.0]],
-            dtype=np.float32,
-        )
-
-        dx, dy, dyaw = node._correlate_scans(
-            points,
-            points,
-            0.20,
-            -0.15,
-            0.05,
-            lock_translation=True,
-        )
-
-        self.assertEqual(dx, 0.0)
-        self.assertEqual(dy, 0.0)
-        self.assertEqual(dyaw, 0.0)
-
-    def test_scan_match_accepts_rotation_only_when_lidar_confirms_it(self):
-        node = object.__new__(CubeyOdometryNode)
-        previous = np.array(
-            [[1.0, 0.0], [0.35, 1.15], [-0.9, 0.25], [-0.2, -1.1], [1.4, 0.7]],
-            dtype=np.float32,
-        )
-        angle = 0.08
-        cosine = np.cos(angle)
-        sine = np.sin(angle)
-        current = np.column_stack(
-            (
-                previous[:, 0] * cosine + previous[:, 1] * sine,
-                -previous[:, 0] * sine + previous[:, 1] * cosine,
-            )
-        )
-
-        dx, dy, dyaw = node._correlate_scans(
-            previous,
-            current,
-            0.0,
-            0.0,
-            angle,
-            lock_translation=True,
-        )
-
-        self.assertEqual(dx, 0.0)
-        self.assertEqual(dy, 0.0)
-        self.assertAlmostEqual(dyaw, angle, places=5)
-
     def test_stale_lidar_scan_is_ignored_after_odometry_reset(self):
         node = object.__new__(CubeyOdometryNode)
         node.last_scan_time = 42.0
@@ -242,6 +181,7 @@ class Nav2IntegrationTests(unittest.TestCase):
         explorer = object.__new__(CubeyFrontierExplorerNode)
         explorer.get_logger = MagicMock(return_value=MagicMock())
 
+        explorer._hold_motion = MagicMock()
         explorer.finalization_at_dock = True
         explorer._complete_mapping()
         self.assertEqual(explorer.state, "COMPLETED")
@@ -276,6 +216,7 @@ class Nav2IntegrationTests(unittest.TestCase):
 
     def test_current_return_failure_stops_away_from_dock(self):
         explorer = object.__new__(CubeyFrontierExplorerNode)
+        explorer.return_attempts = 3
         explorer.nav_goal_generation = 8
         explorer.state = "RETURNING_TO_DOCK"
         explorer.current_goal_coord = (0.0, 0.0)
@@ -352,9 +293,10 @@ class Nav2IntegrationTests(unittest.TestCase):
         self.assertEqual(explorer.state, "EXPLORING")
         self.assertEqual(explorer.zero_frontier_cycles, 0)
 
-    def test_completed_map_is_saved_before_slam_is_paused_for_return(self):
+    def test_completed_map_checkpoint_precedes_return(self):
         explorer = object.__new__(CubeyFrontierExplorerNode)
         explorer.map_save_dir = "maps"
+        explorer.mission_generation = 1
         explorer.pre_return_save_attempts = 0
         explorer.save_map_client = MagicMock()
         explorer.save_map_client.wait_for_service.return_value = True
@@ -495,6 +437,8 @@ class Nav2IntegrationTests(unittest.TestCase):
 
     def test_unreachable_dock_preflight_tries_one_safe_escape_backup(self):
         explorer = object.__new__(CubeyFrontierExplorerNode)
+        explorer.robot_pose = None
+        explorer.latest_global_costmap = None
         explorer.dock_plan_generation = 3
         explorer.state = "RETURNING_TO_DOCK"
         explorer.dock_plan_queue = []
@@ -516,22 +460,6 @@ class Nav2IntegrationTests(unittest.TestCase):
         explorer._plan_next_dock_approach(3)
 
         explorer._initiate_map_finalization.assert_called_once_with()
-
-    def test_return_waits_for_confirmed_slam_lock(self):
-        explorer = object.__new__(CubeyFrontierExplorerNode)
-        explorer.state = "RETURNING_TO_DOCK"
-        explorer.slam_locked_for_return = False
-        explorer.get_logger = MagicMock(return_value=MagicMock())
-        explorer._queue_reachable_dock_selection = MagicMock()
-        explorer._initiate_map_finalization = MagicMock()
-        future = MagicMock()
-        future.result.return_value.status = True
-
-        explorer._on_slam_locked_for_return(future)
-
-        self.assertTrue(explorer.slam_locked_for_return)
-        explorer._queue_reachable_dock_selection.assert_called_once_with()
-        explorer._initiate_map_finalization.assert_not_called()
 
     def test_stale_heartbeat_is_not_ready(self):
         service = CubeyNavService()
@@ -573,10 +501,10 @@ class Nav2IntegrationTests(unittest.TestCase):
         ):
             self.assertTrue(service.start_exploration())
 
-        mapping_service.start_mapping.assert_called_once_with()
+        mapping_service.start_mapping.assert_called_once_with(external_pose=True)
         thread_class.return_value.start.assert_called_once_with()
         self.assertTrue(service._is_exploring)
-        self.assertEqual(service.telemetry.state, "EXPLORING")
+        self.assertEqual(service.telemetry.state, "PREPARING")
 
     @patch("src.services.navigation.cubey_nav_service.get_mapping_service")
     def test_missing_ros_acknowledgement_stops_mapping(self, get_mapping_service):

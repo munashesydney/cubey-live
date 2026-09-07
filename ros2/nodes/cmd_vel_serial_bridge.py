@@ -10,6 +10,8 @@ to the ESP32 (cubey_wheels) over hardware UART (/dev/ttyAMA0 @ 115200 baud).
 from __future__ import annotations
 
 import json
+import math
+from collections import deque
 import logging
 import os
 import select
@@ -23,6 +25,10 @@ try:
     import rclpy
     from rclpy.node import Node
     from geometry_msgs.msg import Twist
+    from sensor_msgs.msg import Imu
+    from std_msgs.msg import String
+    from rclpy.time import Time
+    from rclpy.qos import qos_profile_sensor_data
 except ImportError:
     print("Warning: rclpy / geometry_msgs not found in standard Python environment. Must be run in Pixi ROS 2 environment.", file=sys.stderr)
     Node = object
@@ -34,6 +40,11 @@ except ImportError:
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(levelname)s] [cmd_vel_bridge] %(message)s")
 logger = logging.getLogger("cmd_vel_bridge")
+
+try:
+    from .imu_support import ImuPacketClock
+except ImportError:
+    from imu_support import ImuPacketClock
 
 
 def apply_minimum_effective_command(
@@ -163,6 +174,18 @@ class CmdVelSerialBridgeNode(Node):
         )
         self.last_cmd_time = time.time()
         self.is_active = False
+        self.command_source = "ros"
+        self.teleop_speed = 180
+        self.motion_state = "PREPARING"
+        self.motion_ready = False
+        self.motion_status_time = 0.0
+        self.imu_clock = ImuPacketClock()
+        self.imu_lines = deque(maxlen=100)
+        self.imu_last_sample = None
+        self.pub_imu = self.create_publisher(Imu, "/imu/raw", qos_profile_sensor_data)
+        self.pub_imu_status = self.create_publisher(String, "/cubey/imu_status", 10)
+        self.sub_motion = self.create_subscription(String, "/cubey/motion_status", self._on_motion_status, 10)
+        self.imu_timer = self.create_timer(0.02, self._publish_imu)
 
         self._connect_serial()
 
@@ -215,6 +238,9 @@ class CmdVelSerialBridgeNode(Node):
 
     def _on_cmd_vel(self, msg: Twist):
         """Handle incoming velocity command."""
+        if not self._motion_allowed("ros"):
+            return
+        self.command_source = "ros"
         vx = msg.linear.x
         vy = msg.linear.y
         wz = msg.angular.z
@@ -233,6 +259,13 @@ class CmdVelSerialBridgeNode(Node):
     def _dispatch_loop(self):
         """Periodically sends TWIST packets to ESP32 or auto-stops on timeout."""
         now = time.time()
+        if not self._motion_allowed(self.command_source):
+            self.target_forward = self.target_left = self.target_ccw = 0
+            self.command_filter.reset()
+            if self.is_active:
+                self._send_raw("TWIST:0,0,0\n")
+            self.is_active = False
+            return
         if now - self.last_cmd_time > self.timeout_sec:
             # Deadman timeout
             if self.is_active or self.target_forward != 0 or self.target_left != 0 or self.target_ccw != 0:
@@ -252,6 +285,47 @@ class CmdVelSerialBridgeNode(Node):
             )
             packet = f"TWIST:{forward},{left},{ccw}\n"
             self._send_raw(packet)
+
+    def _on_motion_status(self, msg):
+        try:
+            status = json.loads(msg.data)
+            self.motion_state = status["state"]
+            self.motion_ready = status.get("ready") is True
+            self.motion_status_time = time.monotonic()
+        except (ValueError, KeyError, TypeError):
+            self.motion_ready = False
+
+    def _motion_allowed(self, source):
+        if not self.motion_ready or time.monotonic()-self.motion_status_time > 0.5:
+            return False
+        if source == "ros":
+            return self.motion_state in ("EXPLORING", "NAVIGATING", "RETURNING_TO_DOCK", "RECOVERING_STUCK")
+        return self.motion_state in ("IDLE", "MANUAL", "COMPLETED", "COMPLETED_AWAY_FROM_DOCK")
+
+    def _publish_imu(self):
+        now = self.get_clock().now().nanoseconds/1e9
+        while self.imu_lines:
+            line, received = self.imu_lines.popleft()
+            sample = self.imu_clock.parse(line, received)
+            if sample is None or now-sample.stamp > 0.2:
+                continue
+            self.imu_last_sample = sample
+            msg = Imu()
+            msg.header.stamp = Time(nanoseconds=int(sample.stamp*1e9)).to_msg()
+            msg.header.frame_id = "imu_link"
+            msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w = sample.quaternion
+            msg.orientation_covariance = [math.radians(3)**2, 0., 0., 0., math.radians(3)**2, 0., 0., 0., math.radians(3)**2]
+            # The firmware sends game rotation vectors, not gyro/acceleration.
+            msg.angular_velocity_covariance[0] = -1.0
+            msg.linear_acceleration_covariance[0] = -1.0
+            self.pub_imu.publish(msg)
+        sample = self.imu_last_sample
+        age = now-sample.stamp if sample else None
+        status = String()
+        status.data = json.dumps({"healthy": bool(sample and 0 <= age <= 0.2 and not self.imu_clock.reason),
+                                  "age_s": age, "stream": self.imu_clock.stream,
+                                  "reason": self.imu_clock.reason, "timestamp": now})
+        self.pub_imu_status.publish(status)
 
     def _send_raw(self, packet: str):
         """Send raw line to ESP32 over serial."""
@@ -277,6 +351,37 @@ class CmdVelSerialBridgeNode(Node):
                 text = data.decode("utf-8", errors="ignore").strip()
                 if not text:
                     continue
+
+                if text.startswith("CMD:"):
+                    text = json.dumps({"action": text[4:], "speed": self.teleop_speed})
+                parsed = None
+                if text.startswith("{"):
+                    try:
+                        parsed = json.loads(text)
+                    except ValueError:
+                        continue
+
+                # Stop and diagnostics remain available even during sensor faults.
+                is_stop = text.lower() == "estop" or (isinstance(parsed, dict) and parsed.get("action") == "stop")
+                if is_stop:
+                    self.target_forward = self.target_left = self.target_ccw = 0
+                    self.command_filter.reset()
+                    self.is_active = False
+                    self._send_raw("TWIST:0,0,0\n")
+                    if text.lower() == "estop":
+                        self._send_raw("ESTOP\n")
+                    continue
+                if text.startswith("SPEED:"):
+                    try:
+                        self.teleop_speed = max(70, min(255, int(text[6:])))
+                    except ValueError:
+                        pass
+                    continue
+                if not is_stop and not self._motion_allowed("teleop"):
+                    if text.upper() in ("PING", "STATUS", "IMU", "RESET_ESTOP"):
+                        self._send_raw(text+"\n")
+                    continue
+                self.command_source = "teleop"
 
                 if text.startswith("{"):
                     try:
@@ -328,6 +433,8 @@ class CmdVelSerialBridgeNode(Node):
                             self.target_forward = int(max(-1.0, min(1.0, vx / self.max_vx)) * 1000) if self.max_vx > 0 else 0
                             self.target_left = int(max(-1.0, min(1.0, vy / self.max_vy)) * 1000) if self.max_vy > 0 else 0
                             self.target_ccw = int(max(-1.0, min(1.0, wz / self.max_wz)) * 1000) if self.max_wz > 0 else 0
+                        else:
+                            continue
                         self.last_cmd_time = time.time()
                         self.is_active = True
                     except Exception:
@@ -342,7 +449,8 @@ class CmdVelSerialBridgeNode(Node):
                         self.last_cmd_time = time.time()
                         self.is_active = True
                         self._send_raw("TWIST:0,0,0\n")
-                    self._send_raw(f"{text}\n")
+                    if text.upper() in ("PING", "IMU", "STATUS", "RESET_ESTOP"):
+                        self._send_raw(f"{text}\n")
             except Exception:
                 time.sleep(0.05)
 
@@ -350,20 +458,26 @@ class CmdVelSerialBridgeNode(Node):
         """Reads incoming telemetry from ESP32."""
         tmp_telemetry = "/tmp/cubey_wheels_telemetry.txt"
         tmp_w = "/tmp/cubey_wheels_telemetry.txt.tmp"
+        buffer = b""
         while self._running:
             if not self.serial_conn or not self.serial_conn.is_open:
                 time.sleep(1.0)
                 self._connect_serial()
+                buffer = b""
                 continue
             try:
-                line = self.serial_conn.readline().decode("utf-8", errors="ignore").strip()
-                if line:
-                    try:
+                buffer += self.serial_conn.read(min(4096, self.serial_conn.in_waiting or 1))
+                while b"\n" in buffer:
+                    raw, buffer = buffer.split(b"\n", 1)
+                    line = raw.decode("ascii", errors="ignore").strip()
+                    if line.startswith("IMU:") and "t_us=" in line:
+                        self.imu_lines.append((line, self.get_clock().now().nanoseconds/1e9))
+                    elif line.startswith("TELEMETRY:"):
                         with open(tmp_w, "w") as f:
                             f.write(line + "\n")
                         os.replace(tmp_w, tmp_telemetry)
-                    except Exception:
-                        pass
+                if len(buffer) > 4096:
+                    buffer = b""  # Discard a damaged unterminated packet.
             except Exception:
                 time.sleep(0.1)
 
