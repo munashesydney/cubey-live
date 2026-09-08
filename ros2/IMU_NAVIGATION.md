@@ -71,3 +71,27 @@ Physical turn, driving, and room-mapping acceptance checks are reserved for the
 operator. Targets are three consecutive missions returning within 10 cm and
 5 degrees of independently marked home, including a subsequent session started
 at a different pose. No stationary test establishes those results.
+
+## Pi stationary verification — 2026-09-07
+
+After the corrected ESP firmware upload, the live IMU produced about 50 Hz with
+no non-increasing timestamps. A settled 30-second sample measured 0.0088 degrees
+of heading variation, raw sample age at most 39 ms, processed IMU age at most
+114 ms, LiDAR at 10 Hz, and filtered odometry near 36 Hz. The stationary reset
+service returned to IDLE with fresh pose and healthy measurement status.
+
+Filtered position wandered up to 5.7 cm from the first sample while stationary;
+this is a remaining estimation limitation, not evidence of physical movement.
+One sensor epoch change was observed without an ESP boot change. The cause is
+unresolved; the odometry restart fault latched as intended. A ROS service restart
+recovered the current sensor stream. Another 30-second check remained healthy,
+with no timestamp regressions and 0.017 degrees of heading variation.
+
+Nav2 activation had timed out while the old firmware supplied no valid odometry.
+Restarting ROS with corrected firmware activated controller_server,
+planner_server, bt_navigator, and behavior_server successfully. Both systemd
+services were active, and the web endpoint responded with its authentication
+challenge. No exploration, navigation goal, or nonzero motor command was sent.
+Motor telemetry confirmed STOPPED. Battery telemetry was approximately 13%.
+Mounting/turn direction, reset reliability over longer runs, and physical
+mapping/return accuracy still require operator testing.
