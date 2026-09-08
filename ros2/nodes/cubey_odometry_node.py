@@ -173,6 +173,7 @@ class CubeyOdometryNode(Node):
         msg.data = json.dumps({"ready": bool(imu_ok and scan_ok and not self.fault),
                                "imu_available": self.imu_healthy and now-self.imu_status_time < 0.3,
                                "imu_ok": imu_ok, "scan_ok": scan_ok,
+                               "fault": self.fault,
                                "reason": self.fault or ("" if imu_ok and scan_ok else "Waiting for fresh IMU and observable LiDAR translation"),
                                "reset_time": self.reset_time, "timestamp": now})
         self.pub_status.publish(msg)

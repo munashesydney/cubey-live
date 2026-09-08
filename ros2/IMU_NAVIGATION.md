@@ -136,3 +136,21 @@ interrupted recovery, timeout, and no premature return dispatch.
 The original checkpoint PGM/YAML, serialized pose graph/data, and diagnostic
 home/pose metadata are preserved on the Pi under
 data/maps/cubey_floorplan_20260907_173132_checkpoint.*.
+
+### Recovery from brief measurement delays
+
+During navigation, a temporary measurement/TF/map delay now cancels the active
+goal and enters RECOVERING_LOCALIZATION with motion disabled. It retains the
+mission and destination, allowing up to 10 seconds to recover. One continuous
+second of healthy measurements, fresh pose/map, and available Nav2 servers is
+required before sending a new navigation goal (and therefore a new path).
+The recovered pose must remain within 25 cm and 30 degrees of the last trusted
+pose. Interrupted exploration without an active destination selects a frontier
+again; interrupted home planning replans home. Interrupted backup is cancelled,
+and the parent exploration/return phase is restored rather than replaying backup.
+
+An explicit IMU/clock fault, changed localization reference, excessive pose
+change, recovery timeout, or fourth interruption within 60 seconds ends the
+mission stopped. Stop/Reset invalidates recovery through the mission state.
+The web shows the paused recovery phase. These paths are covered by local tests;
+no automatic-resume driving test has been performed on the robot.

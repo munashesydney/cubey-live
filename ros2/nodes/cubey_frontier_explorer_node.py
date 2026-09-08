@@ -96,6 +96,8 @@ class CubeyFrontierExplorerNode(Node):
         self.mission_generation = 0
         self.mission_id = None
         self.failure_reason = ""
+        self.localization_interruptions = []
+        self.last_valid_pose = None
         self.odom_health = {}
         self.odom_health_time = 0.0
         self.pose_stamp = 0.0
@@ -326,6 +328,8 @@ class CubeyFrontierExplorerNode(Node):
         """Reset real SLAM Toolbox state and local odometry, then optionally explore."""
         self._cancel_active_nav_goal()
         self.mission_generation += 1
+        self.localization_interruptions = []
+        self.last_valid_pose = None
         self.state = "PREPARING"
         self.preparation_stage = "STOPPING"
         self.start_after_reset = start_after_reset
@@ -473,6 +477,10 @@ class CubeyFrontierExplorerNode(Node):
         self._update_robot_pose_from_tf()
         ready = self._sensors_ready() and self._pose_fresh()
         now = time.time()
+        if self.state == "RECOVERING_LOCALIZATION":
+            self._recover_localization_tick(ready and now-self.last_map_time <= 5.0)
+            self._export_live_pose()
+            return
         if self.state in ("PREPARING", "RESETTING"):
             self._hold_motion()
             if now > self.preparation_deadline:
@@ -514,10 +522,11 @@ class CubeyFrontierExplorerNode(Node):
             self._export_live_pose()
             return
         if active and (not ready or now-self.last_map_time > 5.0):
-            ros_now = self.get_clock().now().nanoseconds/1e9
-            self._fail_mission(self.odom_health.get("reason") or
-                               f"Localization or map became stale (TF age={ros_now-self.pose_stamp:.2f}s, "
-                               f"odometry age={ros_now-self.odom_stamp:.2f}s, map age={now-self.last_map_time:.2f}s)")
+            self._pause_for_localization()
+            self._export_live_pose()
+            return
+        if ready:
+            self.last_valid_pose = self.robot_pose
         if (self.state == "FINALIZING_MAP" or
                 (self.state == "RETURNING_TO_DOCK" and not self.pre_return_map_saved)) and now > self.operation_deadline:
             self._fail_mission("Map save operation timed out; robot stopped")
@@ -539,6 +548,69 @@ class CubeyFrontierExplorerNode(Node):
             motion.data = json.dumps({"ready": ready, "state": self.state, "timestamp": self.get_clock().now().nanoseconds/1e9})
             self.pub_motion.publish(motion)
         self._export_live_pose()
+
+    def _pause_for_localization(self):
+        """Cancel motion, retaining the destination rather than an old path."""
+        fault = self.odom_health.get("fault")
+        if fault:
+            self._fail_mission(fault)
+            return
+        now = time.monotonic()
+        recent = [t for t in self.localization_interruptions if now-t < 60.0]
+        if len(recent) >= 3:
+            self._fail_mission("Localization interrupted repeatedly; check sensor timing and Pi cooling")
+            return
+        self.localization_interruptions = recent + [now]
+        self.localization_resume_state = self.state
+        self.localization_resume_goal = None
+        if self.current_goal_coord is not None:
+            self.localization_resume_goal = (*self.current_goal_coord, self.current_goal_yaw,
+                                             self.current_frontier_coord, self.active_goal_purpose)
+        if self.state == "RECOVERING_STUCK":
+            self.localization_resume_state = "RETURNING_TO_DOCK" if self.recovery_purpose == self.GOAL_RETURN else "EXPLORING"
+        self.localization_anchor = self.last_valid_pose
+        self.localization_reset_time = self.odom_health.get("reset_time")
+        self.localization_deadline = now+10.0
+        self.localization_ready_since = None
+        self._cancel_active_nav_goal()
+        self.awaiting_home_settle = False
+        self.state = "RECOVERING_LOCALIZATION"
+        self.failure_reason = "Paused for fresh IMU, LiDAR and localization"
+        self._hold_motion()
+        self.get_logger().warn(self.failure_reason)
+
+    def _recover_localization_tick(self, ready):
+        self._hold_motion()
+        now = time.monotonic()
+        fault = self.odom_health.get("fault")
+        if fault or self.odom_health.get("reset_time") != self.localization_reset_time:
+            self._fail_mission(fault or "Localization reference changed; reset mapping before continuing")
+            return
+        if now >= self.localization_deadline:
+            self._fail_mission("Localization did not recover within 10 seconds; robot stopped")
+            return
+        if not ready:
+            self.localization_ready_since = None
+            return
+        anchor = self.localization_anchor
+        pose = self.robot_pose
+        if anchor is None or pose is None or math.hypot(pose[0]-anchor[0], pose[1]-anchor[1]) > 0.25 or self._angular_distance(pose[2], anchor[2]) > math.radians(30):
+            self._fail_mission("Localization pose changed unexpectedly; reset mapping before continuing")
+            return
+        if self.localization_ready_since is None:
+            self.localization_ready_since = now
+            return
+        if now-self.localization_ready_since < 1.0 or not self.nav_client.server_is_ready() or not self.planner_client.server_is_ready():
+            return
+        self.state = self.localization_resume_state
+        self.failure_reason = ""
+        self.last_valid_pose = pose
+        self.get_logger().info("Localization recovered for one second; replanning the interrupted mission")
+        goal = self.localization_resume_goal
+        if goal is not None:
+            self._send_nav2_goal(*goal[:3], frontier_coord=goal[3], purpose=goal[4])
+        elif self.state == "RETURNING_TO_DOCK":
+            self._queue_reachable_dock_selection()
 
     def _export_live_pose(self):
         pose = None
@@ -1011,6 +1083,7 @@ class CubeyFrontierExplorerNode(Node):
         goal_msg.pose = self._pose_stamped(self, target_x, target_y, target_yaw)
 
         self.current_goal_coord = (target_x, target_y)
+        self.current_goal_yaw = target_yaw
         self.current_frontier_coord = frontier_coord
         self.goal_start_time = time.time()
         self.goal_progress_pose = self.robot_pose

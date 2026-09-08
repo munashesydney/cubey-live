@@ -287,6 +287,70 @@ def checkpoint_wait_node():
     return node
 
 
+def localization_wait_node():
+    node = mission_node()
+    node.localization_interruptions = []
+    node.last_valid_pose = node.robot_pose
+    node.current_goal_coord = (3., 4.)
+    node.current_goal_yaw = 0.7
+    node.current_frontier_coord = None
+    node.active_goal_purpose = node.GOAL_RETURN
+    node.odom_health = {"reset_time": 100., "fault": ""}
+    node.nav_client = MagicMock()
+    node.planner_client = MagicMock()
+    node._send_nav2_goal = MagicMock()
+    node._pause_for_localization()
+    return node
+
+
+def test_localization_delay_stops_and_replans_original_destination_after_stability():
+    node = localization_wait_node()
+    assert node.state == "RECOVERING_LOCALIZATION"
+    node._cancel_active_nav_goal.assert_called_once()
+    node._hold_motion.assert_called()
+    node._recover_localization_tick(False)
+    node._send_nav2_goal.assert_not_called()
+    node._recover_localization_tick(True)
+    node._send_nav2_goal.assert_not_called()
+    node.localization_ready_since = time.monotonic()-2
+    node._recover_localization_tick(False)
+    assert node.localization_ready_since is None
+    node._recover_localization_tick(True)
+    node.localization_ready_since = time.monotonic()-2
+    node._recover_localization_tick(True)
+    assert node.state == "RETURNING_TO_DOCK"
+    node._send_nav2_goal.assert_called_once_with(3., 4., 0.7, frontier_coord=None, purpose=node.GOAL_RETURN)
+
+
+@pytest.mark.parametrize("failure", ["sensor_reset", "reference", "position", "heading", "timeout"])
+def test_localization_recovery_never_resumes_after_reference_fault_or_timeout(failure):
+    node = localization_wait_node()
+    if failure == "sensor_reset": node.odom_health["fault"] = "IMU restarted"
+    if failure == "reference": node.odom_health["reset_time"] = 101.
+    if failure == "position": node.robot_pose = (2., 2., .5)
+    if failure == "heading": node.robot_pose = (1., 2., 1.5)
+    if failure == "timeout": node.localization_deadline = time.monotonic()-1
+    node.localization_ready_since = time.monotonic()-2
+    node._recover_localization_tick(True)
+    assert node.state == "ERROR"
+    node._send_nav2_goal.assert_not_called()
+
+
+def test_repeated_localization_interruptions_fail_closed():
+    node = localization_wait_node()
+    node.state = "RETURNING_TO_DOCK"
+    node.localization_interruptions = [time.monotonic()]*3
+    node._pause_for_localization()
+    assert node.state == "ERROR"
+
+
+def test_stop_during_localization_wait_prevents_automatic_resume():
+    node = localization_wait_node()
+    node._stop_exploration()
+    assert node.state == "IDLE"
+    node._send_nav2_goal.assert_not_called()
+
+
 def test_checkpoint_save_tolerates_stale_localization_only_while_stopped():
     node = checkpoint_wait_node()
     node._safety_tick()

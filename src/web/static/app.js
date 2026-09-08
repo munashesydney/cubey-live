@@ -192,7 +192,7 @@
     const navMode = data.nav_mode || "manual";
 
     lblActiveMapName.textContent = activeMapName;
-    const activeStates = ["PREPARING", "RESETTING", "EXPLORING", "NAVIGATING", "RETURNING_TO_DOCK", "RECOVERING_STUCK", "FINALIZING_MAP"];
+    const activeStates = ["PREPARING", "RESETTING", "EXPLORING", "NAVIGATING", "RETURNING_TO_DOCK", "RECOVERING_STUCK", "RECOVERING_LOCALIZATION", "FINALIZING_MAP"];
     isMapping = activeStates.includes(navState) || (isMapping && navState === "MANUAL");
     if (isMapping) {
       pillStatus.classList.add("active");
@@ -215,6 +215,7 @@
       PREPARING: "Checking sensors and recording home…", RESETTING: "Preparing a fresh map…",
       EXPLORING: "Mapping room", RETURNING_TO_DOCK: "Returning home",
       RECOVERING_STUCK: "Finding a clear route", FINALIZING_MAP: "Saving map",
+      RECOVERING_LOCALIZATION: "Paused · Waiting for localization to recover",
       COMPLETED: "Home · Map saved", COMPLETED_AWAY_FROM_DOCK: "Map saved · Could not reach home",
       ERROR: data.failure_reason || "Mapping stopped: check sensors"
     };
