@@ -158,9 +158,9 @@
   function handleMapUpdate(data) {
     homePose = data.home ?? null;
     poseFresh = data.pose_fresh === true;
-    robotPose = data.pose ?? robotPose;
+    if (poseFresh && data.pose) robotPose = data.pose;
     trajectory = data.trajectory ?? trajectory;
-    laserScan = data.laser_scan ?? laserScan;
+    laserScan = poseFresh ? (data.laser_scan ?? laserScan) : [];
 
     gridWidth = data.width ?? gridWidth;
     gridHeight = data.height ?? gridHeight;
@@ -710,6 +710,10 @@
         gridBuffer = new Int8Array(0);
         trajectory = [];
         robotPose = { x_m: 0, y_m: 0, theta_deg: 0 };
+        laserScan = [];
+        homePose = null;
+        viewPanX = canvas.width / 2;
+        viewPanY = canvas.height / 2;
         render();
       } catch (e) {
         console.error("Failed to reset SLAM map:", e);

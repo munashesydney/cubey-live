@@ -75,7 +75,7 @@ class CubeyOdometryNode(Node):
             data = json.loads(msg.data)
             stream = data.get("stream")
             if self.imu_stream is not None and stream != self.imu_stream:
-                self.fault = "IMU restarted; start a new mapping session"
+                self.fault = "IMU or system clock restarted; reset mapping before continuing"
                 self.prev_points = None
             self.imu_stream = stream
             self.imu_healthy = data.get("healthy") is True

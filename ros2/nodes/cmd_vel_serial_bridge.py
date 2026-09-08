@@ -306,8 +306,8 @@ class CmdVelSerialBridgeNode(Node):
     def _publish_imu(self):
         now = self.get_clock().now().nanoseconds/1e9
         while self.imu_lines:
-            line, received = self.imu_lines.popleft()
-            sample = self.imu_clock.parse(line, received)
+            line, received, monotonic_received = self.imu_lines.popleft()
+            sample = self.imu_clock.parse(line, received, monotonic_received)
             if sample is None or now-sample.stamp > 0.2:
                 continue
             self.imu_last_sample = sample
@@ -324,7 +324,7 @@ class CmdVelSerialBridgeNode(Node):
         age = now-sample.stamp if sample else None
         status = String()
         status.data = json.dumps({"healthy": bool(sample and 0 <= age <= 0.2 and not self.imu_clock.reason),
-                                  "age_s": age, "stream": self.imu_clock.stream,
+                                  "age_s": age, "stream": (*self.imu_clock.stream, self.imu_clock.host_clock_generation) if self.imu_clock.stream else None,
                                   "reason": self.imu_clock.reason, "timestamp": now})
         self.pub_imu_status.publish(status)
 
@@ -472,7 +472,7 @@ class CmdVelSerialBridgeNode(Node):
                     raw, buffer = buffer.split(b"\n", 1)
                     line = raw.decode("ascii", errors="ignore").strip()
                     if line.startswith("IMU:") and "t_us=" in line:
-                        self.imu_lines.append((line, self.get_clock().now().nanoseconds/1e9))
+                        self.imu_lines.append((line, self.get_clock().now().nanoseconds/1e9, time.monotonic()))
                     elif line.startswith("TELEMETRY:"):
                         with open(tmp_w, "w") as f:
                             f.write(line + "\n")

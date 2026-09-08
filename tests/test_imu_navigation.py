@@ -62,6 +62,45 @@ def test_sequence_wrap_and_clock_regression():
     assert "regressed" in clock.reason
 
 
+@pytest.mark.parametrize("jump", [800.0, -800.0])
+def test_host_clock_step_preserves_fresh_samples_and_marks_new_clock_epoch(jump):
+    clock = ImuPacketClock()
+    clock.parse(packet(), 100, 10)
+    sample = clock.parse(packet(2, 1_020_000), 100.02+jump, 10.02)
+    assert sample.stamp == pytest.approx(100.02+jump)
+    assert clock.host_clock_generation == 1
+    # A real serial delay following the clock change is still rejected.
+    assert clock.parse(packet(3, 1_040_000), 100.4+jump, 10.4) is None
+    assert clock.reason == "IMU serial backlog"
+
+
+def test_serial_backlog_does_not_masquerade_as_a_host_clock_step():
+    clock = ImuPacketClock()
+    clock.parse(packet(), 100, 10)
+    assert clock.parse(packet(2, 1_020_000), 100.4, 10.4) is None
+    assert clock.host_clock_generation == 0
+
+
+def test_reset_does_not_accept_an_unrelated_idle_heartbeat():
+    service = CubeyNavService()
+    now = time.time()
+    with patch.object(service, "_read_ros2_status", return_value={"state": "IDLE", "timestamp": now+1, "mission_id": "old"}):
+        assert not service._wait_for_ros2_state({"IDLE"}, now, timeout_s=0.01, mission_id="new")
+
+
+def test_failed_reset_keeps_web_map_and_surfaces_sensor_failure():
+    service = CubeyNavService()
+    with patch.object(service, "stop_navigation"), patch.object(service, "is_ros2_ready", return_value=True), \
+         patch("src.services.navigation.cubey_nav_service.uuid.uuid4", return_value="reset-test"), \
+         patch.object(service, "_send_ros2_command", return_value=True), \
+         patch.object(service, "_wait_for_ros2_state", return_value=False), \
+         patch.object(service, "_read_ros2_status", return_value={"mission_id": "reset-test", "failure_reason": "Waiting for IMU"}), \
+         patch("src.services.navigation.cubey_nav_service.get_mapping_service") as mapping:
+        assert not service.reset_mapping()
+        assert service.last_reset_error == "Waiting for IMU"
+        mapping.assert_not_called()
+
+
 def test_heading_interpolation_uses_short_path_through_pi():
     history = HeadingHistory()
     history.add(1, math.radians(179))

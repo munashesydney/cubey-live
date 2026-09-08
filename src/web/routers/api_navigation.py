@@ -74,7 +74,7 @@ async def reset_mapping_grid(_: str = Depends(verify_credentials)):
     if not await asyncio.to_thread(nav_svc.reset_mapping):
         raise HTTPException(
             status_code=503,
-            detail="ROS 2 SLAM did not acknowledge the map reset.",
+            detail=nav_svc.last_reset_error or "ROS 2 SLAM did not acknowledge the map reset.",
         )
     return {"status": "map_reset"}
 

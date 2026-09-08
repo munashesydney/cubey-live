@@ -286,6 +286,7 @@ class CubeyFrontierExplorerNode(Node):
             elif command == "stop":
                 self._stop_exploration()
             elif command == "reset":
+                self.mission_id = message.get("mission_id")
                 self._reset_mapping(start_after_reset=False)
             elif command == "navigate":
                 if not self._sensors_ready() or not self._pose_fresh():
@@ -418,12 +419,10 @@ class CubeyFrontierExplorerNode(Node):
         try:
             response = future.result()
             if response.result != Reset.Response.RESULT_SUCCESS:
-                self.state = "ERROR"
-                self.get_logger().error(f"SLAM reset failed with result code {response.result}.")
+                self._fail_mission(f"SLAM reset failed with result code {response.result}.")
                 return
         except Exception as e:
-            self.state = "ERROR"
-            self.get_logger().error(f"SLAM reset failed: {e}")
+            self._fail_mission(f"SLAM reset failed: {e}")
             return
 
         self.start_after_reset = start_after_reset
@@ -523,11 +522,12 @@ class CubeyFrontierExplorerNode(Node):
 
     def _export_live_pose(self):
         pose = None
-        if self.robot_pose is not None:
+        healthy = self._sensors_ready() and self._pose_fresh()
+        if self.robot_pose is not None and healthy:
             pose = {"x_m": self.robot_pose[0], "y_m": self.robot_pose[1], "theta_deg": math.degrees(self.robot_pose[2])}
-        data = {"pose": pose, "pose_fresh": self._pose_fresh(), "home": list(self.start_pose) if self.home_captured else None,
+        data = {"pose": pose, "pose_fresh": healthy, "home": list(self.start_pose) if self.home_captured else None,
                 "trajectory": self.trajectory, "imu_ok": self.odom_health.get("imu_ok", False),
-                "nav_state": self.state, "failure_reason": self.failure_reason,
+                "nav_state": self.state, "failure_reason": self.failure_reason or (self.odom_health.get("reason", "") if not healthy else ""),
                 "mission_id": self.mission_id, "timestamp": time.time()}
         try:
             path = "/tmp/cubey_nav2_live_pose.json"

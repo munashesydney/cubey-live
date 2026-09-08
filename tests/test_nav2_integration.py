@@ -537,7 +537,9 @@ class Nav2IntegrationTests(unittest.TestCase):
             self.assertTrue(service.reset_mapping())
 
         mapping_service.reset_map.assert_called_once_with()
-        send.assert_called_once_with("reset")
+        self.assertEqual(send.call_args.args, ("reset",))
+        self.assertTrue(send.call_args.kwargs["mission_id"])
+        self.assertEqual(wait.call_args.kwargs["mission_id"], send.call_args.kwargs["mission_id"])
         wait.assert_called_once()
         self.assertEqual(service.telemetry.state, "IDLE")
 

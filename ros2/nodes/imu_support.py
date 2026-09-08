@@ -58,10 +58,25 @@ class ImuPacketClock:
         self.offset = None
         self.last_stamp = None
         self.reason = "Waiting for timestamped IMU firmware"
+        self.host_clock_generation = 0
+        self.host_clock_offset = None
 
-    def parse(self, line, received_at):
+    def parse(self, line, received_at, received_monotonic=None):
         if not line.startswith("IMU:"):
             return None
+        if received_monotonic is not None:
+            host_offset = received_at-received_monotonic
+            if self.host_clock_offset is not None:
+                jump = host_offset-self.host_clock_offset
+                if abs(jump) > 0.1:
+                    # NTP can step wall time after boot. Preserve measured
+                    # transport delay instead of treating that step as backlog.
+                    if self.offset is not None:
+                        self.offset += jump
+                    if self.last_stamp is not None:
+                        self.last_stamp += jump
+                    self.host_clock_generation += 1
+            self.host_clock_offset = host_offset
         try:
             kv = dict(part.split("=", 1) for part in line[4:].split(","))
             if kv.get("ok") != "1":

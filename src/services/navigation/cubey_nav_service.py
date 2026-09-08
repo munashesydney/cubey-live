@@ -82,6 +82,7 @@ class CubeyNavService:
         self._worker_thread: Optional[threading.Thread] = None
         self._pending_mission_id = None
         self._request_generation = 0
+        self.last_reset_error = ""
 
     @property
     def is_active(self) -> bool:
@@ -145,8 +146,8 @@ class CubeyNavService:
             return False
 
     def _wait_for_ros2_state(self, expected_states: set[str], sent_at: float, timeout_s: float = 5.0, mission_id=None) -> bool:
-        deadline = time.time() + timeout_s
-        while time.time() < deadline:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
             data = self._read_ros2_status()
             if data:
                 try:
@@ -155,6 +156,8 @@ class CubeyNavService:
                     is_new = False
                 if is_new and data.get("state") in expected_states and (mission_id is None or data.get("mission_id") == mission_id):
                     return True
+                if is_new and data.get("state") == "ERROR" and data.get("mission_id") == mission_id:
+                    return False
             time.sleep(0.1)
         return False
 
@@ -309,21 +312,25 @@ class CubeyNavService:
         """Stop motion and reset both the real SLAM graph and legacy UI state."""
         self.stop_navigation()
 
+        self.last_reset_error = ""
         if not self.is_ros2_ready():
+            self.last_reset_error = "ROS navigation service is unavailable."
             self._emit_log("Nav2/SLAM is not ready. The map was not reset.")
             return False
 
-        # Keep the web application's persisted/session state in sync with ROS.
-        get_mapping_service().reset_map()
-
+        reset_id = str(uuid.uuid4())
         sent_at = time.time()
-        if not self._send_ros2_command("reset") or not self._wait_for_ros2_state(
-            {"IDLE"}, sent_at, timeout_s=27.0
+        if not self._send_ros2_command("reset", mission_id=reset_id) or not self._wait_for_ros2_state(
+            {"IDLE"}, sent_at, timeout_s=27.0, mission_id=reset_id
         ):
+            status = self._read_ros2_status() or {}
+            self.last_reset_error = (status.get("failure_reason") if status.get("mission_id") == reset_id else None) or "Mapping reset timed out while waiting for healthy sensors and localization."
             self._send_ros2_command("stop")
-            self._emit_log("SLAM Toolbox did not acknowledge the map reset.")
+            self._emit_log(self.last_reset_error)
             return False
 
+        # Only clear the web map after this exact reset has completed in ROS.
+        get_mapping_service().reset_map()
         with self._lock:
             self._is_exploring = False
             self._is_navigating_goal = False
