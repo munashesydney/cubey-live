@@ -95,3 +95,24 @@ challenge. No exploration, navigation goal, or nonzero motor command was sent.
 Motor telemetry confirmed STOPPED. Battery telemetry was approximately 13%.
 Mounting/turn direction, reset reliability over longer runs, and physical
 mapping/return accuracy still require operator testing.
+
+### Follow-up: clock correction and failed web reset
+
+The next Pi boot logged initial NTP synchronization at 17:19:08 after starting
+services with a clock several minutes behind. This invalidated the original
+wall-clock-to-IMU offset: raw serial samples remained healthy at 50 Hz while ROS
+rejected them as backlog. The filter continued predicting position without new
+measurements, producing a spurious position over 20 metres from the origin.
+
+The bridge now compares wall and monotonic receipt times, adjusts the timestamp
+offset on a clock step, and exposes a new clock generation. This preserves real
+backlog rejection and requires a localization reset after a clock discontinuity.
+The web no longer updates its avatar from unhealthy localization. Map reset
+acknowledgments now match a unique request ID, preserve the web map on failure,
+and report the supervisor's failure reason. Successful reset recentres the view.
+
+After deployment, the actual authenticated POST /api/mapping/reset returned
+HTTP 200 in 2.48 seconds. Pose was within 3 mm of the origin, IMU healthy, state
+IDLE, and motors STOPPED. Local verification passed 88 targeted tests, including
+forward/backward host-clock steps, retained backlog rejection, and reset request
+matching; JavaScript syntax validation also passed. No mapping was started.
