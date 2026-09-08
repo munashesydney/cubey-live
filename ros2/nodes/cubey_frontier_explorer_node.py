@@ -222,6 +222,8 @@ class CubeyFrontierExplorerNode(Node):
         self.reset_slam_client = self.create_client(Reset, "/slam_toolbox/reset")
         self.save_map_client = self.create_client(SaveMap, "/map_saver/save_map")
         self.reset_odom_client = self.create_client(Trigger, "/cubey/reset_odometry")
+        from navigation_health import NavigationHealth
+        self.navigation_health = NavigationHealth(self, self._localization_ready)
 
         # Main supervision timer (e.g. 1-2 Hz)
         self.timer = self.create_timer(self.update_interval, self._supervision_loop)
@@ -328,6 +330,7 @@ class CubeyFrontierExplorerNode(Node):
     def _reset_mapping(self, start_after_reset: bool):
         """Reset real SLAM Toolbox state and local odometry, then optionally explore."""
         self._cancel_active_nav_goal()
+        self.navigation_health.reset_retries()
         self.mission_generation += 1
         self.localization_interruptions = []
         self.last_valid_pose = None
@@ -459,6 +462,39 @@ class CubeyFrontierExplorerNode(Node):
         now = self.get_clock().now().nanoseconds/1e9
         return self.robot_pose is not None and 0 <= now-self.pose_stamp < 0.4 and 0 <= now-self.odom_stamp < 0.4
 
+    def _localization_ready(self):
+        return (self._sensors_ready() and self._pose_fresh() and self.latest_map is not None
+                and 0 <= time.time()-self.last_map_time <= 5.0)
+
+    def _navigation_ready(self):
+        return self.navigation_health.ready()
+
+    def _readiness_reason(self):
+        if not self._sensors_ready():
+            return self.odom_health.get("reason") or "Waiting for fresh sensor measurements"
+        if not self._pose_fresh():
+            return "Waiting for SLAM localization (map → robot transform)"
+        if self.latest_map is None or time.time()-self.last_map_time > 5.0:
+            return "Waiting for a fresh SLAM map"
+        return self.navigation_health.reason()
+
+    def _status_message(self):
+        if self.state in ("PREPARING", "RESETTING"):
+            if self.preparation_stage == "STOPPING":
+                return "Preparing: stopping and waiting for IMU" if not self.odom_health.get("imu_available") else "Preparing: holding still before reset"
+            if self.preparation_stage == "RESETTING":
+                return "Preparing: resetting odometry and SLAM"
+            return self._readiness_reason() or "Preparing: holding still to record home"
+        if self.state in ("RECOVERING_NAVIGATION", "RECOVERING_LOCALIZATION"):
+            return "Paused: " + (self._readiness_reason() or "checking stability before resuming")
+        if self.failure_reason:
+            return self.failure_reason
+        if self.state == "IDLE":
+            return self._readiness_reason() or "Ready · Start mapping to record a new home"
+        return {"EXPLORING": "Mapping room", "NAVIGATING": "Navigating to selected goal",
+                "RETURNING_TO_DOCK": "Returning home", "FINALIZING_MAP": "Saving map",
+                "COMPLETED": "Home · Map saved", "COMPLETED_AWAY_FROM_DOCK": "Map saved · Could not reach home"}.get(self.state, self.state)
+
     def _hold_motion(self):
         self.pub_stop.publish(Twist())
         msg = String()
@@ -478,14 +514,14 @@ class CubeyFrontierExplorerNode(Node):
         self._update_robot_pose_from_tf()
         ready = self._sensors_ready() and self._pose_fresh()
         now = time.time()
-        if self.state == "RECOVERING_LOCALIZATION":
-            self._recover_localization_tick(ready and now-self.last_map_time <= 5.0)
+        if self.state in ("RECOVERING_LOCALIZATION", "RECOVERING_NAVIGATION"):
+            self._recover_localization_tick(ready and now-self.last_map_time <= 5.0 and self._navigation_ready())
             self._export_live_pose()
             return
         if self.state in ("PREPARING", "RESETTING"):
             self._hold_motion()
             if now > self.preparation_deadline:
-                self._fail_mission("Mapping preparation timed out: " + self.odom_health.get("reason", "waiting for localization"))
+                self._fail_mission("Mapping preparation timed out: " + self._status_message())
             elif self.preparation_stage == "STOPPING":
                 # Stop commands have been enforced by the bridge before resetting
                 # frames. A sensor fault is recoverable through this explicit reset.
@@ -496,7 +532,7 @@ class CubeyFrontierExplorerNode(Node):
                     self.last_motion_time = now
                 if (self.latest_map is not None and self.pose_stamp > self.reset_completed_stamp
                         and now-self.last_motion_time >= 1.0
-                        and self.nav_client.server_is_ready() and self.planner_client.server_is_ready()):
+                        and self._navigation_ready()):
                     self.start_pose = self.robot_pose
                     self.home_captured = True
                     self.state = "EXPLORING" if self.start_after_reset else "IDLE"
@@ -505,6 +541,10 @@ class CubeyFrontierExplorerNode(Node):
             self._export_live_pose()
             return
         active = self.state in ("EXPLORING", "NAVIGATING", "RETURNING_TO_DOCK", "RECOVERING_STUCK")
+        if active and not self._navigation_ready():
+            self._pause_for_navigation("Navigation became unavailable")
+            self._export_live_pose()
+            return
         if self.state == "RETURNING_TO_DOCK" and getattr(self, "return_localization_pending", False):
             # Hold before return until localization is stable. Background saving
             # neither authorizes nor blocks navigation.
@@ -558,7 +598,8 @@ class CubeyFrontierExplorerNode(Node):
         now = time.monotonic()
         recent = [t for t in self.localization_interruptions if now-t < 60.0]
         if len(recent) >= 3:
-            self._fail_mission("Localization interrupted repeatedly; check sensor timing and Pi cooling")
+            self._fail_mission("Mission interrupted repeatedly; robot stopped: " +
+                               (self._readiness_reason() or self.failure_reason or "repeated navigation rejection"))
             return
         self.localization_interruptions = recent + [now]
         self.localization_resume_state = self.state
@@ -587,7 +628,7 @@ class CubeyFrontierExplorerNode(Node):
             self._fail_mission(fault or "Localization reference changed; reset mapping before continuing")
             return
         if now >= self.localization_deadline:
-            self._fail_mission("Localization did not recover within 10 seconds; robot stopped")
+            self._fail_mission("Recovery timed out; robot stopped: " + self._readiness_reason())
             return
         if not ready:
             self.localization_ready_since = None
@@ -600,7 +641,7 @@ class CubeyFrontierExplorerNode(Node):
         if self.localization_ready_since is None:
             self.localization_ready_since = now
             return
-        if now-self.localization_ready_since < 1.0 or not self.nav_client.server_is_ready() or not self.planner_client.server_is_ready():
+        if now-self.localization_ready_since < 1.0 or not self._navigation_ready():
             return
         self.state = self.localization_resume_state
         self.failure_reason = ""
@@ -612,6 +653,15 @@ class CubeyFrontierExplorerNode(Node):
         elif self.state == "RETURNING_TO_DOCK":
             self._queue_reachable_dock_selection()
 
+    def _pause_for_navigation(self, reason):
+        self._pause_for_localization()
+        if self.state == "RECOVERING_LOCALIZATION":
+            self.state = "RECOVERING_NAVIGATION"
+            self.localization_deadline = time.monotonic()+20.0
+            self.failure_reason = reason
+            self._hold_motion()
+            self.get_logger().warn(reason)
+
     def _export_live_pose(self):
         pose = None
         healthy = self._sensors_ready() and self._pose_fresh()
@@ -620,7 +670,10 @@ class CubeyFrontierExplorerNode(Node):
         data = {"pose": pose, "pose_fresh": healthy, "home": list(self.start_pose) if self.home_captured else None,
                 "trajectory": self.trajectory, "imu_ok": self.odom_health.get("imu_ok", False),
                 "nav_state": self.state, "failure_reason": self.failure_reason or (self.odom_health.get("reason", "") if not healthy else ""),
-                "mission_id": self.mission_id, "timestamp": time.time()}
+                "mission_id": self.mission_id, "timestamp": time.time(),
+                "status_message": self._status_message(),
+                "navigation_nodes": self.navigation_health.snapshot(),
+                "navigation_ready": self._navigation_ready()}
         try:
             path = "/tmp/cubey_nav2_live_pose.json"
             with open(path+".tmp", "w") as stream:
@@ -1004,10 +1057,10 @@ class CubeyFrontierExplorerNode(Node):
             goal_handle = future.result()
         except Exception as error:
             self.get_logger().warn(f"Nav2 frontier plan request failed: {error}")
-            self._reject_planned_frontier(candidate, generation)
+            self._pause_for_navigation(f"Planner request failed: {error}")
             return
         if not goal_handle.accepted:
-            self._reject_planned_frontier(candidate, generation)
+            self._pause_for_navigation("Planner rejected request; waiting before retry")
             return
         self.active_plan_handle = goal_handle
         result_future = goal_handle.get_result_async()
@@ -1070,15 +1123,6 @@ class CubeyFrontierExplorerNode(Node):
         purpose: str = GOAL_FRONTIER,
     ):
         """Dispatches an action goal to Nav2 bt_navigator."""
-        if not self.nav_client.wait_for_server(timeout_sec=2.0):
-            self.get_logger().warn("Nav2 navigate_to_pose action server not yet ready.")
-            if purpose == self.GOAL_MANUAL:
-                self.state = "ERROR"
-            elif purpose == self.GOAL_RETURN:
-                self.get_logger().warn("Dock goal could not start; saving the map at the current safe position.")
-                self._initiate_map_finalization()
-            return
-
         goal_msg = NavigateToPose.Goal()
         goal_msg.pose = self._pose_stamped(self, target_x, target_y, target_yaw)
 
@@ -1091,6 +1135,10 @@ class CubeyFrontierExplorerNode(Node):
         self.nav_goal_generation += 1
         generation = self.nav_goal_generation
         self.active_goal_purpose = purpose
+
+        if not self._navigation_ready() or not self.nav_client.server_is_ready():
+            self._pause_for_navigation("Navigator is not active; waiting before dispatch")
+            return
 
         send_future = self.nav_client.send_goal_async(
             goal_msg,
@@ -1107,8 +1155,7 @@ class CubeyFrontierExplorerNode(Node):
             if generation != self.nav_goal_generation:
                 return
             self.get_logger().warn(f"Nav2 rejected {purpose} goal: {error}")
-            self._handle_goal_failure(purpose)
-            self._clear_current_goal(generation)
+            self._pause_for_navigation(f"Navigation request failed: {error}")
             return
 
         if generation != self.nav_goal_generation:
@@ -1120,8 +1167,11 @@ class CubeyFrontierExplorerNode(Node):
 
         if not goal_handle.accepted:
             self.get_logger().warn(f"Nav2 rejected {purpose} goal.")
-            self._handle_goal_failure(purpose)
-            self._clear_current_goal(generation)
+            # A rejected request never drove anywhere. Preserve the destination
+            # and do not blacklist the frontier or burn return attempts.
+            if purpose == self.GOAL_RETURN:
+                self.return_attempts = max(0, self.return_attempts-1)
+            self._pause_for_navigation(f"Nav2 rejected {purpose}; waiting before retry")
             return
 
         self.active_goal_handle = goal_handle
@@ -1405,6 +1455,9 @@ class CubeyFrontierExplorerNode(Node):
         self._update_robot_pose_from_tf()
         if self.state not in ("EXPLORING", "RETURNING_TO_DOCK"):
             return
+        if not self._navigation_ready():
+            self._pause_for_navigation("Navigation is not active; mission paused")
+            return
 
         if self.latest_map is None:
             self.get_logger().info("Waiting for initial /map from SLAM Toolbox...", throttle_duration_sec=5.0)
@@ -1542,7 +1595,7 @@ class CubeyFrontierExplorerNode(Node):
         self.get_logger().info("Saving checkpoint in background; return preparation does not wait for disk saving")
 
     def _on_pre_return_map_saved(self, future, generation=None) -> None:
-        if self.state not in ("RETURNING_TO_DOCK", "RECOVERING_LOCALIZATION") or (generation is not None and generation != self.mission_generation):
+        if self.state not in ("RETURNING_TO_DOCK", "RECOVERING_LOCALIZATION", "RECOVERING_NAVIGATION") or (generation is not None and generation != self.mission_generation):
             return
         try:
             if not future.result().result:
@@ -1584,10 +1637,8 @@ class CubeyFrontierExplorerNode(Node):
             return
         self.return_attempts += 1
         if not self.planner_client.wait_for_server(timeout_sec=1.0):
-            self.get_logger().warn(
-                "Nav2 planner unavailable for dock preflight; preserving the map and stopping."
-            )
-            self._initiate_map_finalization()
+            self.return_attempts -= 1
+            self._pause_for_navigation("Home planner unavailable; waiting before retry")
             return
         self.dock_plan_queue = self._dock_candidates()
         self.planning_dock = True
@@ -1648,7 +1699,8 @@ class CubeyFrontierExplorerNode(Node):
             goal_handle = future.result()
         except Exception as error:
             self.get_logger().warn(f"Nav2 dock plan request failed: {error}")
-            self._plan_next_dock_approach(generation)
+            self.return_attempts = max(0, self.return_attempts-1)
+            self._pause_for_navigation(f"Home planner request failed: {error}")
             return
         if not goal_handle.accepted:
             target_x, target_y, _ = candidate
@@ -1656,7 +1708,8 @@ class CubeyFrontierExplorerNode(Node):
                 f"Dock planner rejected candidate ({target_x:.2f},{target_y:.2f}) "
                 f"[{self._costmap_pose_diagnostic(target_x, target_y)}]."
             )
-            self._plan_next_dock_approach(generation)
+            self.return_attempts = max(0, self.return_attempts-1)
+            self._pause_for_navigation("Home planner rejected request; waiting before retry")
             return
         self.active_plan_handle = goal_handle
         result_future = goal_handle.get_result_async()
@@ -1824,7 +1877,9 @@ class CubeyFrontierExplorerNode(Node):
             "distance_remaining_m": dist_m, "frontiers_completed": self.total_frontiers_mapped,
             "mission_id": self.mission_id, "failure_reason": self.failure_reason,
             "imu_ok": self.odom_health.get("imu_ok", False),
-            "ready": self._sensors_ready() and self._pose_fresh(), "timestamp": time.time()})
+            "ready": self._localization_ready() and self._navigation_ready(),
+            "status_message": self._status_message(), "navigation_nodes": self.navigation_health.snapshot(),
+            "timestamp": time.time()})
 
         msg = String()
         msg.data = status_json

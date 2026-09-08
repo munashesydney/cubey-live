@@ -175,6 +175,8 @@ async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(
                 payload["pose_fresh"] = live_pose.get("pose_fresh", False)
                 payload["imu_ok"] = live_pose.get("imu_ok", False)
                 payload["home"] = live_pose.get("home")
+                payload["status_message"] = live_pose.get("status_message", "Navigation status unavailable — waiting for ROS heartbeat")
+                payload["navigation_nodes"] = live_pose.get("navigation_nodes", {})
                 if live_pose.get("timestamp"):
                     payload["pose"] = live_pose.get("pose")
                     payload["trajectory"] = live_pose.get("trajectory", [])

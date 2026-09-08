@@ -246,6 +246,7 @@ class Nav2IntegrationTests(unittest.TestCase):
 
     def test_active_goal_suspends_empty_frontier_completion_checks(self):
         explorer = object.__new__(CubeyFrontierExplorerNode)
+        explorer._navigation_ready = lambda: True
         explorer.state = "EXPLORING"
         explorer.latest_map = MagicMock()
         explorer.current_goal_coord = (2.0, 1.0)

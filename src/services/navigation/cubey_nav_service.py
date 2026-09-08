@@ -87,7 +87,7 @@ class CubeyNavService:
     @property
     def is_active(self) -> bool:
         with self._lock:
-            return self.telemetry.state in ("PREPARING", "RESETTING", "NAVIGATING", "EXPLORING", "RETURNING_TO_DOCK", "RECOVERING_STUCK", "RECOVERING_LOCALIZATION", "FINALIZING_MAP")
+            return self.telemetry.state in ("PREPARING", "RESETTING", "NAVIGATING", "EXPLORING", "RETURNING_TO_DOCK", "RECOVERING_STUCK", "RECOVERING_LOCALIZATION", "RECOVERING_NAVIGATION", "FINALIZING_MAP")
 
     @property
     def is_autonomous(self) -> bool:

@@ -192,7 +192,7 @@
     const navMode = data.nav_mode || "manual";
 
     lblActiveMapName.textContent = activeMapName;
-    const activeStates = ["PREPARING", "RESETTING", "EXPLORING", "NAVIGATING", "RETURNING_TO_DOCK", "RECOVERING_STUCK", "RECOVERING_LOCALIZATION", "FINALIZING_MAP"];
+    const activeStates = ["PREPARING", "RESETTING", "EXPLORING", "NAVIGATING", "RETURNING_TO_DOCK", "RECOVERING_STUCK", "RECOVERING_LOCALIZATION", "RECOVERING_NAVIGATION", "FINALIZING_MAP"];
     isMapping = activeStates.includes(navState) || (isMapping && navState === "MANUAL");
     if (isMapping) {
       pillStatus.classList.add("active");
@@ -220,7 +220,9 @@
       ERROR: data.failure_reason || "Mapping stopped: check sensors"
     };
     if (phaseLabels[navState]) lblMappingState.textContent = phaseLabels[navState];
-    lblMappingState.title = `IMU: ${data.imu_ok ? "live" : "unavailable"}`;
+    if (data.status_message) lblMappingState.textContent = data.status_message;
+    lblMappingState.title = `IMU: ${data.imu_ok ? "live" : "unavailable"}\n` +
+      Object.entries(data.navigation_nodes || {}).map(([name, state]) => `${name}: ${state}`).join("\n");
 
     if (data.battery_pct !== undefined) {
       lblBatteryPct.textContent = `${data.battery_pct}%`;

@@ -2,6 +2,7 @@
 """Measured IMU heading and laser translation. The EKF alone owns odom TF."""
 from __future__ import annotations
 import json
+from copy import deepcopy
 import math
 import numpy as np
 
@@ -200,7 +201,9 @@ class CubeyOdometryNode(Node):
                 self.y += s*dx+c*dy
                 self.position_variance += variance
                 odom = Odometry()
-                odom.header = msg.header
+                # ROS Python messages share nested objects on assignment. Keep
+                # the original laser frame when forwarding this scan to SLAM.
+                odom.header = deepcopy(msg.header)
                 odom.header.frame_id = "odom"
                 odom.child_frame_id = "base_link"
                 odom.pose.pose.position.x, odom.pose.pose.position.y = self.x, self.y

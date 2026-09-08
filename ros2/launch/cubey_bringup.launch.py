@@ -156,7 +156,9 @@ def generate_launch_description():
             name="lifecycle_manager_navigation",
             parameters=[{
                 "use_sim_time": use_sim_time,
-                "autostart": True,
+                # Explorer sequences lifecycle transitions after localization
+                # is available, including recovery after a cold boot/reset.
+                "autostart": False,
                 "bond_timeout": 0.0,
                 "node_names": lifecycle_nodes,
             }],

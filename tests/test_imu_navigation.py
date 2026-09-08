@@ -241,6 +241,27 @@ def test_slam_uses_gated_scan_topic():
     assert config["slam_toolbox"]["ros__parameters"]["scan_topic"] == "/scan/slam"
 
 
+def test_translation_publication_preserves_forwarded_laser_frame():
+    node = measurement_node()
+    node.laser_x = node.laser_y = node.laser_yaw = 0.
+    node._now.return_value = 100.1
+    node.history.add(100.1, 0.)
+    node.last_scan_time = 100.0
+    node.prev_points = np.ones((40, 2))
+    node.last_imu_time = node.filtered_stamp = 100.1
+    node.filtered_pose = (0., 0., 0.)
+    scan = NS(header=NS(stamp=NS(sec=100, nanosec=100_000_000), frame_id="laser"),
+              ranges=[1.]*40, angle_min=0., angle_increment=.1, range_min=.1, range_max=10.)
+    odom = NS(pose=NS(pose=NS(position=NS(), orientation=NS()), covariance=[0.]*36),
+              twist=NS(twist=NS(linear=NS()), covariance=[0.]*36))
+    with patch.object(odometry, "Odometry", return_value=odom, create=True), \
+         patch.object(odometry, "match_translation", return_value=(0., 0., .001)):
+        node._on_laser_scan(scan)
+    assert node.pub_translation.publish.call_args.args[0].header.frame_id == "odom"
+    assert node.pub_slam_scan.publish.call_args.args[0].header.frame_id == "laser"
+    assert scan.header.frame_id == "laser"
+
+
 def test_imu_restart_latches_fault_until_explicit_session_reset():
     node = measurement_node()
     node._on_imu_status(NS(data=json.dumps({"stream": [123, 1], "healthy": True})))
@@ -291,6 +312,12 @@ def test_bridge_blocks_stale_supervisor_and_old_autonomous_commands():
 
 def mission_node():
     node = object.__new__(CubeyFrontierExplorerNode)
+    node.navigation_health = MagicMock()
+    node.navigation_health.ready.return_value = True
+    node.navigation_health.reason.return_value = ""
+    node._sensors_ready = MagicMock(return_value=True)
+    node.latest_map = NS()
+    node.last_map_time = time.time()
     node.mission_generation = 7
     node.state = "RETURNING_TO_DOCK"
     node.start_pose = (1., 2., 0.5)
@@ -427,6 +454,34 @@ def test_stop_during_localization_wait_prevents_automatic_resume():
     node._stop_exploration()
     assert node.state == "IDLE"
     node._send_nav2_goal.assert_not_called()
+
+
+def test_rejected_navigation_goal_pauses_without_blacklisting_or_spending_attempt():
+    node = localization_wait_node()
+    node.state = "RETURNING_TO_DOCK"
+    node.nav_goal_generation = 5
+    node.return_attempts = 1
+    node._handle_goal_failure = MagicMock()
+    result = MagicMock()
+    result.result.return_value.accepted = False
+    node._on_goal_response(result, 5, node.GOAL_RETURN)
+    assert node.state == "RECOVERING_NAVIGATION"
+    assert node.return_attempts == 0
+    node._handle_goal_failure.assert_not_called()
+
+
+def test_inactive_navigation_cannot_exhaust_frontiers():
+    node = mission_node()
+    node.state = "EXPLORING"
+    node.navigation_health.ready.return_value = False
+    node._update_robot_pose_from_tf = MagicMock()
+    node._pause_for_navigation = MagicMock()
+    node._extract_frontiers = MagicMock()
+    node._trigger_auto_stop_sequence = MagicMock()
+    node._supervision_loop()
+    node._pause_for_navigation.assert_called_once()
+    node._extract_frontiers.assert_not_called()
+    node._trigger_auto_stop_sequence.assert_not_called()
 
 
 def test_checkpoint_save_tolerates_stale_localization_only_while_stopped():
