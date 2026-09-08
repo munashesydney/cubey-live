@@ -140,6 +140,29 @@ class HeadingHistory:
         return nearest[1] if abs(nearest[0]-stamp) <= tolerance else None
 
 
+def heading_jump_metrics(samples, stamp, heading):
+    """Bound both one-sample change and sustained turn rate with timing tolerance.
+
+    The 0.025 rad angle allowance absorbs approximately one report's timing
+    jitter; it is applied once across the window, not once per sample.
+    """
+    previous_stamp, previous = samples[-1]
+    dt = stamp-previous_stamp
+    delta = wrap(heading-previous)
+    window_stamp, window_heading = samples[0]
+    for candidate_stamp, candidate_heading in samples:
+        if candidate_stamp <= stamp-0.08:
+            window_stamp, window_heading = candidate_stamp, candidate_heading
+        else:
+            break
+    window_dt = stamp-window_stamp
+    window_delta = wrap(heading-window_heading)
+    allowance = 0.025
+    return {"pair_rate_rad_s": delta/dt, "window_rate_rad_s": window_delta/window_dt,
+            "window_interval_s": window_dt, "angle_allowance_rad": allowance,
+            "jump": abs(delta) > 4.0*dt+allowance or abs(window_delta) > 4.0*window_dt+allowance}
+
+
 def match_translation(previous, current, rotation, max_translation=0.2):
     """Robust point-to-plane translation with rotation supplied by the IMU.
 

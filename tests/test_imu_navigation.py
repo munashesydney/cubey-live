@@ -10,7 +10,7 @@ import pytest
 import yaml
 
 from ros2.nodes.imu_support import (ImuPacketClock, HeadingHistory, conjugate,
-    quaternion_multiply, quaternion_from_euler, match_translation, yaw, wrap)
+    quaternion_multiply, quaternion_from_euler, match_translation, yaw, wrap, heading_jump_metrics)
 from ros2.nodes import cubey_odometry_node as odometry
 from ros2.nodes import cubey_frontier_explorer_node as explorer_module
 from ros2.nodes.cubey_frontier_explorer_node import CubeyFrontierExplorerNode
@@ -110,6 +110,25 @@ def test_heading_interpolation_uses_short_path_through_pi():
     assert history.add(1.01, 0) is False
 
 
+def test_recorded_073044_heading_sequence_is_not_a_jump():
+    samples = [(0.8018434, -1.6342370522346763), (.8210404, -1.5991323628367224),
+               (.8422453, -1.5606895468862603), (.8683724, -1.5244113573763922),
+               (.8828423, -1.4872128802112097), (.9012413, -1.45026103489693),
+               (.9210503, -1.4118857426803344), (.9420505, -1.3744748752450286),
+               (.9691193, -1.3349005855618448), (.9927075, -1.2948358739170016)]
+    result = heading_jump_metrics(samples, 1.0012703, math.radians(-71.82350074730024))
+    assert result["pair_rate_rad_s"] > 4.
+    assert 1.5 < result["window_rate_rad_s"] < 2.5
+    assert not result["jump"]
+
+
+def test_sustained_excessive_turn_rate_is_not_hidden_by_pair_allowance():
+    samples = [(0., 0.), (.02, .09), (.04, .18), (.06, .27)]
+    assert heading_jump_metrics(samples, .08, .36)["jump"]
+    assert heading_jump_metrics([(0., 0.)], .02, .2)["jump"]
+    assert not heading_jump_metrics([(0., math.radians(179))], .02, math.radians(-179))["jump"]
+
+
 @pytest.mark.parametrize("mount_angles", [(0, 0, 0), (0, 0, math.pi), (0.2, -0.1, math.pi/2), (math.pi/2, 0, 0)])
 def test_full_mounting_rotation_preserves_left_turn_direction(mount_angles):
     mount = quaternion_from_euler(*mount_angles)
@@ -165,6 +184,7 @@ def measurement_node(now=100):
     node.imu_status_time = now
     node.pub_imu = MagicMock()
     node.pub_translation = MagicMock()
+    node.pub_slam_scan = MagicMock()
     node.get_logger = MagicMock(return_value=MagicMock())
     node._reset_state()
     return node
@@ -183,6 +203,42 @@ def test_heading_updates_with_no_motor_command_and_reset_changes_reference():
         node._now.return_value = 100.14
         node._on_imu(imu_message(100.14, 1.2))
         assert node.history.samples[-1][1] == pytest.approx(0)
+
+
+@pytest.mark.parametrize("fault", ["latched", "imu_stale", "translation_stale", "filter_stale", "filter_rotating", "filter_drifting", "imu_unhealthy"])
+def test_slam_scan_gate_blocks_invalid_localization_even_if_filter_keeps_publishing(fault):
+    node = measurement_node()
+    node._now.return_value = 100.1
+    node.last_imu_time = node.last_translation_time = node.filtered_stamp = 100.1
+    node.filtered_pose = (0., 0., 0.)
+    if fault == "latched": node.fault = "IMU heading jump"
+    if fault == "imu_stale": node.last_imu_time = 99.
+    if fault == "translation_stale": node.last_translation_time = 99.
+    if fault == "filter_stale": node.filtered_stamp = 99.
+    if fault == "filter_rotating": node.filtered_pose = (0., 0., 1.)
+    if fault == "filter_drifting": node.filtered_pose = (1., 0., 0.)
+    if fault == "imu_unhealthy": node.imu_healthy = False
+    node._forward_slam_scan(NS(), 0.)
+    node.pub_slam_scan.publish.assert_not_called()
+
+
+def test_slam_scan_gate_passes_measured_scans_and_closes_on_reset():
+    node = measurement_node()
+    node._now.return_value = 100.1
+    node.last_imu_time = node.last_translation_time = node.filtered_stamp = 100.1
+    node.filtered_pose = (0., 0., 0.)
+    scan = NS()
+    node._forward_slam_scan(scan, 0.)
+    node.pub_slam_scan.publish.assert_called_once_with(scan)
+    node._handle_reset_odometry(None, NS())
+    node._forward_slam_scan(scan, 0.)
+    assert node.pub_slam_scan.publish.call_count == 1
+
+
+def test_slam_uses_gated_scan_topic():
+    from pathlib import Path
+    config = yaml.safe_load(Path("ros2/config/slam_toolbox_params.yaml").read_text())
+    assert config["slam_toolbox"]["ros__parameters"]["scan_topic"] == "/scan/slam"
 
 
 def test_imu_restart_latches_fault_until_explicit_session_reset():

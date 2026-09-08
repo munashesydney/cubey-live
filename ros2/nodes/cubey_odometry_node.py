@@ -6,10 +6,10 @@ import math
 import numpy as np
 
 try:
-    from .imu_support import (HeadingHistory, conjugate, match_translation,
+    from .imu_support import (HeadingHistory, conjugate, match_translation, heading_jump_metrics,
                               quaternion_from_euler, quaternion_multiply, wrap, yaw)
 except ImportError:
-    from imu_support import (HeadingHistory, conjugate, match_translation,
+    from imu_support import (HeadingHistory, conjugate, match_translation, heading_jump_metrics,
                              quaternion_from_euler, quaternion_multiply, wrap, yaw)
 
 try:
@@ -43,6 +43,8 @@ class CubeyOdometryNode(Node):
         self._reset_state()
         self.pub_imu = self.create_publisher(Imu, "/imu/data", qos_profile_sensor_data)
         self.pub_translation = self.create_publisher(Odometry, "/odom/lidar", 10)
+        self.pub_slam_scan = self.create_publisher(LaserScan, "/scan/slam", qos_profile_sensor_data)
+        self.sub_filter = self.create_subscription(Odometry, "/odom", self._on_filtered_odom, qos_profile_sensor_data)
         self.pub_status = self.create_publisher(String, "/cubey/odometry_status", 10)
         self.sub_imu = self.create_subscription(Imu, "/imu/raw", self._on_imu, qos_profile_sensor_data)
         self.sub_imu_status = self.create_subscription(String, "/cubey/imu_status", self._on_imu_status, 10)
@@ -64,6 +66,29 @@ class CubeyOdometryNode(Node):
         self.prev_scan_yaw = 0.0
         self.x = self.y = self.wz = 0.0
         self.position_variance = 0.0001
+        self.filtered_pose = None
+        self.filtered_stamp = 0.0
+
+    def _on_filtered_odom(self, msg):
+        self.filtered_stamp = msg.header.stamp.sec+msg.header.stamp.nanosec/1e9
+        p, q = msg.pose.pose.position, msg.pose.pose.orientation
+        self.filtered_pose = (p.x, p.y, yaw((q.x, q.y, q.z, q.w)))
+
+    def _filter_consistent(self, heading):
+        if self.filtered_pose is None or self.filtered_stamp <= self.reset_time or not 0 <= self._now()-self.filtered_stamp <= 0.3:
+            return False
+        x, y, angle = self.filtered_pose
+        return math.hypot(x-self.x, y-self.y) <= 0.3 and abs(wrap(angle-heading)) <= math.radians(20)
+
+    def _forward_slam_scan(self, msg, heading):
+        # Raw scans still feed measured odometry and obstacle detection. SLAM
+        # only receives scans supported by current measurements and filtered pose.
+        now = self._now()
+        if (not self.fault and self.imu_healthy and 0 <= now-self.imu_status_time < 0.3
+                and 0 <= now-self.last_imu_time <= 0.2
+                and 0 <= now-self.last_translation_time <= 0.25
+                and self._filter_consistent(heading)):
+            self.pub_slam_scan.publish(msg)
 
     def _handle_reset_odometry(self, request, response):
         self._reset_state()
@@ -104,8 +129,9 @@ class CubeyOdometryNode(Node):
             dt = stamp-before
             if dt <= 0:
                 return
-            self.wz = wrap(heading-previous)/dt
-            if abs(self.wz) > 4.0:
+            metrics = heading_jump_metrics(list(self.history.samples), stamp, heading)
+            self.wz = metrics["window_rate_rad_s"]
+            if metrics["jump"]:
                 self.fault = "Implausible IMU heading jump; restart mapping"
                 self.get_logger().error("IMU_HEADING_JUMP " + json.dumps({
                     "previous_stamp": before, "sample_stamp": stamp,
@@ -113,7 +139,8 @@ class CubeyOdometryNode(Node):
                     "previous_heading_deg": math.degrees(previous),
                     "heading_deg": math.degrees(heading),
                     "delta_deg": math.degrees(wrap(heading-previous)),
-                    "rate_rad_s": self.wz, "limit_rad_s": 4.0,
+                    "rate_rad_s": metrics["pair_rate_rad_s"], "limit_rad_s": 4.0,
+                    "jump_metrics": metrics,
                     "previous_quaternion_xyzw": self.last_imu_quaternion,
                     "quaternion_xyzw": [q.x, q.y, q.z, q.w],
                     "mount_xyzw": self.mount, "stream": self.imu_stream,
@@ -188,6 +215,7 @@ class CubeyOdometryNode(Node):
                 odom.twist.covariance[0] = odom.twist.covariance[7] = variance/dt**2
                 self.pub_translation.publish(odom)
                 self.last_translation_time = stamp
+                self._forward_slam_scan(msg, heading)
         self.prev_points, self.prev_scan_yaw = points, heading
         self.last_scan_time = stamp
 
@@ -195,12 +223,14 @@ class CubeyOdometryNode(Node):
         now = self._now()
         imu_ok = self.imu_healthy and now-self.imu_status_time < 0.3 and 0 <= now-self.last_imu_time <= 0.2
         scan_ok = 0 <= now-self.last_translation_time <= 0.5
+        filter_ok = bool(self.history.samples and self._filter_consistent(self.history.samples[-1][1]))
         msg = String()
-        msg.data = json.dumps({"ready": bool(imu_ok and scan_ok and not self.fault),
+        msg.data = json.dumps({"ready": bool(imu_ok and scan_ok and filter_ok and not self.fault),
                                "imu_available": self.imu_healthy and now-self.imu_status_time < 0.3,
                                "imu_ok": imu_ok, "scan_ok": scan_ok,
+                               "filter_ok": filter_ok,
                                "fault": self.fault,
-                               "reason": self.fault or ("" if imu_ok and scan_ok else "Waiting for fresh IMU and observable LiDAR translation"),
+                               "reason": self.fault or ("Waiting for fresh IMU and observable LiDAR translation" if not (imu_ok and scan_ok) else ("" if filter_ok else "Waiting for filtered pose to agree with measurements")),
                                "reset_time": self.reset_time, "timestamp": now})
         self.pub_status.publish(msg)
 

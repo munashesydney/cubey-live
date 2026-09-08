@@ -169,3 +169,25 @@ Its success, failure, absent service, or unanswered request cannot change the
 return state. Localization readiness remains mandatory. Final saving still runs
 at home and reports failures explicitly. Local tests exercise all four checkpoint
 outcomes and verify the Nav2 SaveMap service contract.
+
+### Heading timing jitter and SLAM scan protection
+
+The 2026-09-08 07:30:44 diagnostic captured a 2.365-degree change across
+8.563 ms during an otherwise smooth turn. The pairwise derivative exceeded
+4 rad/s, causing a fault; afterward the EKF continued predicting roughly
+1.296 rad/s while motor telemetry was STOPPED. The map kept growing after the
+fault. The failed graph is preserved as imu_fault_20260908_073044.* on the Pi.
+
+The jump guard now checks both a single increment and an approximately 80 ms
+window against 4 rad/s with a single 0.025-radian timing allowance. The recorded
+sequence passes, while abrupt jumps and sustained excessive rates still fault.
+Diagnostics retain the pairwise rate and add the window rate and allowance.
+
+SLAM now subscribes only to /scan/slam. Measured odometry forwards each accepted
+scan only with fresh IMU/translation, no latched fault, and a fresh filtered pose
+within 30 cm and 20 degrees of the measured pose. Filter disagreement also marks
+localization not ready. Raw /scan remains available for odometry and obstacle
+detection. Thus EKF prediction during a sensor outage cannot by itself authorize
+new SLAM scans. Existing queued scans can still finish processing; previously
+corrupted map data is not repaired automatically. Reset/restart clears the scan
+gate until fresh measurements and filtered pose are established again.
