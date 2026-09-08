@@ -257,18 +257,17 @@ def test_failed_measurement_reset_never_resets_filter_or_starts_slam():
     node._hold_motion.assert_called()
 
 
-def test_saved_checkpoint_holds_until_localization_recovers():
+def test_saved_checkpoint_does_not_change_navigation_or_localization_state():
     node = mission_node()
     node.pre_return_map_base = "checkpoint"
     node._queue_reachable_dock_selection = MagicMock()
     result = MagicMock()
-    result.result.return_value.result = 0
+    result.result.return_value.result = True
     with patch.object(explorer_module, "SaveMap", NS(Response=NS(RESULT_SUCCESS=0)), create=True):
         node._on_pre_return_map_saved(result, 7)
     node._queue_reachable_dock_selection.assert_not_called()
     assert node.pre_return_map_saved
-    assert node.return_localization_pending
-    node._hold_motion.assert_called_once()
+    node._hold_motion.assert_not_called()
 
 
 def checkpoint_wait_node():
@@ -377,6 +376,35 @@ def test_checkpoint_recovery_requires_continuously_fresh_pose_before_return():
     node._safety_tick()
     node._queue_reachable_dock_selection.assert_called_once()
     assert not node.return_localization_pending
+
+
+@pytest.mark.parametrize("save_outcome", ["pending", "failed", "unavailable", "success"])
+def test_return_planning_proceeds_independently_of_checkpoint(save_outcome):
+    node = checkpoint_wait_node()
+    node.pre_return_map_base = "checkpoint"
+    node._pose_fresh.return_value = True
+    node.save_map_client = MagicMock()
+    node.save_map_client.service_is_ready.return_value = False
+    if save_outcome == "unavailable":
+        node._request_pre_return_map_save()
+    elif save_outcome != "pending":
+        response = MagicMock()
+        response.result.return_value.result = save_outcome == "success"
+        node._on_pre_return_map_saved(response, 7)
+    node._safety_tick()
+    node.return_ready_since = time.monotonic()-1
+    node._safety_tick()
+    node._queue_reachable_dock_selection.assert_called_once()
+    node._fail_mission.assert_not_called()
+    assert node.state == "RETURNING_TO_DOCK"
+
+
+def test_map_save_request_uses_persistent_nav2_service_fields():
+    with patch.object(explorer_module, "SaveMap", NS(Request=lambda: NS()), create=True):
+        req = CubeyFrontierExplorerNode._map_save_request("/maps/test")
+    assert req.map_topic == "/map"
+    assert req.map_url == "/maps/test"
+    assert (req.image_format, req.map_mode, req.free_thresh, req.occupied_thresh) == ("pgm", "trinary", .25, .65)
 
 
 @pytest.mark.parametrize("saved", [False, True])

@@ -331,7 +331,7 @@ class Nav2IntegrationTests(unittest.TestCase):
         explorer._request_pre_return_map_save = MagicMock()
         explorer._initiate_map_finalization = MagicMock()
         failed_response = MagicMock()
-        failed_response.result = 255
+        failed_response.result = False
         future = MagicMock()
         future.result.return_value = failed_response
         fake_save_map = MagicMock()
@@ -342,7 +342,7 @@ class Nav2IntegrationTests(unittest.TestCase):
         ):
             explorer._on_pre_return_map_saved(future)
 
-        explorer._request_pre_return_map_save.assert_called_once_with()
+        explorer._request_pre_return_map_save.assert_not_called()
         explorer._initiate_map_finalization.assert_not_called()
         self.assertFalse(explorer.pre_return_map_saved)
 

@@ -44,7 +44,8 @@ try:
     from std_srvs.srv import Trigger
     from nav2_msgs.action import BackUp, ComputePathToPose, NavigateToPose
     from action_msgs.msg import GoalStatus
-    from slam_toolbox.srv import Reset, SaveMap, SerializePoseGraph
+    from slam_toolbox.srv import Reset, SerializePoseGraph
+    from nav2_msgs.srv import SaveMap
     from robot_localization.srv import SetPose
     from tf2_ros import Buffer, TransformException, TransformListener
 except ImportError as e:
@@ -219,7 +220,7 @@ class CubeyFrontierExplorerNode(Node):
         self.reset_filter_client = self.create_client(SetPose, "/set_pose")
         self.serialize_client = self.create_client(SerializePoseGraph, "/slam_toolbox/serialize_map")
         self.reset_slam_client = self.create_client(Reset, "/slam_toolbox/reset")
-        self.save_map_client = self.create_client(SaveMap, "/slam_toolbox/save_map")
+        self.save_map_client = self.create_client(SaveMap, "/map_saver/save_map")
         self.reset_odom_client = self.create_client(Trigger, "/cubey/reset_odometry")
 
         # Main supervision timer (e.g. 1-2 Hz)
@@ -504,13 +505,13 @@ class CubeyFrontierExplorerNode(Node):
             self._export_live_pose()
             return
         active = self.state in ("EXPLORING", "NAVIGATING", "RETURNING_TO_DOCK", "RECOVERING_STUCK")
-        if self.state == "RETURNING_TO_DOCK" and (not self.pre_return_map_saved or getattr(self, "return_localization_pending", False)):
-            # SLAM's save service can delay its TF/scan callbacks. No navigation
-            # is allowed during this bounded, stationary save/relocalize phase.
+        if self.state == "RETURNING_TO_DOCK" and getattr(self, "return_localization_pending", False):
+            # Hold before return until localization is stable. Background saving
+            # neither authorizes nor blocks navigation.
             self._hold_motion()
             if now > self.operation_deadline:
-                self._fail_mission("Map save or post-save localization timed out; robot stopped")
-            elif self.pre_return_map_saved:
+                self._fail_mission("Return preparation timed out waiting for healthy localization; robot stopped")
+            else:
                 if ready and now-self.last_map_time <= 5.0:
                     if self.return_ready_since is None:
                         self.return_ready_since = time.monotonic()
@@ -527,8 +528,7 @@ class CubeyFrontierExplorerNode(Node):
             return
         if ready:
             self.last_valid_pose = self.robot_pose
-        if (self.state == "FINALIZING_MAP" or
-                (self.state == "RETURNING_TO_DOCK" and not self.pre_return_map_saved)) and now > self.operation_deadline:
+        if self.state == "FINALIZING_MAP" and now > self.operation_deadline:
             self._fail_mission("Map save operation timed out; robot stopped")
         if self.awaiting_home_settle:
             self._hold_motion()
@@ -1494,7 +1494,7 @@ class CubeyFrontierExplorerNode(Node):
     # ------------------------------------------------------------------
 
     def _trigger_auto_stop_sequence(self):
-        """Save a checkpoint and return with live SLAM correction."""
+        """Start background checkpoint saving and prepare a localized return."""
         self.get_logger().info("=========================================================")
         self.get_logger().info("🎉 ALL ACCESSIBLE FRONTIERS FULLY EXPLORED!")
         self.get_logger().info("🤖 Phase 1: Initiating Return-to-Dock Sequence.")
@@ -1517,61 +1517,41 @@ class CubeyFrontierExplorerNode(Node):
         self.pre_return_save_attempts = 0
         self._request_pre_return_map_save()
 
+    @staticmethod
+    def _map_save_request(path):
+        request = SaveMap.Request()
+        request.map_topic = "/map"
+        request.map_url = path
+        request.image_format = "pgm"
+        request.map_mode = "trinary"
+        request.free_thresh = 0.25
+        request.occupied_thresh = 0.65
+        return request
+
     def _request_pre_return_map_save(self) -> None:
         if self.state != "RETURNING_TO_DOCK":
             return
-        if not self.save_map_client.wait_for_service(timeout_sec=2.0):
-            self.get_logger().error(
-                "SLAM save_map service unavailable; stopping before return so the live map is not damaged."
-            )
-            self._initiate_map_finalization()
+        if not self.save_map_client.service_is_ready():
+            self.get_logger().warn("Checkpoint saver unavailable; return continues and final save will be attempted")
             return
-
-        request = SaveMap.Request()
-        request.name.data = self.pre_return_map_base
+        request = self._map_save_request(self.pre_return_map_base)
         self.pre_return_save_attempts += 1
-        save_future = self.save_map_client.call_async(request)
         generation = self.mission_generation
+        save_future = self.save_map_client.call_async(request)
         save_future.add_done_callback(lambda f: self._on_pre_return_map_saved(f, generation))
-        self.get_logger().info(
-            f"Saving completed map before return-to-dock "
-            f"(attempt {self.pre_return_save_attempts}/2)."
-        )
+        self.get_logger().info("Saving checkpoint in background; return preparation does not wait for disk saving")
 
     def _on_pre_return_map_saved(self, future, generation=None) -> None:
-        if self.state != "RETURNING_TO_DOCK" or (generation is not None and generation != self.mission_generation):
+        if self.state not in ("RETURNING_TO_DOCK", "RECOVERING_LOCALIZATION") or (generation is not None and generation != self.mission_generation):
             return
-        save_error: Optional[str] = None
         try:
-            response = future.result()
-            if response.result != SaveMap.Response.RESULT_SUCCESS:
-                save_error = f"SLAM Toolbox result code {response.result}"
+            if not future.result().result:
+                raise RuntimeError("Map saver did not receive/write the map")
         except Exception as error:
-            save_error = str(error)
-
-        if save_error:
-            if self.pre_return_save_attempts < 2:
-                self.get_logger().warn(
-                    f"Completed-map save was temporarily unavailable ({save_error}); retrying once."
-                )
-                self._request_pre_return_map_save()
-                return
-            self.get_logger().error(
-                f"Could not save completed map before return after two attempts "
-                f"({save_error}); stopping safely."
-            )
-            self._initiate_map_finalization()
+            self.get_logger().warn(f"Checkpoint save failed ({error}); return continues, final save remains scheduled")
             return
-
         self.pre_return_map_saved = True
-        self.map_save_succeeded = True
-        self.get_logger().info(
-            f"💾 Completed map safely saved before return: {self.pre_return_map_base}"
-        )
-        self.return_localization_pending = True
-        self.return_ready_since = None
-        self.operation_deadline = time.time()+10.0
-        self._hold_motion()
+        self.get_logger().info(f"Checkpoint saved: {self.pre_return_map_base}")
 
     def _dock_candidates(self) -> List[Tuple[float, float, float]]:
         """Return exact dock first, followed by nearby approach poses."""
@@ -1646,6 +1626,7 @@ class CubeyFrontierExplorerNode(Node):
                     "No Nav2-reachable dock approach after one safe escape attempt; "
                     "preserving the map and stopping."
                 )
+                self.failure_reason = "Nav2 could not plan a path home after recovery"
                 self._initiate_map_finalization()
             return
 
@@ -1768,12 +1749,10 @@ class CubeyFrontierExplorerNode(Node):
 
     def _save_final_map(self, final_map_base: str):
         if not self.save_map_client.wait_for_service(timeout_sec=2.0):
-            self.get_logger().error("SLAM save_map service unavailable; map remains available live but was not written to disk.")
-            self.state = "ERROR"
+            self._fail_mission("Final map saver unavailable; live map has not been written to disk")
             return
 
-        request = SaveMap.Request()
-        request.name.data = final_map_base
+        request = self._map_save_request(final_map_base)
         save_future = self.save_map_client.call_async(request)
         generation = self.mission_generation
         save_future.add_done_callback(lambda future: self._on_map_saved(future, final_map_base, generation))
@@ -1783,9 +1762,9 @@ class CubeyFrontierExplorerNode(Node):
             return
         try:
             response = future.result()
-            if response.result == SaveMap.Response.RESULT_SUCCESS:
+            if response.result is True:
                 self.map_save_succeeded = True
-                self.get_logger().info(f"💾 Map saved via SLAM Toolbox to: {final_map_base}")
+                self.get_logger().info(f"Map saved via persistent Nav2 saver to: {final_map_base}")
                 if not self.serialize_client.service_is_ready():
                     self._fail_mission("Occupancy map saved, but SLAM graph serialization is unavailable")
                     return
@@ -1795,11 +1774,9 @@ class CubeyFrontierExplorerNode(Node):
                 current = self.mission_generation
                 operation.add_done_callback(lambda f: self._on_graph_saved(f, current))
             else:
-                self.get_logger().error(f"SLAM Toolbox map save failed with result code {response.result}.")
-                self.state = "ERROR"
+                self._fail_mission("Final map save failed; live map remains available")
         except Exception as e:
-            self.get_logger().error(f"SLAM Toolbox map save failed: {e}")
-            self.state = "ERROR"
+            self._fail_mission(f"Final map save failed: {e}")
 
     def _on_graph_saved(self, future, generation):
         if generation != self.mission_generation or self.state != "FINALIZING_MAP":

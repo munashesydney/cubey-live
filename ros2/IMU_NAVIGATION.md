@@ -154,3 +154,18 @@ change, recovery timeout, or fourth interruption within 60 seconds ends the
 mission stopped. Stop/Reset invalidates recovery through the mission state.
 The web shows the paused recovery phase. These paths are covered by local tests;
 no automatic-resume driving test has been performed on the robot.
+
+### Persistent saving independent of return navigation
+
+The 19:21 mission completed exploration but the SLAM-triggered map_saver_cli
+twice timed out after two seconds waiting for map data. Its fallback final save
+then succeeded. No return drive was attempted. A stationary ComputePathToPose
+diagnostic subsequently found a 159-point route to the actual recorded home.
+
+Map saving now uses a lifecycle-managed nav2_map_server/map_saver_server with
+an eight-second timeout and transient-local subscription to /map. Checkpoint
+saving runs asynchronously and is no longer a prerequisite for return planning.
+Its success, failure, absent service, or unanswered request cannot change the
+return state. Localization readiness remains mandatory. Final saving still runs
+at home and reports failures explicitly. Local tests exercise all four checkpoint
+outcomes and verify the Nav2 SaveMap service contract.
