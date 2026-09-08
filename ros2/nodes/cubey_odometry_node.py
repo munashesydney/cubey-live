@@ -56,6 +56,8 @@ class CubeyOdometryNode(Node):
     def _reset_state(self):
         self.reset_time = self._now()
         self.heading_reference = None
+        self.last_imu_quaternion = None
+        self.imu_transport_status = {}
         self.history = HeadingHistory()
         self.last_imu_time = self.last_scan_time = self.last_translation_time = 0.0
         self.prev_points = None
@@ -76,7 +78,11 @@ class CubeyOdometryNode(Node):
             stream = data.get("stream")
             if self.imu_stream is not None and stream != self.imu_stream:
                 self.fault = "IMU or system clock restarted; reset mapping before continuing"
+                self.get_logger().error("IMU_STREAM_CHANGED " + json.dumps({
+                    "previous_stream": self.imu_stream, "new_stream": stream,
+                    "received_at": self._now(), "transport_status": data}))
                 self.prev_points = None
+            self.imu_transport_status = data
             self.imu_stream = stream
             self.imu_healthy = data.get("healthy") is True
             self.imu_status_time = self._now()
@@ -101,10 +107,30 @@ class CubeyOdometryNode(Node):
             self.wz = wrap(heading-previous)/dt
             if abs(self.wz) > 4.0:
                 self.fault = "Implausible IMU heading jump; restart mapping"
+                self.get_logger().error("IMU_HEADING_JUMP " + json.dumps({
+                    "previous_stamp": before, "sample_stamp": stamp,
+                    "interval_s": dt, "sample_age_s": self._now()-stamp,
+                    "previous_heading_deg": math.degrees(previous),
+                    "heading_deg": math.degrees(heading),
+                    "delta_deg": math.degrees(wrap(heading-previous)),
+                    "rate_rad_s": self.wz, "limit_rad_s": 4.0,
+                    "previous_quaternion_xyzw": self.last_imu_quaternion,
+                    "quaternion_xyzw": [q.x, q.y, q.z, q.w],
+                    "mount_xyzw": self.mount, "stream": self.imu_stream,
+                    "reset_time": self.reset_time,
+                    "scan_age_s": self._now()-self.last_scan_time,
+                    "translation_age_s": self._now()-self.last_translation_time,
+                    "recent_accepted_headings": list(self.history.samples)[-10:],
+                    # This is the most recently received status, not necessarily
+                    # the transport packet corresponding to this quaternion.
+                    "latest_transport_status": self.imu_transport_status,
+                    "transport_status_age_s": self._now()-self.imu_status_time,
+                }))
                 return
         if not self.history.add(stamp, heading):
             return
         self.last_imu_time = stamp
+        self.last_imu_quaternion = [q.x, q.y, q.z, q.w]
         planar = Imu()
         planar.header = msg.header
         planar.header.frame_id = "base_link"  # Mounting already applied above.

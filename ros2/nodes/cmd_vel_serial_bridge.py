@@ -325,6 +325,9 @@ class CmdVelSerialBridgeNode(Node):
         status = String()
         status.data = json.dumps({"healthy": bool(sample and 0 <= age <= 0.2 and not self.imu_clock.reason),
                                   "age_s": age, "stream": (*self.imu_clock.stream, self.imu_clock.host_clock_generation) if self.imu_clock.stream else None,
+                                  "sequence": self.imu_clock.sequence, "sensor_us": self.imu_clock.sensor_us,
+                                  "last_published_stamp": sample.stamp if sample else None,
+                                  "calibration": sample.calibration if sample else None,
                                   "reason": self.imu_clock.reason, "timestamp": now})
         self.pub_imu_status.publish(status)
 

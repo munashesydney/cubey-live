@@ -165,6 +165,7 @@ def measurement_node(now=100):
     node.imu_status_time = now
     node.pub_imu = MagicMock()
     node.pub_translation = MagicMock()
+    node.get_logger = MagicMock(return_value=MagicMock())
     node._reset_state()
     return node
 
@@ -194,6 +195,28 @@ def test_imu_restart_latches_fault_until_explicit_session_reset():
     response = node._handle_reset_odometry(None, NS())
     assert response.success
     assert not node.fault
+
+
+def test_heading_jump_logs_measurements_once_and_keeps_existing_stop_threshold():
+    node = measurement_node()
+    with patch.object(odometry, "Imu", side_effect=lambda: imu_message(0, 0), create=True):
+        node._now.return_value = 100.02
+        node._on_imu(imu_message(100.02, 1.0))
+        node._now.return_value = 100.05
+        node._on_imu(imu_message(100.04, 1.2))
+        node._on_imu(imu_message(100.06, 1.3))
+    node.get_logger().error.assert_called_once()
+    message = node.get_logger().error.call_args.args[0]
+    assert message.startswith("IMU_HEADING_JUMP ")
+    diagnostic = json.loads(message.split(" ", 1)[1])
+    assert diagnostic["interval_s"] == pytest.approx(.02)
+    assert diagnostic["rate_rad_s"] == pytest.approx(10.)
+    assert diagnostic["sample_age_s"] == pytest.approx(.01)
+    assert diagnostic["limit_rad_s"] == 4.
+    assert len(diagnostic["recent_accepted_headings"]) == 1
+    assert diagnostic["previous_quaternion_xyzw"] is not None
+    assert node.fault
+    assert node.pub_imu.publish.call_count == 1
 
 
 def test_bridge_blocks_stale_supervisor_and_old_autonomous_commands():
