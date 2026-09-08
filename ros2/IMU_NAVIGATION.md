@@ -116,3 +116,23 @@ HTTP 200 in 2.48 seconds. Pose was within 3 mm of the origin, IMU healthy, state
 IDLE, and motors STOPPED. Local verification passed 88 targeted tests, including
 forward/backward host-clock steps, retained backlog rejection, and reset request
 matching; JavaScript syntax validation also passed. No mapping was started.
+
+### First operator-driven mapping mission: checkpoint transition
+
+Mission 8db74039-b9d6-45ab-8b04-7235aae8114a reached six frontier goals and
+completed exploration. It entered return preparation at 17:31:32, requesting
+the checkpoint save. The generic localization watchdog aborted at 17:31:33;
+the save completed successfully at 17:31:34. No home navigation goal was sent.
+The logs indicate a transient localization delay during saving; the previous
+generic error did not record which freshness threshold tripped.
+
+Checkpoint saving now holds motion throughout its bounded 20-second operation.
+After success, the supervisor waits up to 10 seconds for healthy sensors, fresh
+TF/odometry and map, requiring 0.75 seconds of continuous readiness before
+planning home. Moving-state freshness checks remain enforced. Future freshness
+failures include TF, odometry and map ages. Tests cover delayed save localization,
+interrupted recovery, timeout, and no premature return dispatch.
+
+The original checkpoint PGM/YAML, serialized pose graph/data, and diagnostic
+home/pose metadata are preserved on the Pi under
+data/maps/cubey_floorplan_20260907_173132_checkpoint.*.

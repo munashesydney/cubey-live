@@ -304,6 +304,7 @@ class Nav2IntegrationTests(unittest.TestCase):
         explorer.pause_slam_client = MagicMock()
         explorer.get_logger = MagicMock(return_value=MagicMock())
         explorer._cancel_active_nav_goal = MagicMock()
+        explorer._hold_motion = MagicMock()
         fake_save_map = MagicMock()
         fake_save_map.Request.return_value = MagicMock()
 
@@ -318,6 +319,7 @@ class Nav2IntegrationTests(unittest.TestCase):
             fake_save_map.Request.return_value
         )
         explorer.pause_slam_client.wait_for_service.assert_not_called()
+        explorer._hold_motion.assert_called_once()
         self.assertEqual(explorer.state, "RETURNING_TO_DOCK")
 
     def test_transient_pre_return_map_save_failure_retries_without_stopping(self):

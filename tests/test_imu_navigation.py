@@ -257,7 +257,7 @@ def test_failed_measurement_reset_never_resets_filter_or_starts_slam():
     node._hold_motion.assert_called()
 
 
-def test_saved_checkpoint_starts_return_without_pausing_slam():
+def test_saved_checkpoint_holds_until_localization_recovers():
     node = mission_node()
     node.pre_return_map_base = "checkpoint"
     node._queue_reachable_dock_selection = MagicMock()
@@ -265,8 +265,65 @@ def test_saved_checkpoint_starts_return_without_pausing_slam():
     result.result.return_value.result = 0
     with patch.object(explorer_module, "SaveMap", NS(Response=NS(RESULT_SUCCESS=0)), create=True):
         node._on_pre_return_map_saved(result, 7)
-    node._queue_reachable_dock_selection.assert_called_once()
+    node._queue_reachable_dock_selection.assert_not_called()
     assert node.pre_return_map_saved
+    assert node.return_localization_pending
+    node._hold_motion.assert_called_once()
+
+
+def checkpoint_wait_node():
+    node = mission_node()
+    node.pre_return_map_saved = False
+    node.return_localization_pending = True
+    node.return_ready_since = None
+    node.operation_deadline = time.time()+20
+    node.last_map_time = time.time()
+    node._update_robot_pose_from_tf = MagicMock()
+    node._sensors_ready = MagicMock(return_value=True)
+    node._pose_fresh.return_value = False
+    node._export_live_pose = MagicMock()
+    node._queue_reachable_dock_selection = MagicMock()
+    node._fail_mission = MagicMock()
+    return node
+
+
+def test_checkpoint_save_tolerates_stale_localization_only_while_stopped():
+    node = checkpoint_wait_node()
+    node._safety_tick()
+    node._hold_motion.assert_called_once()
+    node._fail_mission.assert_not_called()
+    node._queue_reachable_dock_selection.assert_not_called()
+
+
+def test_checkpoint_recovery_requires_continuously_fresh_pose_before_return():
+    node = checkpoint_wait_node()
+    node.pre_return_map_saved = True
+    node._safety_tick()
+    node._queue_reachable_dock_selection.assert_not_called()
+    node._pose_fresh.return_value = True
+    node._safety_tick()
+    node._queue_reachable_dock_selection.assert_not_called()
+    node.return_ready_since = time.monotonic()-1
+    node._pose_fresh.return_value = False
+    node._safety_tick()
+    assert node.return_ready_since is None
+    node._pose_fresh.return_value = True
+    node._safety_tick()
+    node.return_ready_since = time.monotonic()-1
+    node._safety_tick()
+    node._queue_reachable_dock_selection.assert_called_once()
+    assert not node.return_localization_pending
+
+
+@pytest.mark.parametrize("saved", [False, True])
+def test_checkpoint_save_and_localization_wait_are_bounded(saved):
+    node = checkpoint_wait_node()
+    node.pre_return_map_saved = saved
+    node.operation_deadline = time.time()-1
+    node._safety_tick()
+    node._fail_mission.assert_called_once()
+    node._hold_motion.assert_called_once()
+    node._queue_reachable_dock_selection.assert_not_called()
 
 
 def test_old_checkpoint_callback_cannot_start_a_new_missions_return():

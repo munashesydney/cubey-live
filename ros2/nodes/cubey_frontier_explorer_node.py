@@ -496,8 +496,28 @@ class CubeyFrontierExplorerNode(Node):
             self._export_live_pose()
             return
         active = self.state in ("EXPLORING", "NAVIGATING", "RETURNING_TO_DOCK", "RECOVERING_STUCK")
+        if self.state == "RETURNING_TO_DOCK" and (not self.pre_return_map_saved or getattr(self, "return_localization_pending", False)):
+            # SLAM's save service can delay its TF/scan callbacks. No navigation
+            # is allowed during this bounded, stationary save/relocalize phase.
+            self._hold_motion()
+            if now > self.operation_deadline:
+                self._fail_mission("Map save or post-save localization timed out; robot stopped")
+            elif self.pre_return_map_saved:
+                if ready and now-self.last_map_time <= 5.0:
+                    if self.return_ready_since is None:
+                        self.return_ready_since = time.monotonic()
+                    elif time.monotonic()-self.return_ready_since >= 0.75:
+                        self.return_localization_pending = False
+                        self._queue_reachable_dock_selection()
+                else:
+                    self.return_ready_since = None
+            self._export_live_pose()
+            return
         if active and (not ready or now-self.last_map_time > 5.0):
-            self._fail_mission(self.odom_health.get("reason") or "Localization or map became stale")
+            ros_now = self.get_clock().now().nanoseconds/1e9
+            self._fail_mission(self.odom_health.get("reason") or
+                               f"Localization or map became stale (TF age={ros_now-self.pose_stamp:.2f}s, "
+                               f"odometry age={ros_now-self.odom_stamp:.2f}s, map age={now-self.last_map_time:.2f}s)")
         if (self.state == "FINALIZING_MAP" or
                 (self.state == "RETURNING_TO_DOCK" and not self.pre_return_map_saved)) and now > self.operation_deadline:
             self._fail_mission("Map save operation timed out; robot stopped")
@@ -1410,6 +1430,10 @@ class CubeyFrontierExplorerNode(Node):
         self._cancel_active_nav_goal()
         self.state = "RETURNING_TO_DOCK"
         self.operation_deadline = time.time()+20.0
+        self.pre_return_map_saved = False
+        self.return_localization_pending = True
+        self.return_ready_since = None
+        self._hold_motion()
         self.dock_escape_attempted = False
 
         os.makedirs(self.map_save_dir, exist_ok=True)
@@ -1471,7 +1495,10 @@ class CubeyFrontierExplorerNode(Node):
         self.get_logger().info(
             f"💾 Completed map safely saved before return: {self.pre_return_map_base}"
         )
-        self._queue_reachable_dock_selection()
+        self.return_localization_pending = True
+        self.return_ready_since = None
+        self.operation_deadline = time.time()+10.0
+        self._hold_motion()
 
     def _dock_candidates(self) -> List[Tuple[float, float, float]]:
         """Return exact dock first, followed by nearby approach poses."""
