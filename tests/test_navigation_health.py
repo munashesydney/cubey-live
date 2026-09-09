@@ -47,6 +47,7 @@ def test_cold_start_waits_for_localization_then_activates_every_component():
             clock.return_value = tick
             health.tick()
         assert not health.ready()
+        assert ("slam_toolbox", 3) in calls
         assert ("controller_server", 3) not in calls
         localized[0] = True
         for tick in range(20, 60):
@@ -79,3 +80,12 @@ def test_unavailable_services_never_report_ready_or_attempt_activation():
     assert not health.ready()
     assert "unavailable" in health.reason()
     assert calls == []
+
+
+def test_supervisor_covers_every_launched_lifecycle_node():
+    import ast
+    module = load_health()
+    tree = ast.parse(Path("ros2/launch/cubey_bringup.launch.py").read_text())
+    assignment = next(n for n in ast.walk(tree) if isinstance(n, ast.Assign)
+                      and any(isinstance(t, ast.Name) and t.id == "lifecycle_nodes" for t in n.targets))
+    assert list(module.NavigationHealth.NODES) == ast.literal_eval(assignment.value)

@@ -5,7 +5,7 @@ from lifecycle_msgs.srv import ChangeState, GetState
 
 
 class NavigationHealth:
-    NODES = ("map_saver", "controller_server", "planner_server", "behavior_server", "bt_navigator")
+    NODES = ("slam_toolbox", "map_saver", "controller_server", "planner_server", "behavior_server", "bt_navigator")
 
     def __init__(self, node, localization_ready):
         self.node = node
@@ -86,7 +86,7 @@ class NavigationHealth:
                 return
             # Configuration is harmless before a map exists. Activation of
             # navigation waits for real map/odom TF; the saver needs no TF.
-            if state == "inactive" and name != "map_saver" and not self.localization_ready():
+            if state == "inactive" and name not in ("slam_toolbox", "map_saver") and not self.localization_ready():
                 return
             key = (name, state)
             if self.attempts.get(key, 0) >= 3:
