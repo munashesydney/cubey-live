@@ -29,6 +29,7 @@ def generate_launch_description():
 
     lifecycle_nodes = [
         "slam_toolbox",
+        "map_saver",
         "controller_server",
         "planner_server",
         "behavior_server",
@@ -36,6 +37,9 @@ def generate_launch_description():
     ]
 
     return LaunchDescription([
+        DeclareLaunchArgument("imu_mount_roll", default_value="0.0", description="Measured base_link to IMU roll, radians"),
+        DeclareLaunchArgument("imu_mount_pitch", default_value="0.0", description="Measured base_link to IMU pitch, radians"),
+        DeclareLaunchArgument("imu_mount_yaw", default_value="0.0", description="Measured base_link to IMU yaw, radians"),
         # Set unbuffered output
         SetEnvironmentVariable("RCUTILS_LOGGING_BUFFERED_STREAM", "0"),
         SetEnvironmentVariable("RCUTILS_COLORIZED_OUTPUT", "1"),
@@ -71,18 +75,17 @@ def generate_launch_description():
         ),
 
         # -----------------------------------------------------------------
-        # 3. 2D Laser & Command Odometry (Cubey Odometry Node)
-        # Publishes /odom & (odom -> base_link TF)
+        # 3. Measured IMU heading and laser translation; EKF owns odom TF.
         # -----------------------------------------------------------------
         Node(
             executable=sys.executable,
             arguments=["-u", odom_script],
             name="cubey_odometry_node",
             parameters=[{
-                "odom_frame": "odom",
-                "base_frame": "base_link",
-                "publish_tf": True,
-                "freq": 15.0,
+                "imu_mount_roll": LaunchConfiguration("imu_mount_roll"),
+                "imu_mount_pitch": LaunchConfiguration("imu_mount_pitch"),
+                "imu_mount_yaw": LaunchConfiguration("imu_mount_yaw"),
+                "use_sim_time": use_sim_time,
             }],
             output="screen",
         ),
@@ -97,6 +100,14 @@ def generate_launch_description():
             parameters=[slam_params_file, {"use_sim_time": use_sim_time}],
             output="screen",
         ),
+        Node(package="robot_localization", executable="ekf_node", name="ekf_filter_node",
+             parameters=[str(config_dir / "ekf_params.yaml"), {"use_sim_time": use_sim_time}],
+             remappings=[("odometry/filtered", "/odom")], output="screen"),
+        Node(package="tf2_ros", executable="static_transform_publisher", name="base_link_to_imu",
+             arguments=["--frame-id", "base_link", "--child-frame-id", "imu_link",
+                        "--roll", LaunchConfiguration("imu_mount_roll"),
+                        "--pitch", LaunchConfiguration("imu_mount_pitch"),
+                        "--yaw", LaunchConfiguration("imu_mount_yaw")], output="screen"),
 
         # -----------------------------------------------------------------
         # 5. Nav2 Navigation Stack
@@ -131,12 +142,23 @@ def generate_launch_description():
             output="screen",
         ),
         Node(
+            package="nav2_map_server",
+            executable="map_saver_server",
+            name="map_saver",
+            parameters=[{"use_sim_time": use_sim_time, "save_map_timeout": 8.0,
+                         "map_subscribe_transient_local": True,
+                         "free_thresh_default": 0.25, "occupied_thresh_default": 0.65}],
+            output="screen",
+        ),
+        Node(
             package="nav2_lifecycle_manager",
             executable="lifecycle_manager",
             name="lifecycle_manager_navigation",
             parameters=[{
                 "use_sim_time": use_sim_time,
-                "autostart": True,
+                # Explorer sequences lifecycle transitions after localization
+                # is available, including recovery after a cold boot/reset.
+                "autostart": False,
                 "bond_timeout": 0.0,
                 "node_names": lifecycle_nodes,
             }],

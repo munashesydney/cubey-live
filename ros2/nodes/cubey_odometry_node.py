@@ -1,326 +1,241 @@
 #!/usr/bin/env python3
-"""
-2D LiDAR Scan-Matching & Command Odometry Node for Cubey Robot.
-
-Generates continuous /odom topic and 'odom' -> 'base_footprint' coordinate transform
-by fusing 2D laser scan matching with open-loop velocity commands.
-Compensates for the absence of hardware wheel encoders and IMU.
-"""
-
+"""Measured IMU heading and laser translation. The EKF alone owns odom TF."""
 from __future__ import annotations
-
+import json
+from copy import deepcopy
 import math
-import sys
-from typing import List, Optional, Tuple
-
 import numpy as np
+
+try:
+    from .imu_support import (HeadingHistory, conjugate, match_translation, heading_jump_metrics,
+                              quaternion_from_euler, quaternion_multiply, wrap, yaw)
+except ImportError:
+    from imu_support import (HeadingHistory, conjugate, match_translation, heading_jump_metrics,
+                             quaternion_from_euler, quaternion_multiply, wrap, yaw)
 
 try:
     import rclpy
     from rclpy.node import Node
-    from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
-    from sensor_msgs.msg import LaserScan
-    from geometry_msgs.msg import Twist, TransformStamped
+    from rclpy.qos import qos_profile_sensor_data
+    from sensor_msgs.msg import Imu, LaserScan
     from nav_msgs.msg import Odometry
+    from std_msgs.msg import String
     from std_srvs.srv import Trigger
-    from tf2_ros import TransformBroadcaster
 except ImportError:
-    print("Warning: rclpy / ros_msgs not available in host Python. Run inside Pixi environment.", file=sys.stderr)
     Node = object
 
 
-def quaternion_from_euler(ai: float, aj: float, ak: float) -> Tuple[float, float, float, float]:
-    """Calculate quaternion (x, y, z, w) from euler roll, pitch, yaw."""
-    ai /= 2.0
-    aj /= 2.0
-    ak /= 2.0
-    ci = math.cos(ai)
-    si = math.sin(ai)
-    cj = math.cos(aj)
-    sj = math.sin(aj)
-    ck = math.cos(ak)
-    sk = math.sin(ak)
-    cc = ci * ck
-    cs = ci * sk
-    sc = si * ck
-    ss = si * sk
-
-    x = cj * sc - sj * cs
-    y = cj * ss + sj * cc
-    z = cj * cs - sj * sc
-    w = cj * cc + sj * ss
-    return x, y, z, w
-
-
 class CubeyOdometryNode(Node):
-    """Computes high-frequency odometry from 2D LiDAR scans and motor commands."""
-
     def __init__(self):
         super().__init__("cubey_odometry_node")
+        for key, default in {"imu_mount_roll": 0.0, "imu_mount_pitch": 0.0,
+                             "imu_mount_yaw": 0.0, "laser_x": -0.035,
+                             "laser_y": 0.0, "laser_yaw": 0.0}.items():
+            self.declare_parameter(key, default)
+        self.mount = quaternion_from_euler(*(float(self.get_parameter("imu_mount_"+axis).value)
+                                            for axis in ("roll", "pitch", "yaw")))
+        self.laser_x = float(self.get_parameter("laser_x").value)
+        self.laser_y = float(self.get_parameter("laser_y").value)
+        self.laser_yaw = float(self.get_parameter("laser_yaw").value)
+        self.imu_stream = None
+        self.imu_healthy = False
+        self.imu_status_time = 0.0
+        self.fault = ""
+        self._reset_state()
+        self.pub_imu = self.create_publisher(Imu, "/imu/data", qos_profile_sensor_data)
+        self.pub_translation = self.create_publisher(Odometry, "/odom/lidar", 10)
+        self.pub_slam_scan = self.create_publisher(LaserScan, "/scan/slam", qos_profile_sensor_data)
+        self.sub_filter = self.create_subscription(Odometry, "/odom", self._on_filtered_odom, qos_profile_sensor_data)
+        self.pub_status = self.create_publisher(String, "/cubey/odometry_status", 10)
+        self.sub_imu = self.create_subscription(Imu, "/imu/raw", self._on_imu, qos_profile_sensor_data)
+        self.sub_imu_status = self.create_subscription(String, "/cubey/imu_status", self._on_imu_status, 10)
+        self.sub_scan = self.create_subscription(LaserScan, "/scan", self._on_laser_scan, qos_profile_sensor_data)
+        self.reset_service = self.create_service(Trigger, "/cubey/reset_odometry", self._handle_reset_odometry)
+        self.timer = self.create_timer(0.05, self._publish_status)
 
-        self.declare_parameter("odom_frame", "odom")
-        self.declare_parameter("base_frame", "base_link")
-        self.declare_parameter("publish_tf", True)
-        self.declare_parameter("freq", 15.0)
+    def _now(self):
+        return self.get_clock().now().nanoseconds/1e9
 
-        self.odom_frame = self.get_parameter("odom_frame").value
-        self.base_frame = self.get_parameter("base_frame").value
+    def _reset_state(self):
+        self.reset_time = self._now()
+        self.heading_reference = None
+        self.last_imu_quaternion = None
+        self.imu_transport_status = {}
+        self.history = HeadingHistory()
+        self.last_imu_time = self.last_scan_time = self.last_translation_time = 0.0
+        self.prev_points = None
+        self.prev_scan_yaw = 0.0
+        self.x = self.y = self.wz = 0.0
+        self.position_variance = 0.0001
+        self.filtered_pose = None
+        self.filtered_stamp = 0.0
 
-        self.publish_tf = bool(self.get_parameter("publish_tf").value)
-        self.freq = float(self.get_parameter("freq").value)
+    def _on_filtered_odom(self, msg):
+        self.filtered_stamp = msg.header.stamp.sec+msg.header.stamp.nanosec/1e9
+        p, q = msg.pose.pose.position, msg.pose.pose.orientation
+        self.filtered_pose = (p.x, p.y, yaw((q.x, q.y, q.z, q.w)))
 
-        # Odometry State
-        self.x = 0.0
-        self.y = 0.0
-        self.yaw = 0.0
-        self.vx = 0.0
-        self.vy = 0.0
-        self.wz = 0.0
+    def _filter_consistent(self, heading):
+        if self.filtered_pose is None or self.filtered_stamp <= self.reset_time or not 0 <= self._now()-self.filtered_stamp <= 0.3:
+            return False
+        x, y, angle = self.filtered_pose
+        return math.hypot(x-self.x, y-self.y) <= 0.3 and abs(wrap(angle-heading)) <= math.radians(20)
 
-        # Scan Matching state
-        self.prev_points: Optional[np.ndarray] = None
-        self.last_scan_time = 0.0
-
-        # ROS 2 Publishers & Broadcasters
-        self.pub_odom = self.create_publisher(Odometry, "/odom", 10)
-        self.tf_broadcaster = TransformBroadcaster(self) if self.publish_tf else None
-
-        # Subscriptions
-        # Odometry must use the freshest scan. Processing a reliable backlog
-        # after motion or reset creates pose jumps and warped SLAM walls.
-        scan_qos = QoSProfile(
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1,
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-        )
-        self.sub_scan = self.create_subscription(
-            LaserScan,
-            "/scan",
-            self._on_laser_scan,
-            scan_qos,
-        )
-        self.sub_cmd = self.create_subscription(Twist, "/cmd_vel", self._on_cmd_vel, 10)
-        self.reset_service = self.create_service(
-            Trigger,
-            "/cubey/reset_odometry",
-            self._handle_reset_odometry,
-        )
-
-        # Periodic publish timer
-        self.timer = self.create_timer(1.0 / self.freq, self._publish_odometry)
-
-        self.get_logger().info(f"Cubey Odometry Node initialized. Publishing '{self.odom_frame}' -> '{self.base_frame}' @ {self.freq} Hz")
-
-    def _on_cmd_vel(self, msg: Twist):
-        """Update current estimated velocity from commanded motion."""
-        self.vx = msg.linear.x
-        self.vy = msg.linear.y
-        self.wz = msg.angular.z
+    def _forward_slam_scan(self, msg, heading):
+        # Raw scans still feed measured odometry and obstacle detection. SLAM
+        # only receives scans supported by current measurements and filtered pose.
+        now = self._now()
+        if (not self.fault and self.imu_healthy and 0 <= now-self.imu_status_time < 0.3
+                and 0 <= now-self.last_imu_time <= 0.2
+                and 0 <= now-self.last_translation_time <= 0.25
+                and self._filter_consistent(heading)):
+            self.pub_slam_scan.publish(msg)
 
     def _handle_reset_odometry(self, request, response):
-        """Reset the local odom frame when a new SLAM mapping session begins."""
-        self.x = 0.0
-        self.y = 0.0
-        self.yaw = 0.0
-        self.vx = 0.0
-        self.vy = 0.0
-        self.wz = 0.0
-        self.prev_points = None
-        self.last_scan_time = 0.0
+        self._reset_state()
+        self.fault = ""
         response.success = True
-        response.message = "Cubey odometry reset."
-        self.get_logger().info("Odometry reset to the mapping origin.")
+        response.message = "Measurement queues cleared; waiting for fresh IMU reference."
         return response
 
-    def _on_laser_scan(self, msg: LaserScan):
-        """Correlate consecutive scans to refine displacement (X, Y, Yaw)."""
-        scan_time = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) / 1e9
-        ros_now = self.get_clock().now().nanoseconds / 1e9
-        if scan_time <= 0.0:
-            scan_time = ros_now
+    def _on_imu_status(self, msg):
+        try:
+            data = json.loads(msg.data)
+            stream = data.get("stream")
+            if self.imu_stream is not None and stream != self.imu_stream:
+                self.fault = "IMU or system clock restarted; reset mapping before continuing"
+                self.get_logger().error("IMU_STREAM_CHANGED " + json.dumps({
+                    "previous_stream": self.imu_stream, "new_stream": stream,
+                    "received_at": self._now(), "transport_status": data}))
+                self.prev_points = None
+            self.imu_transport_status = data
+            self.imu_stream = stream
+            self.imu_healthy = data.get("healthy") is True
+            self.imu_status_time = self._now()
+        except (ValueError, TypeError):
+            self.imu_healthy = False
 
-        # A delayed pre-reset scan must never be integrated into the new odom
-        # frame. Depth-one QoS prevents backlog; this check handles anything
-        # already in transit when reset occurs.
-        scan_age = ros_now - scan_time
-        if scan_age > 0.25:
+    def _on_imu(self, msg):
+        stamp = msg.header.stamp.sec + msg.header.stamp.nanosec/1e9
+        if self.fault or stamp <= self.reset_time or not 0 <= self._now()-stamp <= 0.2:
             return
-
-        dt = scan_time - self.last_scan_time if self.last_scan_time > 0 else 0.0
-        if self.last_scan_time > 0 and dt <= 0.0:
+        q = msg.orientation
+        body = quaternion_multiply((q.x, q.y, q.z, q.w), conjugate(self.mount))
+        heading = yaw(body)
+        if self.heading_reference is None:
+            self.heading_reference = heading
+        heading = wrap(heading-self.heading_reference)
+        if self.history.samples:
+            before, previous = self.history.samples[-1]
+            dt = stamp-before
+            if dt <= 0:
+                return
+            metrics = heading_jump_metrics(list(self.history.samples), stamp, heading)
+            self.wz = metrics["window_rate_rad_s"]
+            if metrics["jump"]:
+                self.fault = "Implausible IMU heading jump; restart mapping"
+                self.get_logger().error("IMU_HEADING_JUMP " + json.dumps({
+                    "previous_stamp": before, "sample_stamp": stamp,
+                    "interval_s": dt, "sample_age_s": self._now()-stamp,
+                    "previous_heading_deg": math.degrees(previous),
+                    "heading_deg": math.degrees(heading),
+                    "delta_deg": math.degrees(wrap(heading-previous)),
+                    "rate_rad_s": metrics["pair_rate_rad_s"], "limit_rad_s": 4.0,
+                    "jump_metrics": metrics,
+                    "previous_quaternion_xyzw": self.last_imu_quaternion,
+                    "quaternion_xyzw": [q.x, q.y, q.z, q.w],
+                    "mount_xyzw": self.mount, "stream": self.imu_stream,
+                    "reset_time": self.reset_time,
+                    "scan_age_s": self._now()-self.last_scan_time,
+                    "translation_age_s": self._now()-self.last_translation_time,
+                    "recent_accepted_headings": list(self.history.samples)[-10:],
+                    # This is the most recently received status, not necessarily
+                    # the transport packet corresponding to this quaternion.
+                    "latest_transport_status": self.imu_transport_status,
+                    "transport_status_age_s": self._now()-self.imu_status_time,
+                }))
+                return
+        if not self.history.add(stamp, heading):
             return
-        self.last_scan_time = scan_time
+        self.last_imu_time = stamp
+        self.last_imu_quaternion = [q.x, q.y, q.z, q.w]
+        planar = Imu()
+        planar.header = msg.header
+        planar.header.frame_id = "base_link"  # Mounting already applied above.
+        planar.orientation.z = math.sin(heading/2)
+        planar.orientation.w = math.cos(heading/2)
+        planar.orientation_covariance = list(msg.orientation_covariance)
+        planar.angular_velocity_covariance[0] = -1.0
+        planar.linear_acceleration_covariance[0] = -1.0
+        self.pub_imu.publish(planar)
 
-        ranges = np.array(msg.ranges, dtype=np.float32)
-        angles = msg.angle_min + np.arange(len(ranges)) * msg.angle_increment
-
-        # Filter valid ranges (0.15m to 12.0m)
-        valid = (ranges >= 0.15) & (ranges <= 10.0) & np.isfinite(ranges)
+    def _on_laser_scan(self, msg):
+        stamp = msg.header.stamp.sec + msg.header.stamp.nanosec/1e9
+        now = self._now()
+        if not 0 <= now-stamp <= 0.25:
+            return
+        if stamp <= self.reset_time or self.fault:
+            return
+        heading = self.history.at(stamp)
+        if heading is None:
+            return
+        ranges = np.asarray(msg.ranges, dtype=float)
+        angles = msg.angle_min + np.arange(len(ranges))*msg.angle_increment + self.laser_yaw
+        valid = np.isfinite(ranges) & (ranges >= max(0.15, msg.range_min)) & (ranges <= min(10.0, msg.range_max))
         if np.count_nonzero(valid) < 30:
+            self.prev_points = None
             return
-
-        valid_ranges = ranges[valid]
-        valid_angles = angles[valid]
-
-        # Convert to local Cartesian points
-        lx = valid_ranges * np.cos(valid_angles)
-        ly = valid_ranges * np.sin(valid_angles)
-        current_points = np.column_stack((lx, ly))
-
-        # Downsample for fast correlation
-        if len(current_points) > 80:
-            step = len(current_points) // 80
-            current_points = current_points[::step]
-
-        is_stationary = abs(self.vx) < 0.005 and abs(self.vy) < 0.005 and abs(self.wz) < 0.01
-        if is_stationary:
-            # Never manufacture motion from LiDAR noise while the motor command is zero.
-            self.prev_points = current_points
+        points = np.column_stack((ranges[valid]*np.cos(angles[valid])+self.laser_x,
+                                  ranges[valid]*np.sin(angles[valid])+self.laser_y))
+        points = points[::max(1, math.ceil(len(points)/180))]
+        dt = stamp-self.last_scan_time
+        if dt <= 0:
             return
+        if self.prev_points is not None and dt < 0.4:
+            measured = match_translation(self.prev_points, points, wrap(heading-self.prev_scan_yaw),
+                                         max_translation=0.6*dt+0.015)
+            if measured is not None:
+                dx, dy, variance = measured
+                c, s = math.cos(self.prev_scan_yaw), math.sin(self.prev_scan_yaw)
+                self.x += c*dx-s*dy
+                self.y += s*dx+c*dy
+                self.position_variance += variance
+                odom = Odometry()
+                # ROS Python messages share nested objects on assignment. Keep
+                # the original laser frame when forwarding this scan to SLAM.
+                odom.header = deepcopy(msg.header)
+                odom.header.frame_id = "odom"
+                odom.child_frame_id = "base_link"
+                odom.pose.pose.position.x, odom.pose.pose.position.y = self.x, self.y
+                odom.pose.pose.orientation.w = 1.0
+                odom.pose.covariance[0] = odom.pose.covariance[7] = self.position_variance
+                for index in (14, 21, 28, 35):
+                    odom.pose.covariance[index] = 1e6
+                # Descriptive measured twist, not fused alongside its own pose.
+                rotation = heading-self.prev_scan_yaw
+                odom.twist.twist.linear.x = (dx*math.cos(rotation)+dy*math.sin(rotation))/dt
+                odom.twist.twist.linear.y = (-dx*math.sin(rotation)+dy*math.cos(rotation))/dt
+                odom.twist.covariance[0] = odom.twist.covariance[7] = variance/dt**2
+                self.pub_translation.publish(odom)
+                self.last_translation_time = stamp
+                self._forward_slam_scan(msg, heading)
+        self.prev_points, self.prev_scan_yaw = points, heading
+        self.last_scan_time = stamp
 
-        if self.prev_points is not None and 0.0 < dt < 0.5:
-            # Estimate motion in the robot-local frame. Scan correlation decides
-            # whether commanded translation really happened (important when stuck).
-            dx_est = self.vx * dt
-            dy_est = self.vy * dt
-            dyaw_est = self.wz * dt
-            lock_translation = abs(self.vx) < 0.01 and abs(self.vy) < 0.01
-
-            # Refine pose delta using scan matching
-            local_dx, local_dy, dyaw_match = self._correlate_scans(
-                self.prev_points,
-                current_points,
-                dx_est,
-                dy_est,
-                dyaw_est,
-                lock_translation=lock_translation,
-            )
-
-            # Rotate the measured local translation into the odom frame.
-            cos_yaw = math.cos(self.yaw)
-            sin_yaw = math.sin(self.yaw)
-            self.x += local_dx * cos_yaw - local_dy * sin_yaw
-            self.y += local_dx * sin_yaw + local_dy * cos_yaw
-            self.yaw += dyaw_match
-            # Normalize yaw to [-pi, pi]
-            self.yaw = math.atan2(math.sin(self.yaw), math.cos(self.yaw))
-        else:
-            # First frame dead reckoning
-            pass
-
-        self.prev_points = current_points
-
-    def _correlate_scans(
-        self, prev_pts: np.ndarray, curr_pts: np.ndarray,
-        dx_init: float, dy_init: float, dyaw_init: float,
-        lock_translation: bool = False,
-    ) -> Tuple[float, float, float]:
-        """Fast grid-search scan match around initial motion estimate."""
-        best_score = float("inf")
-        best_dx = dx_init
-        best_dy = dy_init
-        best_dyaw = dyaw_init
-
-        # Always evaluate zero translation. If the wheels spin against an
-        # obstacle, the stationary scan alignment should beat dead reckoning.
-        dx_candidates = [0.0] if lock_translation else [0.0, dx_init - 0.03, dx_init, dx_init + 0.03]
-        dy_candidates = [0.0] if lock_translation else [0.0, dy_init - 0.03, dy_init, dy_init + 0.03]
-        dyaw_candidates = [dyaw_init - 0.04, dyaw_init, dyaw_init + 0.04]
-        zero_motion_score = float("inf")
-
-        # Zero yaw is mandatory. Without it, a commanded rotation forces the
-        # estimator to invent a turn even when Cubey is physically stuck.
-        dyaw_candidates = list(dict.fromkeys([0.0, *dyaw_candidates]))
-
-        for dyaw in dyaw_candidates:
-            cos_a = math.cos(dyaw)
-            sin_a = math.sin(dyaw)
-            # Rotate current points by candidate yaw
-            rotated_x = curr_pts[:, 0] * cos_a - curr_pts[:, 1] * sin_a
-            rotated_y = curr_pts[:, 0] * sin_a + curr_pts[:, 1] * cos_a
-
-            for dx in dx_candidates:
-                for dy in dy_candidates:
-                    tx = rotated_x + dx
-                    ty = rotated_y + dy
-
-                    # Sum of nearest distances to previous points (approximate fast score)
-                    # Sample subset for speed
-                    dists_sq = np.min(
-                        (prev_pts[:, 0, None] - tx[None, :]) ** 2 +
-                        (prev_pts[:, 1, None] - ty[None, :]) ** 2,
-                        axis=0
-                    )
-                    score = np.mean(dists_sq)
-
-                    if dx == 0.0 and dy == 0.0 and dyaw == 0.0:
-                        zero_motion_score = score
-
-                    if score < best_score:
-                        best_score = score
-                        best_dx = dx
-                        best_dy = dy
-                        best_dyaw = dyaw
-
-        # Require measured scan alignment to beat the exact zero-motion case
-        # before accepting either translation or rotation. Commands only seed
-        # the search; they are never proof that the chassis moved.
-        improvement = (zero_motion_score - best_score) / max(zero_motion_score, 1e-9)
-        if improvement < 0.03:
-            return 0.0, 0.0, 0.0
-
-        if lock_translation:
-            return 0.0, 0.0, best_dyaw
-
-        return best_dx, best_dy, best_dyaw
-
-    def _publish_odometry(self):
-        """Periodically broadcast /odom message and TF transform."""
-        now = self.get_clock().now()
-
-        # Fail closed when LiDAR is late or absent. Open-loop command integration
-        # made the web trail and SLAM pose move while the physical robot was stuck.
-        # Holding the last scan-confirmed pose lets Nav2's progress checker stop
-        # safely instead of corrupting the map.
-
-        qx, qy, qz, qw = quaternion_from_euler(0, 0, self.yaw)
-
-        # 1. Publish Odometry Message
-        odom_msg = Odometry()
-        odom_msg.header.stamp = now.to_msg()
-        odom_msg.header.frame_id = self.odom_frame
-        odom_msg.child_frame_id = self.base_frame
-
-        odom_msg.pose.pose.position.x = float(self.x)
-        odom_msg.pose.pose.position.y = float(self.y)
-        odom_msg.pose.pose.position.z = 0.0
-        odom_msg.pose.pose.orientation.x = qx
-        odom_msg.pose.pose.orientation.y = qy
-        odom_msg.pose.pose.orientation.z = qz
-        odom_msg.pose.pose.orientation.w = qw
-
-        odom_msg.twist.twist.linear.x = float(self.vx)
-        odom_msg.twist.twist.linear.y = float(self.vy)
-        odom_msg.twist.twist.angular.z = float(self.wz)
-
-        self.pub_odom.publish(odom_msg)
-
-        # 2. Publish TF Transform: odom -> base_footprint
-        if self.tf_broadcaster:
-            t = TransformStamped()
-            t.header.stamp = now.to_msg()
-            t.header.frame_id = self.odom_frame
-            t.child_frame_id = self.base_frame
-
-            t.transform.translation.x = float(self.x)
-            t.transform.translation.y = float(self.y)
-            t.transform.translation.z = 0.0
-            t.transform.rotation.x = qx
-            t.transform.rotation.y = qy
-            t.transform.rotation.z = qz
-            t.transform.rotation.w = qw
-
-            self.tf_broadcaster.sendTransform(t)
+    def _publish_status(self):
+        now = self._now()
+        imu_ok = self.imu_healthy and now-self.imu_status_time < 0.3 and 0 <= now-self.last_imu_time <= 0.2
+        scan_ok = 0 <= now-self.last_translation_time <= 0.5
+        filter_ok = bool(self.history.samples and self._filter_consistent(self.history.samples[-1][1]))
+        msg = String()
+        msg.data = json.dumps({"ready": bool(imu_ok and scan_ok and filter_ok and not self.fault),
+                               "imu_available": self.imu_healthy and now-self.imu_status_time < 0.3,
+                               "imu_ok": imu_ok, "scan_ok": scan_ok,
+                               "filter_ok": filter_ok,
+                               "fault": self.fault,
+                               "reason": self.fault or ("Waiting for fresh IMU and observable LiDAR translation" if not (imu_ok and scan_ok) else ("" if filter_ok else "Waiting for filtered pose to agree with measurements")),
+                               "reset_time": self.reset_time, "timestamp": now})
+        self.pub_status.publish(msg)
 
 
 def main(args=None):
@@ -338,4 +253,3 @@ def main(args=None):
 
 if __name__ == "__main__":
     main()
-

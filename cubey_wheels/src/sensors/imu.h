@@ -8,3 +8,4 @@
 
 void setupIMU();
 void updateIMU();
+void sendIMUSnapshot(bool usb = false);

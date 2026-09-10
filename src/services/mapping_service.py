@@ -140,10 +140,13 @@ class MappingService:
     # Mapping Controls
     # ------------------------------------------------------------------
 
-    def start_mapping(self) -> None:
+    def start_mapping(self, external_pose: bool = False) -> None:
         """Enable active SLAM map updates from incoming LiDAR scans."""
         with self._lock:
             self.is_mapping = True
+            self.external_pose = external_pose
+        if external_pose:
+            return  # ROS owns the LiDAR, map and pose for this session.
 
         # Ensure LiDAR hardware is connected and active
         try:
@@ -399,7 +402,7 @@ class MappingService:
             except Exception:
                 pass
 
-        if not self.is_mapping or not scan_data.points:
+        if not self.is_mapping or getattr(self, "external_pose", False) or not scan_data.points:
             return
 
         with self._lock:

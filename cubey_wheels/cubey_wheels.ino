@@ -13,6 +13,7 @@
 #include "src/sensors/imu.h"
 #include "src/web/webpage.h"
 #include "src/web/web_server.h"
+#include "src/web/firmware_update.h"
 
 // ============================================================
 // CUBEY — 4-WHEEL MECANUM CONTROLLER MAIN ENTRYPOINT
@@ -80,6 +81,7 @@ void setup() {
 
 void loop() {
   server.handleClient();
+  handleFirmwareUpdateRestart();
   processSerialCommands();
   updateCliffSafety();
   updateIMU();

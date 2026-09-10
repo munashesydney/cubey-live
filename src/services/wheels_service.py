@@ -45,6 +45,15 @@ class TelemetryData:
     yaw: float = 0.0
     pitch: float = 0.0
     roll: float = 0.0
+    cliff_acquisition: str = "unknown"
+    front_range_valid: Optional[bool] = None
+    back_range_valid: Optional[bool] = None
+    front_range_status: Optional[int] = None
+    back_range_status: Optional[int] = None
+    front_sensor_error: Optional[int] = None
+    back_sensor_error: Optional[int] = None
+    front_sample_age_ms: Optional[int] = None
+    back_sample_age_ms: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -62,6 +71,10 @@ class TelemetryData:
             "yaw": self.yaw,
             "pitch": self.pitch,
             "roll": self.roll,
+            "cliff_acquisition": self.cliff_acquisition,
+            **{f"{side}_{field}": getattr(self, f"{side}_{field}")
+               for side in ("front", "back")
+               for field in ("range_valid", "range_status", "sensor_error", "sample_age_ms")},
         }
 
 
@@ -519,6 +532,13 @@ class WheelsService:
                 yaw=float(kv.get("yaw", self.telemetry.yaw)),
                 pitch=float(kv.get("pitch", self.telemetry.pitch)),
                 roll=float(kv.get("roll", self.telemetry.roll)),
+                cliff_acquisition=kv.get("cliff_acquisition", "unknown"),
+                **{f"{side}_{field}": (int(kv[f"{side}_{field}"]) if f"{side}_{field}" in kv else None)
+                   for side in ("front", "back")
+                   for field in ("range_status", "sensor_error", "sample_age_ms")},
+                **{f"{side}_range_valid": (kv[f"{side}_range_valid"] == "1" if f"{side}_range_valid" in kv
+                                          else False if int(kv.get(f"{side}_dist", 0)) >= 8190 else None)
+                   for side in ("front", "back")},
             )
 
             if self.on_telemetry:

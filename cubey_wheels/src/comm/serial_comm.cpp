@@ -3,6 +3,7 @@
 #include "../motion/motors.h"
 #include "../sensors/battery.h"
 #include "../sensors/cliff_sensors.h"
+#include "../sensors/imu.h"
 
 // State definitions
 unsigned long lastTelemetryTime = 0;
@@ -133,8 +134,8 @@ void testSingleMotor(String motorName, int direction, int speed) {
 }
 
 void sendTelemetry(bool broadcast) {
-  uint16_t frontDistance = 0;
-  uint16_t backDistance = 0;
+  uint16_t frontDistance = 0xffff;
+  uint16_t backDistance = 0xffff;
   if (frontSensorReady) {
     readFloorSensor(frontSensor, frontDistance);
   }
@@ -153,6 +154,7 @@ void sendTelemetry(bool broadcast) {
                ",batt_v=" + String(bV, 2) +
                ",batt_pct=" + String(bPct) +
                ",charging=" + (isCharging ? "1" : "0");
+  msg += floorSensorDiagnostics();
   msg += ",estop=" + String(emergencyStopLatched ? "1" : "0");
   msg += ",imu_ok=" + String(imuReady ? "1" : "0") +
          ",yaw=" + String(imuYaw, 1) +
@@ -249,6 +251,7 @@ void handleIncomingLine(String line) {
                   ",qy=" + String(imuQuatJ, 4) +
                   ",qz=" + String(imuQuatK, 4);
     serialPrintln(resp);
+    sendIMUSnapshot(true);
   }
   else {
     // Fallback: direct command name like "forward", "stop", etc.
@@ -264,7 +267,7 @@ void processSerialCommands() {
     if (c == '\r') continue;
     if (c == '\n') {
       if (serial1RxBuffer.length() > 0) {
-        serialPrintln("[ESP-RPI-CMD] " + serial1RxBuffer);
+        if (!serial1RxBuffer.startsWith("TWIST:")) serialPrintln("[ESP-RPI-CMD] " + serial1RxBuffer);
         handleIncomingLine(serial1RxBuffer);
       }
       serial1RxBuffer = "";

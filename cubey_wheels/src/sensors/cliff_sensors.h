@@ -10,4 +10,5 @@
 void setupCliffSensors();
 bool readFloorSensor(Adafruit_VL53L0X &sensor, uint16_t &distance);
 void updateCliffSafety();
+String floorSensorDiagnostics();
 void performSafetyEscape(bool moveForward);

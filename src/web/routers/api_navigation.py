@@ -3,6 +3,7 @@ SLAM mapping sessions, waypoint navigation, and teleoperation motor drive endpoi
 """
 
 import logging
+import asyncio
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -25,7 +26,7 @@ class DriveCommandRequest(BaseModel):
 
 
 class StartMappingRequest(BaseModel):
-    mode: Optional[str] = "manual"  # "manual" | "autonomous"
+    mode: Optional[str] = "autonomous"  # "manual" | "autonomous"
 
 
 class NavGoalRequest(BaseModel):
@@ -38,12 +39,14 @@ class NavGoalRequest(BaseModel):
 async def start_mapping_session(req: Optional[StartMappingRequest] = None, _: str = Depends(verify_credentials)):
     """Start 2D mapping session in manual or autonomous mode."""
     nav_svc = get_nav_service()
-    mode = (req.mode if req and req.mode else "manual").lower()
+    mode = (req.mode if req and req.mode else "autonomous").lower()
+    if mode not in ("manual", "autonomous"):
+        raise HTTPException(status_code=422, detail="Unknown mapping mode")
 
     if mode == "autonomous":
-        started = nav_svc.start_exploration()
+        started = await asyncio.to_thread(nav_svc.start_exploration)
     else:
-        started = nav_svc.start_manual_mapping()
+        started = await asyncio.to_thread(nav_svc.start_manual_mapping)
 
     if not started:
         raise HTTPException(
@@ -68,10 +71,10 @@ async def pause_mapping_session(_: str = Depends(verify_credentials)):
 async def reset_mapping_grid(_: str = Depends(verify_credentials)):
     """Clear the real SLAM graph, occupancy grid, trajectory, and robot pose."""
     nav_svc = get_nav_service()
-    if not nav_svc.reset_mapping():
+    if not await asyncio.to_thread(nav_svc.reset_mapping):
         raise HTTPException(
             status_code=503,
-            detail="ROS 2 SLAM did not acknowledge the map reset.",
+            detail=nav_svc.last_reset_error or "ROS 2 SLAM did not acknowledge the map reset.",
         )
     return {"status": "map_reset"}
 
