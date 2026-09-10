@@ -1,4 +1,5 @@
 #include "web_server.h"
+#include "firmware_update.h"
 #include "../config/config.h"
 #include "../motion/motors.h"
 #include "../comm/serial_comm.h"
@@ -11,6 +12,7 @@ WebServer server(80);
 // WEB ROUTES
 // ============================================================
 void setupWebServer() {
+  setupFirmwareUpdateRoutes();
   server.on("/", HTTP_GET, []() {
     server.sendHeader(
       "Cache-Control",

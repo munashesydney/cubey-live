@@ -27,6 +27,12 @@ enum Motion {
 // ---------------- Wi-Fi ----------------
 constexpr const char* WIFI_NAME = "Cubey-Control";
 constexpr const char* WIFI_PASSWORD = "cubey123";
+// The ESP is an access point, so firmware updates are reachable only by a
+// client already authenticated to Cubey-Control. HTTP Basic authentication
+// prevents an unauthenticated device on that network from flashing firmware.
+constexpr const char* FIRMWARE_UPDATE_USERNAME = "cubey";
+constexpr const char* FIRMWARE_UPDATE_PASSWORD = WIFI_PASSWORD;
+constexpr const char* CUBEY_FIRMWARE_VERSION = "2026.09.09-ota-1";
 
 // ---------------- Cliff sensors ----------------
 #define SENSOR_SDA 6
