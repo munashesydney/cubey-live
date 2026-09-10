@@ -31,6 +31,20 @@ def active_wifi_connection() -> str:
     raise RuntimeError("Pi has no active Wi-Fi connection to restore")
 
 
+def wait_for_ssid(ssid: str, wifi_device: str, timeout_s: float = 20.0) -> None:
+    """Wait until the ESP access point is actually visible to the Pi."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        visible = nmcli("-t", "-f", "SSID", "device", "wifi", "list",
+                        "ifname", wifi_device, "--rescan", "yes", check=False)
+        if ssid in visible.splitlines():
+            return
+        time.sleep(1.0)
+    raise RuntimeError(
+        f"{ssid!r} is not visible from {wifi_device}; the ESP access point may be off or out of range"
+    )
+
+
 def wait_for_updater(host: str, password: str, timeout_s: float = 20.0) -> dict:
     deadline = time.monotonic() + timeout_s
     last_error: Exception | None = None
@@ -72,6 +86,7 @@ def main() -> int:
     try:
         # A named, non-autoconnecting profile is easy to remove after use.
         nmcli("connection", "delete", TEMP_CONNECTION, check=False)
+        wait_for_ssid(args.ssid, args.wifi_device)
         nmcli("device", "wifi", "connect", args.ssid, "password", args.wifi_password,
               "ifname", args.wifi_device, "name", TEMP_CONNECTION)
         nmcli("connection", "modify", TEMP_CONNECTION, "connection.autoconnect", "no",

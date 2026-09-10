@@ -26,3 +26,9 @@ def test_wait_for_updater_retries_then_reads_status():
     with patch.object(module, "request", side_effect=[OSError("not yet"), (200, '{"version":"ota"}')]), \
          patch.object(module.time, "sleep"):
         assert module.wait_for_updater("192.168.4.1", "pw") == {"version": "ota"}
+
+
+def test_wait_for_ssid_accepts_visible_access_point():
+    module = load_module("update_esp_via_cubey_wifi")
+    with patch.object(module, "nmcli", return_value="WIFI-2574\nCubey-Control"):
+        module.wait_for_ssid("Cubey-Control", "wlan0", timeout_s=0.1)
