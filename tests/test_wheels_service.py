@@ -117,6 +117,27 @@ class WheelsServiceProtocolTests(unittest.TestCase):
         self.service.request_status()
         self.assertIn("[TX-MOCK] STATUS", sent_lines)
 
+    def test_cliff_diagnostics_distinguish_invalid_reading_from_drop(self):
+        self.service._parse_incoming_line(
+            "TELEMETRY:front_dist=56,back_dist=65535,front_cliff=0,back_cliff=1,"
+            "cliff_acquisition=sequential_v2,front_range_valid=1,back_range_valid=0,"
+            "front_range_status=0,back_range_status=4,front_sensor_error=0,back_sensor_error=0,"
+            "front_sample_age_ms=20,back_sample_age_ms=40")
+        data = self.service.telemetry.to_dict()
+        self.assertEqual(data['cliff_acquisition'], 'sequential_v2')
+        self.assertTrue(data['front_range_valid'])
+        self.assertFalse(data['back_range_valid'])
+        self.assertTrue(data['back_cliff'])
+        self.assertEqual(data['back_range_status'], 4)
+        self.assertEqual(data['back_distance_mm'], 65535)  # Preserve raw evidence.
+        self.assertEqual(data['back_sample_age_ms'], 40)
+
+    def test_old_firmware_error_values_are_not_reported_as_valid_ranges(self):
+        self.service._parse_incoming_line('TELEMETRY:front_dist=55,back_dist=8191,back_cliff=1')
+        self.assertIsNone(self.service.telemetry.front_range_valid)
+        self.assertFalse(self.service.telemetry.back_range_valid)
+        self.assertEqual(self.service.telemetry.cliff_acquisition, 'unknown')
+
     def test_pulse_movement(self):
         sent_lines = []
         self.service._emit_log = lambda text: sent_lines.append(text)

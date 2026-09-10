@@ -480,6 +480,8 @@ class CmdVelSerialBridgeNode(Node):
                         with open(tmp_w, "w") as f:
                             f.write(line + "\n")
                         os.replace(tmp_w, tmp_telemetry)
+                    elif line.startswith(("CLIFF_SENSOR_", "[CLIFF DETECTED]")):
+                        self.get_logger().warn(line)
                 if len(buffer) > 4096:
                     buffer = b""  # Discard a damaged unterminated packet.
             except Exception:

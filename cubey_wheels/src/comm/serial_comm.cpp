@@ -134,8 +134,8 @@ void testSingleMotor(String motorName, int direction, int speed) {
 }
 
 void sendTelemetry(bool broadcast) {
-  uint16_t frontDistance = 0;
-  uint16_t backDistance = 0;
+  uint16_t frontDistance = 0xffff;
+  uint16_t backDistance = 0xffff;
   if (frontSensorReady) {
     readFloorSensor(frontSensor, frontDistance);
   }
@@ -154,6 +154,7 @@ void sendTelemetry(bool broadcast) {
                ",batt_v=" + String(bV, 2) +
                ",batt_pct=" + String(bPct) +
                ",charging=" + (isCharging ? "1" : "0");
+  msg += floorSensorDiagnostics();
   msg += ",estop=" + String(emergencyStopLatched ? "1" : "0");
   msg += ",imu_ok=" + String(imuReady ? "1" : "0") +
          ",yaw=" + String(imuYaw, 1) +
