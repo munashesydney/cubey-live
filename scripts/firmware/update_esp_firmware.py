@@ -18,6 +18,34 @@ import urllib.request
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SKETCH_DIR = REPO_ROOT / "cubey_wheels"
 
+# Toolchain installed by scripts/firmware/install_arduino_toolchain.sh. Pinned
+# paths make --compile work under sudo, where PATH and HOME are not the user's.
+TOOLCHAIN_BIN = Path("/opt/cubey-arduino/bin/arduino-cli")
+TOOLCHAIN_CONFIG = Path("/opt/cubey-arduino/arduino-cli.yaml")
+
+
+def resolve_arduino_cli(explicit: str | None = None) -> str:
+    """Prefer the Pi's pinned toolchain, then PATH, so sudo cannot hide it."""
+    if explicit:
+        return explicit
+    override = os.getenv("CUBEY_ARDUINO_CLI")
+    if override:
+        return override
+    if TOOLCHAIN_BIN.is_file():
+        return str(TOOLCHAIN_BIN)
+    return "arduino-cli"
+
+
+def resolve_arduino_config(explicit: str | None = None) -> str | None:
+    if explicit:
+        return explicit
+    override = os.getenv("CUBEY_ARDUINO_CONFIG")
+    if override:
+        return override
+    if TOOLCHAIN_CONFIG.is_file():
+        return str(TOOLCHAIN_CONFIG)
+    return None
+
 
 def request(url: str, password: str, body: bytes | None = None, content_type: str | None = None):
     headers = {"Authorization": "Basic " + base64.b64encode(f"cubey:{password}".encode()).decode()}
@@ -28,9 +56,22 @@ def request(url: str, password: str, body: bytes | None = None, content_type: st
         return response.status, response.read().decode("utf-8", errors="replace")
 
 
-def compile_firmware(arduino_cli: str, fqbn: str) -> Path:
-    output_dir = Path(tempfile.mkdtemp(prefix="cubey-esp-build-"))
-    subprocess.run([arduino_cli, "compile", "--fqbn", fqbn, "--output-dir", str(output_dir), str(SKETCH_DIR)], check=True)
+def compile_firmware(arduino_cli: str, fqbn: str, config_file: str | None = None) -> Path:
+    # Keep every generated file out of the checkout: arduino-cli would otherwise
+    # default to <sketch>/build and dirty the repository.
+    build_dir = Path(tempfile.mkdtemp(prefix="cubey-esp-build-"))
+    output_dir = Path(tempfile.mkdtemp(prefix="cubey-esp-artifacts-"))
+    command = [arduino_cli]
+    if config_file:
+        command += ["--config-file", config_file]
+    command += [
+        "compile",
+        "--fqbn", fqbn,
+        "--build-path", str(build_dir),
+        "--output-dir", str(output_dir),
+        str(SKETCH_DIR),
+    ]
+    subprocess.run(command, check=True)
     image = output_dir / "cubey_wheels.ino.bin"
     if not image.is_file():
         raise RuntimeError(f"Arduino CLI did not create {image}")
@@ -59,14 +100,16 @@ def main() -> int:
                         help="Cubey-Control password, or set CUBEY_ESP_PASSWORD")
     parser.add_argument("--firmware", type=Path, help="Existing .bin image to install")
     parser.add_argument("--compile", action="store_true", help="Build cubey_wheels before upload")
-    parser.add_argument("--arduino-cli", default="arduino-cli")
+    parser.add_argument("--arduino-cli", default=None, help="Path to arduino-cli (default: the Pi toolchain, then PATH)")
+    parser.add_argument("--arduino-config", default=None, help="arduino-cli config file (default: the Pi toolchain config)")
     parser.add_argument("--fqbn", default="esp32:esp32:esp32s3")
     args = parser.parse_args()
     if not args.password:
         parser.error("--password or CUBEY_ESP_PASSWORD is required")
     if args.compile == (args.firmware is not None):
         parser.error("choose exactly one of --compile or --firmware")
-    image = compile_firmware(args.arduino_cli, args.fqbn) if args.compile else args.firmware
+    image = compile_firmware(resolve_arduino_cli(args.arduino_cli), args.fqbn,
+                             resolve_arduino_config(args.arduino_config)) if args.compile else args.firmware
     if not image.is_file():
         parser.error(f"firmware image does not exist: {image}")
     root = f"http://{args.host}"

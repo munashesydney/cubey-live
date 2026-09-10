@@ -12,7 +12,13 @@ import sys
 import time
 import urllib.error
 
-from update_esp_firmware import compile_firmware, multipart_image, request
+from update_esp_firmware import (
+    compile_firmware,
+    multipart_image,
+    request,
+    resolve_arduino_cli,
+    resolve_arduino_config,
+)
 
 
 TEMP_CONNECTION = "Cubey ESP temporary update"
@@ -67,7 +73,10 @@ def main() -> int:
     parser.add_argument("--wifi-device", default="wlan0")
     parser.add_argument("--firmware", type=Path)
     parser.add_argument("--compile", action="store_true")
-    parser.add_argument("--arduino-cli", default="arduino-cli")
+    parser.add_argument("--arduino-cli", default=None,
+                        help="Path to arduino-cli (default: the Pi toolchain, then PATH)")
+    parser.add_argument("--arduino-config", default=None,
+                        help="arduino-cli config file (default: the Pi toolchain config)")
     parser.add_argument("--fqbn", default="esp32:esp32:esp32s3")
     parser.add_argument("--keep-temporary-connection", action="store_true")
     args = parser.parse_args()
@@ -77,7 +86,12 @@ def main() -> int:
         parser.error("choose exactly one of --compile or --firmware")
 
     # Compile before disconnecting Internet-dependent Pi services.
-    image = compile_firmware(args.arduino_cli, args.fqbn) if args.compile else args.firmware
+    image = (
+        compile_firmware(resolve_arduino_cli(args.arduino_cli), args.fqbn,
+                         resolve_arduino_config(args.arduino_config))
+        if args.compile
+        else args.firmware
+    )
     if not image or not image.is_file():
         parser.error(f"firmware image does not exist: {image}")
     original_connection = active_wifi_connection()

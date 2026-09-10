@@ -68,7 +68,7 @@ void setup() {
   serialPrint(" | TX=GPIO ");
   serialPrintln(String(RPI_TX_PIN));
   serialPrint("IMU (BNO08x): ");
-  serialPrintln(imuReady ? "CONNECTED (Wire1: SDA=40, SCL=41)" : "NOT FOUND / OFF");
+  serialPrintln(imuConnected() ? "CONNECTED (Wire1: SDA=40, SCL=41)" : "NOT DETECTED YET");
   serialPrintln("Also listening on: Serial (USB)");
   serialPrint("Wi-Fi: ");
   serialPrintln(WIFI_NAME);

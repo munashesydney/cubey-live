@@ -157,6 +157,7 @@ void sendTelemetry(bool broadcast) {
   msg += floorSensorDiagnostics();
   msg += ",estop=" + String(emergencyStopLatched ? "1" : "0");
   msg += ",imu_ok=" + String(imuReady ? "1" : "0") +
+         ",imu_conn=" + String(imuConnected() ? "1" : "0") +
          ",yaw=" + String(imuYaw, 1) +
          ",pitch=" + String(imuPitch, 1) +
          ",roll=" + String(imuRoll, 1);

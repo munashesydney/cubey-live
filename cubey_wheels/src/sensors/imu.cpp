@@ -41,7 +41,7 @@ class TimestampedBNO08x : public Adafruit_BNO08x {
 int (*TimestampedBNO08x::originalRead)(sh2_Hal_t *, uint8_t *, unsigned, uint32_t *) = nullptr;
 static TimestampedBNO08x bno08x;
 static sh2_SensorValue_t sensorValue;
-static bool imuConnected = false;
+static bool imuLinkUp = false;
 static bool reportEnabled = false;
 static uint32_t imuBoot = 0;
 static uint32_t imuEpoch = 0;
@@ -50,6 +50,7 @@ static uint64_t imuSampleUs = 0;
 static uint8_t imuAccuracy = 0;
 static unsigned long lastImuPush = 0;
 static unsigned long lastReportRetry = 0;
+static unsigned long lastImuProbe = 0;
 
 void sendIMUSnapshot(bool usb) {
   char packet[220];
@@ -67,10 +68,10 @@ void sendIMUSnapshot(bool usb) {
 // ============================================================
 // IMU SETUP (Dedicated Wire1 hardware bus: SDA=40, SCL=41)
 // ============================================================
-void setupIMU() {
-  imuBoot = esp_random();
-  serialPrintln("Starting BNO08x IMU on Wire1 (SDA=40, SCL=41)...");
-
+// Attach the BNO08x from scratch. Safe to call again after a failed probe:
+// the sensor is hardware-reset and re-addressed, which also drops any previous
+// report subscription.
+static bool attachImu() {
   // 1. Hardware Reset: BNO08x Hillcrest firmware requires >= 150-200ms to boot from reset
   pinMode(IMU_RST, OUTPUT);
   digitalWrite(IMU_RST, HIGH);
@@ -85,37 +86,45 @@ void setupIMU() {
   Wire1.setClock(100000);
 
   // 3. Connect directly to verified address (0x4A) with quick retry and fallback
-  bool connected = false;
   for (int attempt = 1; attempt <= 3; attempt++) {
     if (bno08x.begin_I2C(IMU_I2C_ADDR, &Wire1)) {
-      connected = true;
-      break;
+      return true;
     }
     delay(50);
   }
 
   // Fallback to alternate address 0x4B if 0x4A did not respond
-  if (!connected) {
-    uint8_t altAddr = (IMU_I2C_ADDR == 0x4A) ? 0x4B : 0x4A;
-    if (bno08x.begin_I2C(altAddr, &Wire1)) {
-      connected = true;
-    }
-  }
+  uint8_t altAddr = (IMU_I2C_ADDR == 0x4A) ? 0x4B : 0x4A;
+  return bno08x.begin_I2C(altAddr, &Wire1);
+}
 
-  if (!connected) {
-    serialPrintln("WARNING: BNO08x IMU not detected (continuing without IMU)");
+// 4. Enable Game Rotation Vector (quaternions fused from gyro & accel, immune
+// to magnetic distortion). Log the failure because reports never arriving is
+// otherwise indistinguishable from a sensor that never attached.
+static void enableImuReports() {
+  reportEnabled = bno08x.enableReport(SH2_GAME_ROTATION_VECTOR, IMU_REPORT_INTERVAL_US);
+  if (!reportEnabled) {
+    serialPrintln("WARNING: Could not enable BNO08x game rotation vector");
+  }
+}
+
+bool imuConnected() {
+  return imuLinkUp;
+}
+
+void setupIMU() {
+  imuBoot = esp_random();
+  serialPrintln("Starting BNO08x IMU on Wire1 (SDA=40, SCL=41)...");
+
+  imuLinkUp = attachImu();
+  if (!imuLinkUp) {
+    serialPrintln("WARNING: BNO08x IMU not detected (retrying while stopped)");
     imuReady = false;
     return;
   }
 
   serialPrintln("BNO08x IMU connected!");
-
-  // 4. Enable Game Rotation Vector (quaternions fused from gyro & accel, immune to magnetic distortion)
-  imuConnected = true;
-  reportEnabled = bno08x.enableReport(SH2_GAME_ROTATION_VECTOR, IMU_REPORT_INTERVAL_US);
-  if (!reportEnabled) {
-    serialPrintln("WARNING: Could not enable BNO08x game rotation vector");
-  }
+  enableImuReports();
 
   imuReady = false; // A detected device is not yet a fresh orientation sample.
 }
@@ -124,8 +133,29 @@ void setupIMU() {
 // IMU UPDATE LOOP (NON-BLOCKING EVENT POLL)
 // ============================================================
 void updateIMU() {
-  if (!imuConnected) return;
-  if (millis() - lastImuUpdate > 200) imuReady = false;
+  const unsigned long now = millis();
+  const bool linkStale = imuLinkUp && now - lastImuUpdate > IMU_LINK_STALE_MS;
+  if (!imuLinkUp || linkStale) {
+    // A boot probe can miss the sensor, and an established link can stop
+    // delivering samples. Re-probe only while stationary: the reset/boot delay
+    // in attachImu() would otherwise stall motor and cliff supervision.
+    if (!motorsRunning && now - lastImuProbe >= IMU_RETRY_INTERVAL_MS) {
+      lastImuProbe = now;
+      imuLinkUp = attachImu();
+      reportEnabled = false;
+      if (imuLinkUp) {
+        ++imuEpoch; // New link/clock generation; the Pi resets its mapping.
+        imuSequence = 0;
+        imuSampleUs = 0;
+        serialPrintln("BNO08x IMU link established; enabling reports...");
+        enableImuReports();
+        sendIMUSnapshot();
+      }
+    }
+    if (!imuLinkUp) return;
+  }
+
+  if (now - lastImuUpdate > 200) imuReady = false;
 
   // Detect hardware/watchdog reset and restore report subscription
   if (bno08x.wasReset()) {
@@ -133,7 +163,7 @@ void updateIMU() {
     ++imuEpoch;
     imuSampleUs = 0;
     serialPrintln("BNO08x reset detected! Restoring reports...");
-    reportEnabled = bno08x.enableReport(SH2_GAME_ROTATION_VECTOR, IMU_REPORT_INTERVAL_US);
+    enableImuReports();
     sendIMUSnapshot();
   }
 

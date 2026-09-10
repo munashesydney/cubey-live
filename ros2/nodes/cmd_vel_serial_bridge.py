@@ -47,6 +47,19 @@ except ImportError:
     from imu_support import ImuPacketClock
 
 
+def telemetry_imu_connected(line: str) -> Optional[bool]:
+    """Read the ESP's BNO08x link flag when that firmware reports it.
+
+    Returns None for firmware that predates the field, so an old image cannot
+    be mistaken for a disconnected sensor.
+    """
+    marker = "imu_conn="
+    index = line.find(marker)
+    if index < 0:
+        return None
+    return line[index + len(marker):index + len(marker) + 1] == "1"
+
+
 def apply_minimum_effective_command(
     forward: int,
     left: int,
@@ -182,6 +195,7 @@ class CmdVelSerialBridgeNode(Node):
         self.imu_clock = ImuPacketClock()
         self.imu_lines = deque(maxlen=100)
         self.imu_last_sample = None
+        self.firmware_imu_conn: Optional[bool] = None
         self.pub_imu = self.create_publisher(Imu, "/imu/raw", qos_profile_sensor_data)
         self.pub_imu_status = self.create_publisher(String, "/cubey/imu_status", 10)
         self.sub_motion = self.create_subscription(String, "/cubey/motion_status", self._on_motion_status, 10)
@@ -322,13 +336,19 @@ class CmdVelSerialBridgeNode(Node):
             self.pub_imu.publish(msg)
         sample = self.imu_last_sample
         age = now-sample.stamp if sample else None
+        # Distinguish "firmware never found the sensor" from "waiting for a
+        # fresh sample", which otherwise look identical from /imu/raw silence.
+        reason = self.imu_clock.reason
+        if sample is None and self.firmware_imu_conn is False:
+            reason = "ESP firmware reports the BNO08x IMU is not connected"
         status = String()
-        status.data = json.dumps({"healthy": bool(sample and 0 <= age <= 0.2 and not self.imu_clock.reason),
+        status.data = json.dumps({"healthy": bool(sample and 0 <= age <= 0.2 and not reason),
                                   "age_s": age, "stream": (*self.imu_clock.stream, self.imu_clock.host_clock_generation) if self.imu_clock.stream else None,
                                   "sequence": self.imu_clock.sequence, "sensor_us": self.imu_clock.sensor_us,
                                   "last_published_stamp": sample.stamp if sample else None,
                                   "calibration": sample.calibration if sample else None,
-                                  "reason": self.imu_clock.reason, "timestamp": now})
+                                  "firmware_imu_connected": self.firmware_imu_conn,
+                                  "reason": reason, "timestamp": now})
         self.pub_imu_status.publish(status)
 
     def _send_raw(self, packet: str):
@@ -477,6 +497,7 @@ class CmdVelSerialBridgeNode(Node):
                     if line.startswith("IMU:") and "t_us=" in line:
                         self.imu_lines.append((line, self.get_clock().now().nanoseconds/1e9, time.monotonic()))
                     elif line.startswith("TELEMETRY:"):
+                        self.firmware_imu_conn = telemetry_imu_connected(line)
                         with open(tmp_w, "w") as f:
                             f.write(line + "\n")
                         os.replace(tmp_w, tmp_telemetry)
