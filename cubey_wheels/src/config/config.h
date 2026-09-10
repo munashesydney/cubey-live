@@ -48,6 +48,12 @@ constexpr const char* CUBEY_FIRMWARE_VERSION = "2026.09.09-ota-1";
 #define IMU_RST 39
 #define IMU_I2C_ADDR 0x4A
 constexpr unsigned long IMU_REPORT_INTERVAL_US = 20000; // 20ms (50Hz)
+// A failed boot probe must not disable heading until the next power cycle.
+// Re-probe while stationary (the SH-2 boot delay would otherwise stall motor
+// and cliff supervision), and treat a link that stops delivering samples as
+// dropped so it can be re-established the same way.
+constexpr unsigned long IMU_RETRY_INTERVAL_MS = 3000;
+constexpr unsigned long IMU_LINK_STALE_MS = 2000;
 
 // ---------------- Onboard Status RGB LED ----------------
 #ifndef RGB_BUILTIN

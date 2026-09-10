@@ -4,7 +4,7 @@ System health, telemetry, and authentication token endpoints.
 
 from fastapi import APIRouter, Depends
 from src.config import config
-from src.services.lidar_service import get_lidar_service
+from src.services.lidar_service import get_lidar_service, read_ros_scan_snapshot
 from src.services.mapping_service import get_mapping_service
 from src.services.wheels_service import get_wheels_service
 from src.services.navigation.cubey_nav_service import get_nav_service
@@ -29,6 +29,12 @@ async def get_system_status(_: str = Depends(verify_credentials)):
 
     snapshot = mapping_svc.get_snapshot()
 
+    # ROS 2 owns the LiDAR hardware on the robot, where the legacy service never
+    # receives scans. Prefer the live ROS snapshot so the dashboard reports the
+    # real sensor rate even before localization is ready.
+    ros_scan = read_ros_scan_snapshot()
+    ros_scan_rate = ros_scan[1] if ros_scan else None
+
     return {
         "status": "online",
         "battery": {
@@ -39,9 +45,9 @@ async def get_system_status(_: str = Depends(verify_credentials)):
         "motion": wheels_svc.telemetry.motion,
         "lidar": {
             "is_connected": lidar_svc.is_connected,
-            "is_scanning": lidar_svc.is_scanning,
+            "is_scanning": lidar_svc.is_scanning or ros_scan_rate is not None,
             "is_mock": lidar_svc.is_mock,
-            "scan_rate_hz": lidar_svc.latest_scan.scan_rate_hz,
+            "scan_rate_hz": round(float(ros_scan_rate), 1) if ros_scan_rate else lidar_svc.latest_scan.scan_rate_hz,
             "min_front_mm": lidar_svc.latest_scan.min_front_dist_mm,
         },
         "mapping": {

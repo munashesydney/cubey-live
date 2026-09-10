@@ -8,13 +8,12 @@ import json
 import logging
 import os
 import secrets
-import time
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
 
 from src.config import config
 from src.services.audio_test_service import get_audio_test_service
-from src.services.lidar_service import get_lidar_service
+from src.services.lidar_service import get_lidar_service, read_ros_scan_snapshot
 from src.services.mapping_service import get_mapping_service
 from src.services.wheels_service import get_wheels_service
 from src.services.navigation.cubey_nav_service import get_nav_service
@@ -156,20 +155,12 @@ async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(
                 # The native ROS LiDAR owns the hardware, so its live points
                 # arrive through a small loopback IPC snapshot rather than the
                 # disabled legacy Python LiDAR service.
-                nav2_scan_file = "/tmp/cubey_nav2_live_scan.json"
-                if os.path.exists(nav2_scan_file):
-                    try:
-                        with open(nav2_scan_file, "r") as scan_file:
-                            nav2_scan = json.load(scan_file)
-                        scan_timestamp = float(nav2_scan.get("timestamp", 0.0))
-                        scan_age = time.time() - scan_timestamp
-                        if scan_age <= 1.0:
-                            payload["laser_scan"] = nav2_scan.get("laser_scan", [])
-                            ros_scan_rate = nav2_scan.get("scan_rate_hz")
-                            if isinstance(ros_scan_rate, (int, float)) and ros_scan_rate > 0:
-                                payload["lidar_rate_hz"] = round(float(ros_scan_rate), 1)
-                    except Exception:
-                        pass
+                ros_scan = read_ros_scan_snapshot()
+                if ros_scan is not None:
+                    scan_hits, ros_scan_rate = ros_scan
+                    payload["laser_scan"] = scan_hits
+                    if ros_scan_rate and ros_scan_rate > 0:
+                        payload["lidar_rate_hz"] = round(float(ros_scan_rate), 1)
 
                 live_pose = read_live_pose()
                 payload["pose_fresh"] = live_pose.get("pose_fresh", False)

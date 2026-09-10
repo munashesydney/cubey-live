@@ -701,26 +701,26 @@ class CubeyFrontierExplorerNode(Node):
             return
         self.last_scan_export_time = now
         self._update_robot_pose_from_tf()
-        if not getattr(self, "robot_pose", None):
-            return
-
-        robot_x, robot_y, robot_yaw = self.robot_pose
-        cos_yaw = math.cos(robot_yaw)
-        sin_yaw = math.sin(robot_yaw)
+        # The scan rate is a sensor-health signal, so export it even before
+        # localization is ready. Only the map-frame points need a pose.
         hits: List[List[float]] = []
+        if getattr(self, "robot_pose", None):
+            robot_x, robot_y, robot_yaw = self.robot_pose
+            cos_yaw = math.cos(robot_yaw)
+            sin_yaw = math.sin(robot_yaw)
 
-        # Match the old mapper's proven self-reflection filter: Cubey's own
-        # chassis occupies the first 14 cm around the laser.
-        for index, range_m in enumerate(msg.ranges):
-            if not math.isfinite(range_m) or range_m < 0.14 or range_m > msg.range_max:
-                continue
-            angle = msg.angle_min + index * msg.angle_increment
-            laser_x = range_m * math.cos(angle)
-            laser_y = range_m * math.sin(angle)
-            base_x = laser_x - 0.035  # laser is 35 mm behind base_link
-            world_x = robot_x + base_x * cos_yaw - laser_y * sin_yaw
-            world_y = robot_y + base_x * sin_yaw + laser_y * cos_yaw
-            hits.append([round(world_x, 3), round(world_y, 3)])
+            # Match the old mapper's proven self-reflection filter: Cubey's own
+            # chassis occupies the first 14 cm around the laser.
+            for index, range_m in enumerate(msg.ranges):
+                if not math.isfinite(range_m) or range_m < 0.14 or range_m > msg.range_max:
+                    continue
+                angle = msg.angle_min + index * msg.angle_increment
+                laser_x = range_m * math.cos(angle)
+                laser_y = range_m * math.sin(angle)
+                base_x = laser_x - 0.035  # laser is 35 mm behind base_link
+                world_x = robot_x + base_x * cos_yaw - laser_y * sin_yaw
+                world_y = robot_y + base_x * sin_yaw + laser_y * cos_yaw
+                hits.append([round(world_x, 3), round(world_y, 3)])
 
         self.latest_scan_hits = hits
         try:

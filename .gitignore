@@ -21,3 +21,6 @@ data/
 Thumbs.db
 .idea/
 .vscode/
+
+# Arduino build output (arduino-cli defaults to <sketch>/build)
+cubey_wheels/build/

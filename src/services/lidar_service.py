@@ -6,6 +6,7 @@ real-time 360-degree point cloud packet decoding, 4-sector obstacle proximity te
 health monitoring, motor control, and simulated mock radar generation.
 """
 
+import json
 import math
 import logging
 import platform
@@ -44,6 +45,30 @@ CMD_GET_SAMPLERATE = 0x59
 RESP_DESCRIPTOR_LEN = 7
 RESP_HEALTH_LEN = 3
 RESP_INFO_LEN = 20
+
+# Native ROS 2 nodes own the LiDAR hardware on the robot and export a small
+# loopback snapshot for the web layer.
+ROS_SCAN_SNAPSHOT_PATH = "/tmp/cubey_nav2_live_scan.json"
+
+
+def read_ros_scan_snapshot(max_age_s: float = 1.0, path: str = ROS_SCAN_SNAPSHOT_PATH):
+    """Read the live ROS LiDAR snapshot exported by the frontier explorer.
+
+    Returns ``(laser_scan, scan_rate_hz)`` or ``None`` when the snapshot is
+    missing, stale, or malformed. On the robot the legacy LiDAR service never
+    receives scans, so this is the only live scan source.
+    """
+    try:
+        with open(path, encoding="utf-8") as stream:
+            data = json.load(stream)
+        if not isinstance(data, dict):
+            return None
+        if time.time() - float(data.get("timestamp", 0.0)) > max_age_s:
+            return None
+        rate = data.get("scan_rate_hz")
+        return data.get("laser_scan", []), rate if isinstance(rate, (int, float)) else None
+    except (OSError, TypeError, ValueError):
+        return None
 
 
 @dataclass
