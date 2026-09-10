@@ -82,16 +82,18 @@ def main() -> int:
         parser.error(f"firmware image does not exist: {image}")
     original_connection = active_wifi_connection()
     print(f"Saving Pi Wi-Fi connection: {original_connection}")
-    connected_to_cubey = False
+    handoff_started = False
     try:
         # A named, non-autoconnecting profile is easy to remove after use.
         nmcli("connection", "delete", TEMP_CONNECTION, check=False)
         wait_for_ssid(args.ssid, args.wifi_device)
+        # NetworkManager may switch radios before it reports a connection error.
+        # From this point onward, always explicitly restore the saved network.
+        handoff_started = True
         nmcli("device", "wifi", "connect", args.ssid, "password", args.wifi_password,
               "ifname", args.wifi_device, "name", TEMP_CONNECTION)
         nmcli("connection", "modify", TEMP_CONNECTION, "connection.autoconnect", "no",
               "ipv4.never-default", "yes")
-        connected_to_cubey = True
         status = wait_for_updater(args.host, args.esp_password)
         print("ESP updater:", json.dumps(status, sort_keys=True))
         body, content_type = multipart_image(image)
@@ -102,7 +104,7 @@ def main() -> int:
         print("ESP accepted and verified firmware; it is restarting.")
         return 0
     finally:
-        if connected_to_cubey:
+        if handoff_started:
             print(f"Restoring Pi Wi-Fi connection: {original_connection}")
             try:
                 nmcli("connection", "up", "id", original_connection, "ifname", args.wifi_device)
