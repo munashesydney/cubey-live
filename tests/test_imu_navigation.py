@@ -111,6 +111,15 @@ def test_heading_interpolation_uses_short_path_through_pi():
     assert history.add(1.01, 0) is False
 
 
+def test_heading_batch_interpolation_matches_individual_beam_times():
+    history = HeadingHistory()
+    history.add(1.00, 0.0)
+    history.add(1.02, 0.2)
+    history.add(1.04, 0.4)
+
+    assert history.at_many([1.00, 1.01, 1.03, 1.04]) == pytest.approx([0.0, 0.1, 0.3, 0.4])
+
+
 def test_recorded_073044_heading_sequence_is_not_a_jump():
     samples = [(0.8018434, -1.6342370522346763), (.8210404, -1.5991323628367224),
                (.8422453, -1.5606895468862603), (.8683724, -1.5244113573763922),
@@ -236,10 +245,8 @@ def test_slam_scan_gate_passes_measured_scans_and_closes_on_reset():
     assert node.pub_slam_scan.publish.call_count == 1
 
 
-def test_slam_scan_gate_waits_for_a_rapid_turn_to_settle():
+def test_slam_scan_gate_keeps_slam_alive_during_a_rapid_turn():
     node = measurement_node()
-    node.max_mapping_yaw_rate = 0.35
-    node.mapping_turn_settle_sec = 0.25
     node._now.return_value = 100.1
     node.imu_status_time = node.last_imu_time = node.last_translation_time = node.filtered_stamp = 100.1
     node.filtered_pose = (0., 0., 0.)
@@ -247,26 +254,14 @@ def test_slam_scan_gate_waits_for_a_rapid_turn_to_settle():
     scan = NS()
 
     node._forward_slam_scan(scan, 0.)
-    node.pub_slam_scan.publish.assert_not_called()
-    assert node.slam_scan_gate_reason == "Paused SLAM scan integration during rapid turn"
-
-    node._now.return_value = 100.2
-    node.imu_status_time = node.last_imu_time = node.last_translation_time = node.filtered_stamp = 100.2
-    node.wz = 0.0
-    node._forward_slam_scan(scan, 0.)
-    node.pub_slam_scan.publish.assert_not_called()
-
-    node._now.return_value = 100.5
-    node.imu_status_time = node.last_imu_time = node.last_translation_time = node.filtered_stamp = 100.5
-    node._forward_slam_scan(scan, 0.)
     node.pub_slam_scan.publish.assert_called_once_with(scan)
+    assert node.slam_scan_gate_reason == ""
 
 
 def lidar_node(min_deskew_coverage=0.98):
     node = object.__new__(rplidar.RPLidarC1Node)
     node.headings = HeadingHistory()
     node.min_deskew_coverage = min_deskew_coverage
-    node.deskew_heading_wait_sec = 0.15
     node.min_range = 0.05
     node.max_range = 12.0
     node.frame_id = "laser"
@@ -276,16 +271,6 @@ def lidar_node(min_deskew_coverage=0.98):
     node.pub_scan = MagicMock()
     node.get_logger = MagicMock(return_value=MagicMock())
     return node
-
-
-def test_lidar_defers_a_fresh_scan_without_blocking_the_serial_reader():
-    node = lidar_node()
-    node.headings = MagicMock()
-    node.headings.at.return_value = None
-
-    assert not node._publish_laser_scan([(0.0, 1.0, 20, 100.1)], 0.1, defer_if_incomplete=True)
-    node.pub_scan.publish.assert_not_called()
-    assert node.deskew_dropped_scans == 0
 
 
 def test_lidar_refuses_to_publish_a_partially_deskewed_scan():

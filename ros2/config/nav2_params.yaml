@@ -63,10 +63,8 @@ controller_server:
       min_lookahead_dist: 0.10
       max_lookahead_dist: 0.30
       lookahead_time: 1.0
-      # Fast spins turn a full LiDAR revolution into a poor localization
-      # sample on this platform. The SLAM scan gate remains the safety net,
-      # while these conservative Nav2 commands make scan/IMU synchronization
-      # substantially easier in the first place.
+      # Conservative turns keep scan/IMU deskew well-conditioned without
+      # starving SLAM of the continuous scans it needs to maintain map TF.
       rotate_to_heading_angular_vel: 0.35
       max_angular_accel: 1.2
       transform_tolerance: 0.3

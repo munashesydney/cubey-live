@@ -1,7 +1,9 @@
 """ROS-independent IMU transport, quaternion math, and measured scan translation."""
+from bisect import bisect_left
 from collections import deque
 from dataclasses import dataclass
 import math
+import threading
 
 import numpy as np
 
@@ -118,26 +120,52 @@ class ImuPacketClock:
 class HeadingHistory:
     def __init__(self):
         self.samples = deque(maxlen=200)
+        self._lock = threading.Lock()
 
     def add(self, stamp, heading):
-        if self.samples and stamp <= self.samples[-1][0]:
-            return False
-        self.samples.append((stamp, heading))
-        return True
+        with self._lock:
+            if self.samples and stamp <= self.samples[-1][0]:
+                return False
+            self.samples.append((stamp, heading))
+            return True
 
     def at(self, stamp, tolerance=0.06):
-        samples = list(self.samples)
-        if not samples or stamp < samples[0][0]-tolerance:
-            return None
-        if stamp > samples[-1][0]+tolerance:
-            return None
-        for (ta, a), (tb, b) in zip(samples, samples[1:]):
-            if ta <= stamp <= tb:
-                if tb-ta > 0.12:
-                    return None
-                return wrap(a + wrap(b-a)*(stamp-ta)/(tb-ta))
-        nearest = min(samples, key=lambda item: abs(item[0]-stamp))
-        return nearest[1] if abs(nearest[0]-stamp) <= tolerance else None
+        return self.at_many([stamp], tolerance)[0]
+
+    def at_many(self, stamps, tolerance=0.06):
+        """Interpolate many ordered beam times from one thread-safe snapshot.
+
+        A LiDAR revolution contains roughly 500 beams. Copying and linearly
+        searching the entire history for every beam consumed most of a Pi CPU
+        core and delayed Nav2 transforms. One snapshot plus binary searches is
+        bounded and produces the same measured-heading result.
+        """
+        with self._lock:
+            samples = list(self.samples)
+        if not samples:
+            return [None] * len(stamps)
+
+        times = [sample[0] for sample in samples]
+        results = []
+        for stamp in stamps:
+            if stamp < times[0]-tolerance or stamp > times[-1]+tolerance:
+                results.append(None)
+                continue
+            index = bisect_left(times, stamp)
+            if index < len(samples) and times[index] == stamp:
+                results.append(samples[index][1])
+                continue
+            if 0 < index < len(samples):
+                ta, a = samples[index-1]
+                tb, b = samples[index]
+                if tb-ta <= 0.12:
+                    results.append(wrap(a + wrap(b-a)*(stamp-ta)/(tb-ta)))
+                else:
+                    results.append(None)
+                continue
+            nearest = samples[0] if index == 0 else samples[-1]
+            results.append(nearest[1] if abs(nearest[0]-stamp) <= tolerance else None)
+        return results
 
 
 def heading_jump_metrics(samples, stamp, heading):
