@@ -61,6 +61,10 @@ class RPLidarC1Node(Node):
         # deskewed scan is worse than dropping it: SLAM can turn its uncorrected
         # segment into a curved wall during a turn.
         self.declare_parameter("min_deskew_coverage", 0.98)
+        # The scan worker receives the final beam before the ROS executor may
+        # have delivered the corresponding IMU sample. Wait briefly for that
+        # sample instead of unnecessarily discarding an otherwise valid scan.
+        self.declare_parameter("deskew_heading_wait_sec", 0.08)
 
         self.port = self.get_parameter("serial_port").value
         self.baudrate = self.get_parameter("serial_baudrate").value
@@ -70,6 +74,9 @@ class RPLidarC1Node(Node):
         self.angle_compensate = bool(self.get_parameter("angle_compensate").value)
         self.min_deskew_coverage = max(
             0.0, min(1.0, float(self.get_parameter("min_deskew_coverage").value))
+        )
+        self.deskew_heading_wait_sec = max(
+            0.0, float(self.get_parameter("deskew_heading_wait_sec").value)
         )
 
         self.pub_scan = self.create_publisher(LaserScan, "/scan", 10)
@@ -207,6 +214,20 @@ class RPLidarC1Node(Node):
             )
             self._last_deskew_warning_at = now
 
+    def _wait_for_reference_heading(self, stamp: float) -> Optional[float]:
+        """Wait only long enough for the IMU callback to cover a fresh beam."""
+        deadline = time.monotonic() + self.deskew_heading_wait_sec
+        while True:
+            heading = self.headings.at(stamp)
+            if heading is not None:
+                return heading
+            remaining = deadline-time.monotonic()
+            if remaining <= 0.0:
+                return None
+            # This is a background serial worker; sleeping here leaves the ROS
+            # executor free to deliver the IMU message being awaited.
+            time.sleep(min(0.005, remaining))
+
     def _publish_laser_scan(self, points: List[Tuple[float, float, int, float]], scan_time: float):
         """Constructs and publishes sensor_msgs/msg/LaserScan message."""
         if not points:
@@ -219,7 +240,7 @@ class RPLidarC1Node(Node):
         # Rebinning reverses acquisition order. Deskew rotations into the last
         # beam's frame and publish a common-time snapshot, not fictitious beam times.
         stamp = points[-1][3]
-        reference_yaw = self.headings.at(stamp)
+        reference_yaw = self._wait_for_reference_heading(stamp)
         if reference_yaw is None:
             self._drop_unsafe_scan("missing_reference_heading", len(points))
             return
