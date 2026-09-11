@@ -412,6 +412,10 @@ def mission_node():
     node.start_pose = (1., 2., 0.5)
     node.robot_pose = node.start_pose
     node.home_captured = True
+    node.pre_return_map_saved = False
+    node.pre_return_graph_saved = False
+    node.map_export_locked = False
+    node.slam_measurements_paused = False
     node._pose_fresh = MagicMock(return_value=True)
     node._hold_motion = MagicMock()
     node._cancel_active_nav_goal = MagicMock()
@@ -452,22 +456,33 @@ def test_failed_measurement_reset_never_resets_filter_or_starts_slam():
     node._hold_motion.assert_called()
 
 
-def test_saved_checkpoint_does_not_change_navigation_or_localization_state():
+def test_saved_occupancy_map_serializes_graph_without_starting_return():
     node = mission_node()
     node.pre_return_map_base = "checkpoint"
     node._queue_reachable_dock_selection = MagicMock()
+    node.serialize_client = MagicMock()
+    graph_future = MagicMock()
+    node.serialize_client.call_async.return_value = graph_future
     result = MagicMock()
     result.result.return_value.result = True
-    with patch.object(explorer_module, "SaveMap", NS(Response=NS(RESULT_SUCCESS=0)), create=True):
+    with patch.object(
+        explorer_module,
+        "SerializePoseGraph",
+        NS(Request=lambda: NS(filename=None), Response=NS(RESULT_SUCCESS=0)),
+        create=True,
+    ):
         node._on_pre_return_map_saved(result, 7)
     node._queue_reachable_dock_selection.assert_not_called()
     assert node.pre_return_map_saved
+    node.serialize_client.call_async.assert_called_once()
+    assert node.serialize_client.call_async.call_args.args[0].filename == "checkpoint"
     node._hold_motion.assert_not_called()
 
 
 def checkpoint_wait_node():
     node = mission_node()
     node.pre_return_map_saved = False
+    node.pre_return_graph_saved = False
     node.return_localization_pending = True
     node.return_ready_since = None
     node.operation_deadline = time.time()+20
@@ -584,6 +599,7 @@ def test_checkpoint_save_tolerates_stale_localization_only_while_stopped():
 def test_checkpoint_recovery_requires_continuously_fresh_pose_before_return():
     node = checkpoint_wait_node()
     node.pre_return_map_saved = True
+    node.pre_return_graph_saved = True
     node._safety_tick()
     node._queue_reachable_dock_selection.assert_not_called()
     node._pose_fresh.return_value = True
@@ -601,23 +617,21 @@ def test_checkpoint_recovery_requires_continuously_fresh_pose_before_return():
     assert not node.return_localization_pending
 
 
-@pytest.mark.parametrize("save_outcome", ["pending", "failed", "unavailable", "success"])
-def test_return_planning_proceeds_independently_of_checkpoint(save_outcome):
+@pytest.mark.parametrize(
+    "map_saved,graph_saved,should_return",
+    [(False, False, False), (True, False, False), (True, True, True)],
+)
+def test_return_waits_until_complete_snapshot_is_durable(
+    map_saved, graph_saved, should_return
+):
     node = checkpoint_wait_node()
-    node.pre_return_map_base = "checkpoint"
+    node.pre_return_map_saved = map_saved
+    node.pre_return_graph_saved = graph_saved
     node._pose_fresh.return_value = True
-    node.save_map_client = MagicMock()
-    node.save_map_client.service_is_ready.return_value = False
-    if save_outcome == "unavailable":
-        node._request_pre_return_map_save()
-    elif save_outcome != "pending":
-        response = MagicMock()
-        response.result.return_value.result = save_outcome == "success"
-        node._on_pre_return_map_saved(response, 7)
     node._safety_tick()
     node.return_ready_since = time.monotonic()-1
     node._safety_tick()
-    node._queue_reachable_dock_selection.assert_called_once()
+    assert node._queue_reachable_dock_selection.call_count == int(should_return)
     node._fail_mission.assert_not_called()
     assert node.state == "RETURNING_TO_DOCK"
 
@@ -630,10 +644,11 @@ def test_map_save_request_uses_persistent_nav2_service_fields():
     assert (req.image_format, req.map_mode, req.free_thresh, req.occupied_thresh) == ("pgm", "trinary", .25, .65)
 
 
-@pytest.mark.parametrize("saved", [False, True])
-def test_checkpoint_save_and_localization_wait_are_bounded(saved):
+@pytest.mark.parametrize("map_saved,graph_saved", [(False, False), (True, False), (True, True)])
+def test_checkpoint_save_and_localization_wait_are_bounded(map_saved, graph_saved):
     node = checkpoint_wait_node()
-    node.pre_return_map_saved = saved
+    node.pre_return_map_saved = map_saved
+    node.pre_return_graph_saved = graph_saved
     node.operation_deadline = time.time()-1
     node._safety_tick()
     node._fail_mission.assert_called_once()
@@ -648,15 +663,38 @@ def test_old_checkpoint_callback_cannot_start_a_new_missions_return():
     node._queue_reachable_dock_selection.assert_not_called()
 
 
-def test_arrival_saves_final_map_even_when_a_checkpoint_exists(tmp_path):
+def test_arrival_uses_map_sealed_before_return(tmp_path):
     node = mission_node()
     node.map_save_dir = str(tmp_path)
     node.pre_return_map_saved = True
+    node.pre_return_graph_saved = True
+    node.pre_return_map_base = str(tmp_path/"sealed")
     node._save_final_map = MagicMock()
-    node._complete_mapping = MagicMock()
+    node._write_session_metadata = MagicMock()
+    node._pause_slam_after_completion = MagicMock()
     node._initiate_map_finalization(at_dock=True)
-    node._save_final_map.assert_called_once()
+    node._save_final_map.assert_not_called()
+    node._write_session_metadata.assert_called_once()
+    node._pause_slam_after_completion.assert_called_once()
+    assert node.final_map_base == str(tmp_path/"sealed")
+
+
+def test_completed_map_pauses_slam_before_reporting_completion():
+    node = mission_node()
+    node.state = "FINALIZING_MAP"
+    node.pause_slam_client = MagicMock()
+    pause_future = MagicMock()
+    node.pause_slam_client.call_async.return_value = pause_future
+    node._complete_mapping = MagicMock()
+    with patch.object(explorer_module, "Pause", NS(Request=lambda: NS()), create=True):
+        node._pause_slam_after_completion()
     node._complete_mapping.assert_not_called()
+    callback = pause_future.add_done_callback.call_args.args[0]
+    response = MagicMock()
+    response.result.return_value.status = True
+    callback(response)
+    assert node.slam_measurements_paused
+    node._complete_mapping.assert_called_once()
 
 
 def test_pose_export_expires_independently_of_static_map(tmp_path):
