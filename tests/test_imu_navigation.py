@@ -12,6 +12,7 @@ import yaml
 from ros2.nodes.imu_support import (ImuPacketClock, HeadingHistory, conjugate,
     quaternion_multiply, quaternion_from_euler, match_translation, yaw, wrap, heading_jump_metrics)
 from ros2.nodes import cubey_odometry_node as odometry
+from ros2.nodes import rplidar_c1_node as rplidar
 from ros2.nodes import cubey_frontier_explorer_node as explorer_module
 from ros2.nodes.cubey_frontier_explorer_node import CubeyFrontierExplorerNode
 from ros2.nodes.cmd_vel_serial_bridge import CmdVelSerialBridgeNode, MinimumEffectiveCommandPulseFilter
@@ -233,6 +234,98 @@ def test_slam_scan_gate_passes_measured_scans_and_closes_on_reset():
     node._handle_reset_odometry(None, NS())
     node._forward_slam_scan(scan, 0.)
     assert node.pub_slam_scan.publish.call_count == 1
+
+
+def test_slam_scan_gate_waits_for_a_rapid_turn_to_settle():
+    node = measurement_node()
+    node.max_mapping_yaw_rate = 0.35
+    node.mapping_turn_settle_sec = 0.25
+    node._now.return_value = 100.1
+    node.imu_status_time = node.last_imu_time = node.last_translation_time = node.filtered_stamp = 100.1
+    node.filtered_pose = (0., 0., 0.)
+    node.wz = 0.36
+    scan = NS()
+
+    node._forward_slam_scan(scan, 0.)
+    node.pub_slam_scan.publish.assert_not_called()
+    assert node.slam_scan_gate_reason == "Paused SLAM scan integration during rapid turn"
+
+    node._now.return_value = 100.2
+    node.imu_status_time = node.last_imu_time = node.last_translation_time = node.filtered_stamp = 100.2
+    node.wz = 0.0
+    node._forward_slam_scan(scan, 0.)
+    node.pub_slam_scan.publish.assert_not_called()
+
+    node._now.return_value = 100.5
+    node.imu_status_time = node.last_imu_time = node.last_translation_time = node.filtered_stamp = 100.5
+    node._forward_slam_scan(scan, 0.)
+    node.pub_slam_scan.publish.assert_called_once_with(scan)
+
+
+def lidar_node(min_deskew_coverage=0.98):
+    node = object.__new__(rplidar.RPLidarC1Node)
+    node.headings = HeadingHistory()
+    node.min_deskew_coverage = min_deskew_coverage
+    node.min_range = 0.05
+    node.max_range = 12.0
+    node.frame_id = "laser"
+    node.deskew_dropped_scans = 0
+    node.last_deskew_drop_reason = ""
+    node._last_deskew_warning_at = float("-inf")
+    node.pub_scan = MagicMock()
+    node.get_logger = MagicMock(return_value=MagicMock())
+    return node
+
+
+def test_lidar_refuses_to_publish_a_partially_deskewed_scan():
+    node = lidar_node()
+    node.headings.add(100.0, 0.0)
+    node.headings.add(100.1, 0.1)
+    # The first beam predates the available IMU history. It must not quietly
+    # remain raw while later beams are deskewed.
+    points = [(0.0, 1.0, 20, 99.8), (0.1, 1.0, 20, 100.1)]
+
+    node._publish_laser_scan(points, 0.1)
+
+    node.pub_scan.publish.assert_not_called()
+    assert node.deskew_dropped_scans == 1
+    assert node.last_deskew_drop_reason == "insufficient_heading_coverage"
+
+
+def test_lidar_publishes_only_fully_deskewed_common_time_scans():
+    node = lidar_node()
+    node.headings.add(100.0, 0.0)
+    node.headings.add(100.1, 0.1)
+    message = NS(header=NS())
+    fake_time = MagicMock(return_value=NS(to_msg=lambda: NS(sec=100, nanosec=100_100_000)))
+    with patch.object(rplidar, "LaserScan", return_value=message, create=True), \
+         patch.object(rplidar, "Time", fake_time, create=True):
+        node._publish_laser_scan([(0.0, 1.0, 20, 100.0), (0.1, 1.0, 20, 100.1)], 0.1)
+
+    node.pub_scan.publish.assert_called_once_with(message)
+    assert message.time_increment == 0.0
+    assert node.deskew_dropped_scans == 0
+
+
+def test_web_scan_projection_uses_the_scan_timestamp_transform():
+    node = object.__new__(CubeyFrontierExplorerNode)
+    node.tf_buffer = MagicMock()
+    node.tf_buffer.lookup_transform.return_value = NS(
+        transform=NS(
+            translation=NS(x=1.2, y=-0.4),
+            rotation=NS(x=0.0, y=0.0, z=math.sin(0.25), w=math.cos(0.25)),
+        )
+    )
+    scan = NS(header=NS(stamp=NS(sec=100, nanosec=123)))
+
+    fake_time = MagicMock()
+    fake_time.from_msg.return_value = "scan-time"
+    with patch.object(explorer_module, "Time", fake_time, create=True):
+        pose = node._scan_pose_from_tf(scan)
+
+    fake_time.from_msg.assert_called_once_with(scan.header.stamp)
+    node.tf_buffer.lookup_transform.assert_called_once_with("map", "base_link", "scan-time")
+    assert pose == pytest.approx((1.2, -0.4, 0.5))
 
 
 def test_slam_uses_gated_scan_topic():

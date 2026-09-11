@@ -695,17 +695,17 @@ class CubeyFrontierExplorerNode(Node):
         self.odom_pose = (pos.x, pos.y, yaw)
 
     def _on_scan(self, msg: LaserScan):
-        """Export real ROS LiDAR hits in map coordinates for the web canvas."""
+        """Export a scan-time-correct LiDAR snapshot for the web canvas."""
         now = time.time()
         if now - self.last_scan_export_time < 0.20:
             return
         self.last_scan_export_time = now
-        self._update_robot_pose_from_tf()
         # The scan rate is a sensor-health signal, so export it even before
         # localization is ready. Only the map-frame points need a pose.
         hits: List[List[float]] = []
-        if getattr(self, "robot_pose", None):
-            robot_x, robot_y, robot_yaw = self.robot_pose
+        scan_pose = self._scan_pose_from_tf(msg)
+        if scan_pose is not None:
+            robot_x, robot_y, robot_yaw = scan_pose
             cos_yaw = math.cos(robot_yaw)
             sin_yaw = math.sin(robot_yaw)
 
@@ -741,6 +741,28 @@ class CubeyFrontierExplorerNode(Node):
             os.replace(tmp_write, tmp_scan)
         except OSError:
             pass
+
+    def _scan_pose_from_tf(self, msg: LaserScan) -> Optional[Tuple[float, float, float]]:
+        """Return map→base_link at the scan's common reference timestamp.
+
+        The LiDAR driver deskews each revolution into its final beam's frame.
+        Rendering that common-time scan with the *latest* robot pose makes a
+        perfectly good wall appear to bend whenever Cubey turns. Looking up TF
+        at ``msg.header.stamp`` keeps the pink preview honest and lets it be a
+        useful indicator of an actually unsafe scan.
+        """
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                "map", "base_link", Time.from_msg(msg.header.stamp)
+            )
+        except (TransformException, AttributeError, TypeError):
+            return None
+
+        translation = transform.transform.translation
+        rotation = transform.transform.rotation
+        siny_cosp = 2.0 * (rotation.w * rotation.z + rotation.x * rotation.y)
+        cosy_cosp = 1.0 - 2.0 * (rotation.y * rotation.y + rotation.z * rotation.z)
+        return translation.x, translation.y, math.atan2(siny_cosp, cosy_cosp)
 
     def _update_robot_pose_from_tf(self):
         """Use the SLAM-corrected map->base pose for goals and the web trail."""

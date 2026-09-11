@@ -30,13 +30,25 @@ class CubeyOdometryNode(Node):
         super().__init__("cubey_odometry_node")
         for key, default in {"imu_mount_roll": 0.0, "imu_mount_pitch": 0.0,
                              "imu_mount_yaw": 0.0, "laser_x": -0.035,
-                             "laser_y": 0.0, "laser_yaw": 0.0}.items():
+                             "laser_y": 0.0, "laser_yaw": 0.0,
+                             # Mapping remains active while Nav2 turns, but
+                             # SLAM integration waits for the turn to settle.
+                             # This protects the pose graph from any scan that
+                             # escapes LiDAR deskew under high yaw rate.
+                             "max_mapping_yaw_rate_rad_s": 0.35,
+                             "mapping_turn_settle_sec": 0.25}.items():
             self.declare_parameter(key, default)
         self.mount = quaternion_from_euler(*(float(self.get_parameter("imu_mount_"+axis).value)
                                             for axis in ("roll", "pitch", "yaw")))
         self.laser_x = float(self.get_parameter("laser_x").value)
         self.laser_y = float(self.get_parameter("laser_y").value)
         self.laser_yaw = float(self.get_parameter("laser_yaw").value)
+        self.max_mapping_yaw_rate = max(
+            0.0, float(self.get_parameter("max_mapping_yaw_rate_rad_s").value)
+        )
+        self.mapping_turn_settle_sec = max(
+            0.0, float(self.get_parameter("mapping_turn_settle_sec").value)
+        )
         self.imu_stream = None
         self.imu_healthy = False
         self.imu_status_time = 0.0
@@ -66,6 +78,10 @@ class CubeyOdometryNode(Node):
         self.prev_points = None
         self.prev_scan_yaw = 0.0
         self.x = self.y = self.wz = 0.0
+        self.last_excessive_turn_time = float("-inf")
+        self.slam_scan_gate_reason = ""
+        self.slam_scan_dropped_turning = 0
+        self.slam_scan_forwarded = 0
         self.position_variance = 0.0001
         self.filtered_pose = None
         self.filtered_stamp = 0.0
@@ -81,6 +97,15 @@ class CubeyOdometryNode(Node):
         x, y, angle = self.filtered_pose
         return math.hypot(x-self.x, y-self.y) <= 0.3 and abs(wrap(angle-heading)) <= math.radians(20)
 
+    def _mapping_turn_is_safe(self, now):
+        """Keep true Nav2 motion running while excluding high-yaw SLAM scans."""
+        maximum = float(getattr(self, "max_mapping_yaw_rate", 0.35))
+        settle = float(getattr(self, "mapping_turn_settle_sec", 0.25))
+        if abs(self.wz) > maximum:
+            self.last_excessive_turn_time = now
+            return False
+        return now-self.last_excessive_turn_time >= settle
+
     def _forward_slam_scan(self, msg, heading):
         # Raw scans still feed measured odometry and obstacle detection. SLAM
         # only receives scans supported by current measurements and filtered pose.
@@ -89,7 +114,15 @@ class CubeyOdometryNode(Node):
                 and 0 <= now-self.last_imu_time <= 0.2
                 and 0 <= now-self.last_translation_time <= 0.25
                 and self._filter_consistent(heading)):
+            if not self._mapping_turn_is_safe(now):
+                self.slam_scan_gate_reason = "Paused SLAM scan integration during rapid turn"
+                self.slam_scan_dropped_turning += 1
+                return
+            self.slam_scan_gate_reason = ""
             self.pub_slam_scan.publish(msg)
+            self.slam_scan_forwarded += 1
+        else:
+            self.slam_scan_gate_reason = "Waiting for fresh, consistent IMU and LiDAR measurements"
 
     def _handle_reset_odometry(self, request, response):
         self._reset_state()
@@ -132,6 +165,8 @@ class CubeyOdometryNode(Node):
                 return
             metrics = heading_jump_metrics(list(self.history.samples), stamp, heading)
             self.wz = metrics["window_rate_rad_s"]
+            if abs(self.wz) > float(getattr(self, "max_mapping_yaw_rate", 0.35)):
+                self.last_excessive_turn_time = self._now()
             if metrics["jump"]:
                 self.fault = "Implausible IMU heading jump; restart mapping"
                 self.get_logger().error("IMU_HEADING_JUMP " + json.dumps({
@@ -232,6 +267,10 @@ class CubeyOdometryNode(Node):
                                "imu_available": self.imu_healthy and now-self.imu_status_time < 0.3,
                                "imu_ok": imu_ok, "scan_ok": scan_ok,
                                "filter_ok": filter_ok,
+                               "slam_scan_gate": self.slam_scan_gate_reason or "open",
+                               "mapping_yaw_rate_rad_s": round(float(self.wz), 3),
+                               "slam_scan_dropped_turning": self.slam_scan_dropped_turning,
+                               "slam_scan_forwarded": self.slam_scan_forwarded,
                                "fault": self.fault,
                                "reason": self.fault or ("Waiting for fresh IMU and observable LiDAR translation" if not (imu_ok and scan_ok) else ("" if filter_ok else "Waiting for filtered pose to agree with measurements")),
                                "reset_time": self.reset_time, "timestamp": now})

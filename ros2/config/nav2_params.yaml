@@ -63,8 +63,12 @@ controller_server:
       min_lookahead_dist: 0.10
       max_lookahead_dist: 0.30
       lookahead_time: 1.0
-      rotate_to_heading_angular_vel: 0.60
-      max_angular_accel: 2.5
+      # Fast spins turn a full LiDAR revolution into a poor localization
+      # sample on this platform. The SLAM scan gate remains the safety net,
+      # while these conservative Nav2 commands make scan/IMU synchronization
+      # substantially easier in the first place.
+      rotate_to_heading_angular_vel: 0.35
+      max_angular_accel: 1.2
       transform_tolerance: 0.3
       use_velocity_scaled_lookahead_dist: true
       min_approach_linear_velocity: 0.08

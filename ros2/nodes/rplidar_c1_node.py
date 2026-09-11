@@ -56,6 +56,11 @@ class RPLidarC1Node(Node):
         self.declare_parameter("min_range", 0.05)
         self.declare_parameter("max_range", 12.0)
         self.declare_parameter("angle_compensate", True)
+        # A scan is only safe to treat as a common-time snapshot when the IMU
+        # covers nearly all of the LiDAR revolution. Publishing a partly
+        # deskewed scan is worse than dropping it: SLAM can turn its uncorrected
+        # segment into a curved wall during a turn.
+        self.declare_parameter("min_deskew_coverage", 0.98)
 
         self.port = self.get_parameter("serial_port").value
         self.baudrate = self.get_parameter("serial_baudrate").value
@@ -63,10 +68,17 @@ class RPLidarC1Node(Node):
         self.min_range = float(self.get_parameter("min_range").value)
         self.max_range = float(self.get_parameter("max_range").value)
         self.angle_compensate = bool(self.get_parameter("angle_compensate").value)
+        self.min_deskew_coverage = max(
+            0.0, min(1.0, float(self.get_parameter("min_deskew_coverage").value))
+        )
 
         self.pub_scan = self.create_publisher(LaserScan, "/scan", 10)
         self.headings = HeadingHistory()
         self.sub_imu = self.create_subscription(Imu, "/imu/data", self._on_imu, qos_profile_sensor_data)
+
+        self.deskew_dropped_scans = 0
+        self.last_deskew_drop_reason = ""
+        self._last_deskew_warning_at = 0.0
 
         self.serial_conn: Optional[serial.Serial] = None
         self._running = False
@@ -181,7 +193,21 @@ class RPLidarC1Node(Node):
                     time.sleep(0.1)
                 break
 
-    def _publish_laser_scan(self, points: List[Tuple[float, float, int]], scan_time: float):
+    def _drop_unsafe_scan(self, reason: str, point_count: int, covered_count: int = 0) -> None:
+        """Record a scan deliberately withheld from every downstream consumer."""
+        self.deskew_dropped_scans += 1
+        self.last_deskew_drop_reason = reason
+        now = time.monotonic()
+        # Keep the diagnostic useful without flooding the ROS log at scan rate.
+        if now - self._last_deskew_warning_at >= 1.0:
+            self.get_logger().warn(
+                "SCAN_DROPPED_UNSAFE_DESKEW "
+                f"reason={reason} covered={covered_count}/{point_count} "
+                f"required={self.min_deskew_coverage:.0%}"
+            )
+            self._last_deskew_warning_at = now
+
+    def _publish_laser_scan(self, points: List[Tuple[float, float, int, float]], scan_time: float):
         """Constructs and publishes sensor_msgs/msg/LaserScan message."""
         if not points:
             return
@@ -194,19 +220,34 @@ class RPLidarC1Node(Node):
         # beam's frame and publish a common-time snapshot, not fictitious beam times.
         stamp = points[-1][3]
         reference_yaw = self.headings.at(stamp)
+        if reference_yaw is None:
+            self._drop_unsafe_scan("missing_reference_heading", len(points))
+            return
+
+        # Do not fall back to raw beam coordinates when IMU interpolation is
+        # incomplete. A whole dropped scan creates a small coverage gap; a
+        # partial raw scan creates a persistent, bent obstacle in /map.
+        deskewed_points = []
+        for angle_rad, dist_m, quality, beam_stamp in points:
+            beam_yaw = self.headings.at(beam_stamp)
+            if beam_yaw is None:
+                continue
+            delta = beam_yaw-reference_yaw
+            bx = dist_m*math.cos(angle_rad)-0.035
+            by = dist_m*math.sin(angle_rad)
+            lx = bx*math.cos(delta)-by*math.sin(delta)+0.035
+            ly = bx*math.sin(delta)+by*math.cos(delta)
+            deskewed_points.append((math.atan2(ly, lx), math.hypot(lx, ly), quality))
+
+        coverage = len(deskewed_points) / len(points)
+        if coverage < self.min_deskew_coverage:
+            self._drop_unsafe_scan("insufficient_heading_coverage", len(points), len(deskewed_points))
+            return
 
         ranges = [float("inf")] * num_readings
         intensities = [0.0] * num_readings
 
-        for angle_rad, dist_m, quality, beam_stamp in points:
-            beam_yaw = self.headings.at(beam_stamp)
-            if reference_yaw is not None and beam_yaw is not None:
-                delta = beam_yaw-reference_yaw
-                bx = dist_m*math.cos(angle_rad)-0.035
-                by = dist_m*math.sin(angle_rad)
-                lx = bx*math.cos(delta)-by*math.sin(delta)+0.035
-                ly = bx*math.sin(delta)+by*math.cos(delta)
-                angle_rad, dist_m = math.atan2(ly, lx), math.hypot(lx, ly)
+        for angle_rad, dist_m, quality in deskewed_points:
             if self.min_range <= dist_m <= self.max_range:
                 idx = int((angle_rad - angle_min) / angle_increment)
                 if 0 <= idx < num_readings:
@@ -220,6 +261,9 @@ class RPLidarC1Node(Node):
         msg.angle_min = angle_min
         msg.angle_max = angle_max
         msg.angle_increment = angle_increment
+        # Points were explicitly deskewed into the final beam's frame, so this
+        # is a true common-time scan rather than a scan that needs TF to infer
+        # per-beam motion.
         msg.time_increment = 0.0
         msg.scan_time = scan_time if scan_time > 0 else 0.1
         msg.range_min = self.min_range
