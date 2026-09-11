@@ -330,6 +330,14 @@ def test_slam_uses_gated_scan_topic():
     assert config["slam_toolbox"]["ros__parameters"]["scan_topic"] == "/scan/slam"
 
 
+def test_slam_cannot_apply_catastrophic_global_loop_closures():
+    from pathlib import Path
+    config = yaml.safe_load(Path("ros2/config/slam_toolbox_params.yaml").read_text())
+    params = config["slam_toolbox"]["ros__parameters"]
+    assert params["use_scan_matching"] is True
+    assert params["do_loop_closing"] is False
+
+
 def test_translation_publication_preserves_forwarded_laser_frame():
     node = measurement_node()
     node.laser_x = node.laser_y = node.laser_yaw = 0.
