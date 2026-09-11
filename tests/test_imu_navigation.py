@@ -266,7 +266,7 @@ def lidar_node(min_deskew_coverage=0.98):
     node = object.__new__(rplidar.RPLidarC1Node)
     node.headings = HeadingHistory()
     node.min_deskew_coverage = min_deskew_coverage
-    node.deskew_heading_wait_sec = 0.0
+    node.deskew_heading_wait_sec = 0.15
     node.min_range = 0.05
     node.max_range = 12.0
     node.frame_id = "laser"
@@ -278,14 +278,14 @@ def lidar_node(min_deskew_coverage=0.98):
     return node
 
 
-def test_lidar_briefly_waits_for_the_matching_imu_heading():
+def test_lidar_defers_a_fresh_scan_without_blocking_the_serial_reader():
     node = lidar_node()
-    node.deskew_heading_wait_sec = 0.02
     node.headings = MagicMock()
-    node.headings.at.side_effect = [None, 0.25]
+    node.headings.at.return_value = None
 
-    assert node._wait_for_reference_heading(100.1) == pytest.approx(0.25)
-    assert node.headings.at.call_count == 2
+    assert not node._publish_laser_scan([(0.0, 1.0, 20, 100.1)], 0.1, defer_if_incomplete=True)
+    node.pub_scan.publish.assert_not_called()
+    assert node.deskew_dropped_scans == 0
 
 
 def test_lidar_refuses_to_publish_a_partially_deskewed_scan():

@@ -12,7 +12,8 @@ import struct
 import sys
 import threading
 import time
-from typing import List, Optional, Tuple
+from collections import deque
+from typing import Deque, List, Optional, Tuple
 
 try:
     import rclpy
@@ -62,9 +63,10 @@ class RPLidarC1Node(Node):
         # segment into a curved wall during a turn.
         self.declare_parameter("min_deskew_coverage", 0.98)
         # The scan worker receives the final beam before the ROS executor may
-        # have delivered the corresponding IMU sample. Wait briefly for that
-        # sample instead of unnecessarily discarding an otherwise valid scan.
-        self.declare_parameter("deskew_heading_wait_sec", 0.08)
+        # have delivered the corresponding IMU sample. Hold the completed scan
+        # briefly for that sample; never sleep in the serial-reader thread,
+        # because doing so creates a serial backlog and stale scan timestamps.
+        self.declare_parameter("deskew_heading_wait_sec", 0.15)
 
         self.port = self.get_parameter("serial_port").value
         self.baudrate = self.get_parameter("serial_baudrate").value
@@ -86,6 +88,10 @@ class RPLidarC1Node(Node):
         self.deskew_dropped_scans = 0
         self.last_deskew_drop_reason = ""
         self._last_deskew_warning_at = 0.0
+        self._pending_scans: Deque[Tuple[List[Tuple[float, float, int, float]], float, float]] = deque()
+        self._pending_scan_lock = threading.Lock()
+        self._max_pending_scans = 4
+        self._scan_publish_timer = self.create_timer(0.01, self._publish_pending_scan)
 
         self.serial_conn: Optional[serial.Serial] = None
         self._running = False
@@ -181,7 +187,7 @@ class RPLidarC1Node(Node):
                     scan_time = now - last_sweep_time
                     last_sweep_time = now
 
-                    self._publish_laser_scan(accumulated_points, scan_time)
+                    self._enqueue_laser_scan(accumulated_points, scan_time)
                     accumulated_points = []
 
                 if dist_m > 0:
@@ -214,21 +220,38 @@ class RPLidarC1Node(Node):
             )
             self._last_deskew_warning_at = now
 
-    def _wait_for_reference_heading(self, stamp: float) -> Optional[float]:
-        """Wait only long enough for the IMU callback to cover a fresh beam."""
-        deadline = time.monotonic() + self.deskew_heading_wait_sec
-        while True:
-            heading = self.headings.at(stamp)
-            if heading is not None:
-                return heading
-            remaining = deadline-time.monotonic()
-            if remaining <= 0.0:
-                return None
-            # This is a background serial worker; sleeping here leaves the ROS
-            # executor free to deliver the IMU message being awaited.
-            time.sleep(min(0.005, remaining))
+    def _enqueue_laser_scan(self, points: List[Tuple[float, float, int, float]], scan_time: float) -> None:
+        """Move a completed sweep off the serial thread for IMU-aware publication."""
+        dropped = None
+        with self._pending_scan_lock:
+            if len(self._pending_scans) >= self._max_pending_scans:
+                dropped = self._pending_scans.popleft()
+            self._pending_scans.append((points, scan_time, time.monotonic()))
+        if dropped is not None:
+            self._drop_unsafe_scan("deskew_queue_overflow", len(dropped[0]))
 
-    def _publish_laser_scan(self, points: List[Tuple[float, float, int, float]], scan_time: float):
+    def _publish_pending_scan(self) -> None:
+        """Publish a queued scan once its complete IMU interval is available."""
+        with self._pending_scan_lock:
+            if not self._pending_scans:
+                return
+            pending = self._pending_scans[0]
+
+        points, scan_time, queued_at = pending
+        finished = self._publish_laser_scan(points, scan_time, defer_if_incomplete=True)
+        if not finished and time.monotonic()-queued_at < self.deskew_heading_wait_sec:
+            return
+        if not finished:
+            # The matching IMU history did not arrive in time. Explicitly drop
+            # rather than ever allowing a partly deskewed scan into SLAM.
+            self._publish_laser_scan(points, scan_time)
+
+        with self._pending_scan_lock:
+            if self._pending_scans and self._pending_scans[0] is pending:
+                self._pending_scans.popleft()
+
+    def _publish_laser_scan(self, points: List[Tuple[float, float, int, float]], scan_time: float,
+                            defer_if_incomplete: bool = False) -> bool:
         """Constructs and publishes sensor_msgs/msg/LaserScan message."""
         if not points:
             return
@@ -240,10 +263,12 @@ class RPLidarC1Node(Node):
         # Rebinning reverses acquisition order. Deskew rotations into the last
         # beam's frame and publish a common-time snapshot, not fictitious beam times.
         stamp = points[-1][3]
-        reference_yaw = self._wait_for_reference_heading(stamp)
+        reference_yaw = self.headings.at(stamp)
         if reference_yaw is None:
+            if defer_if_incomplete:
+                return False
             self._drop_unsafe_scan("missing_reference_heading", len(points))
-            return
+            return True
 
         # Do not fall back to raw beam coordinates when IMU interpolation is
         # incomplete. A whole dropped scan creates a small coverage gap; a
@@ -262,8 +287,10 @@ class RPLidarC1Node(Node):
 
         coverage = len(deskewed_points) / len(points)
         if coverage < self.min_deskew_coverage:
+            if defer_if_incomplete:
+                return False
             self._drop_unsafe_scan("insufficient_heading_coverage", len(points), len(deskewed_points))
-            return
+            return True
 
         ranges = [float("inf")] * num_readings
         intensities = [0.0] * num_readings
@@ -293,6 +320,7 @@ class RPLidarC1Node(Node):
         msg.intensities = intensities
 
         self.pub_scan.publish(msg)
+        return True
 
 
     def destroy_node(self):
