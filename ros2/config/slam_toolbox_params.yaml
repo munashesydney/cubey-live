@@ -42,7 +42,11 @@ slam_toolbox:
     link_match_minimum_response_fine: 0.1
     link_scan_maximum_distance: 1.5
     loop_search_maximum_distance: 3.0
-    do_loop_closing: true
+    # Cubey's room-scale maps are locally consistent, while a false global
+    # closure can move map->odom metres at once and warp an otherwise clean
+    # map. Keep native sequential scan matching, but do not globally rewrite
+    # the live pose graph during exploration.
+    do_loop_closing: false
     loop_match_minimum_chain_size: 10
     loop_match_maximum_variance_coarse: 3.0
     loop_match_minimum_response_coarse: 0.35

@@ -63,8 +63,10 @@ controller_server:
       min_lookahead_dist: 0.10
       max_lookahead_dist: 0.30
       lookahead_time: 1.0
-      rotate_to_heading_angular_vel: 0.60
-      max_angular_accel: 2.5
+      # Conservative turns keep scan/IMU deskew well-conditioned without
+      # starving SLAM of the continuous scans it needs to maintain map TF.
+      rotate_to_heading_angular_vel: 0.35
+      max_angular_accel: 1.2
       transform_tolerance: 0.3
       use_velocity_scaled_lookahead_dist: true
       min_approach_linear_velocity: 0.08

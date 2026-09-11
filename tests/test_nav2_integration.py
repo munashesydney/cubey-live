@@ -323,7 +323,7 @@ class Nav2IntegrationTests(unittest.TestCase):
         explorer._hold_motion.assert_called_once()
         self.assertEqual(explorer.state, "RETURNING_TO_DOCK")
 
-    def test_transient_pre_return_map_save_failure_retries_without_stopping(self):
+    def test_pre_return_map_save_failure_stops_before_return(self):
         explorer = object.__new__(CubeyFrontierExplorerNode)
         explorer.state = "RETURNING_TO_DOCK"
         explorer.pre_return_save_attempts = 1
@@ -331,6 +331,7 @@ class Nav2IntegrationTests(unittest.TestCase):
         explorer.get_logger = MagicMock(return_value=MagicMock())
         explorer._request_pre_return_map_save = MagicMock()
         explorer._initiate_map_finalization = MagicMock()
+        explorer._fail_mission = MagicMock()
         failed_response = MagicMock()
         failed_response.result = False
         future = MagicMock()
@@ -343,7 +344,7 @@ class Nav2IntegrationTests(unittest.TestCase):
         ):
             explorer._on_pre_return_map_saved(future)
 
-        explorer._request_pre_return_map_save.assert_not_called()
+        explorer._fail_mission.assert_called_once()
         explorer._initiate_map_finalization.assert_not_called()
         self.assertFalse(explorer.pre_return_map_saved)
 

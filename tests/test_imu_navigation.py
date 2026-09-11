@@ -12,6 +12,7 @@ import yaml
 from ros2.nodes.imu_support import (ImuPacketClock, HeadingHistory, conjugate,
     quaternion_multiply, quaternion_from_euler, match_translation, yaw, wrap, heading_jump_metrics)
 from ros2.nodes import cubey_odometry_node as odometry
+from ros2.nodes import rplidar_c1_node as rplidar
 from ros2.nodes import cubey_frontier_explorer_node as explorer_module
 from ros2.nodes.cubey_frontier_explorer_node import CubeyFrontierExplorerNode
 from ros2.nodes.cmd_vel_serial_bridge import CmdVelSerialBridgeNode, MinimumEffectiveCommandPulseFilter
@@ -108,6 +109,15 @@ def test_heading_interpolation_uses_short_path_through_pi():
     assert abs(history.at(1.01)) == pytest.approx(math.pi)
     assert history.at(2) is None
     assert history.add(1.01, 0) is False
+
+
+def test_heading_batch_interpolation_matches_individual_beam_times():
+    history = HeadingHistory()
+    history.add(1.00, 0.0)
+    history.add(1.02, 0.2)
+    history.add(1.04, 0.4)
+
+    assert history.at_many([1.00, 1.01, 1.03, 1.04]) == pytest.approx([0.0, 0.1, 0.3, 0.4])
 
 
 def test_recorded_073044_heading_sequence_is_not_a_jump():
@@ -235,10 +245,97 @@ def test_slam_scan_gate_passes_measured_scans_and_closes_on_reset():
     assert node.pub_slam_scan.publish.call_count == 1
 
 
+def test_slam_scan_gate_keeps_slam_alive_during_a_rapid_turn():
+    node = measurement_node()
+    node._now.return_value = 100.1
+    node.imu_status_time = node.last_imu_time = node.last_translation_time = node.filtered_stamp = 100.1
+    node.filtered_pose = (0., 0., 0.)
+    node.wz = 0.36
+    scan = NS()
+
+    node._forward_slam_scan(scan, 0.)
+    node.pub_slam_scan.publish.assert_called_once_with(scan)
+    assert node.slam_scan_gate_reason == ""
+
+
+def lidar_node(min_deskew_coverage=0.98):
+    node = object.__new__(rplidar.RPLidarC1Node)
+    node.headings = HeadingHistory()
+    node.min_deskew_coverage = min_deskew_coverage
+    node.min_range = 0.05
+    node.max_range = 12.0
+    node.frame_id = "laser"
+    node.deskew_dropped_scans = 0
+    node.last_deskew_drop_reason = ""
+    node._last_deskew_warning_at = float("-inf")
+    node.pub_scan = MagicMock()
+    node.get_logger = MagicMock(return_value=MagicMock())
+    return node
+
+
+def test_lidar_refuses_to_publish_a_partially_deskewed_scan():
+    node = lidar_node()
+    node.headings.add(100.0, 0.0)
+    node.headings.add(100.1, 0.1)
+    # The first beam predates the available IMU history. It must not quietly
+    # remain raw while later beams are deskewed.
+    points = [(0.0, 1.0, 20, 99.8), (0.1, 1.0, 20, 100.1)]
+
+    node._publish_laser_scan(points, 0.1)
+
+    node.pub_scan.publish.assert_not_called()
+    assert node.deskew_dropped_scans == 1
+    assert node.last_deskew_drop_reason == "insufficient_heading_coverage"
+
+
+def test_lidar_publishes_only_fully_deskewed_common_time_scans():
+    node = lidar_node()
+    node.headings.add(100.0, 0.0)
+    node.headings.add(100.1, 0.1)
+    message = NS(header=NS())
+    fake_time = MagicMock(return_value=NS(to_msg=lambda: NS(sec=100, nanosec=100_100_000)))
+    with patch.object(rplidar, "LaserScan", return_value=message, create=True), \
+         patch.object(rplidar, "Time", fake_time, create=True):
+        node._publish_laser_scan([(0.0, 1.0, 20, 100.0), (0.1, 1.0, 20, 100.1)], 0.1)
+
+    node.pub_scan.publish.assert_called_once_with(message)
+    assert message.time_increment == 0.0
+    assert node.deskew_dropped_scans == 0
+
+
+def test_web_scan_projection_uses_the_scan_timestamp_transform():
+    node = object.__new__(CubeyFrontierExplorerNode)
+    node.tf_buffer = MagicMock()
+    node.tf_buffer.lookup_transform.return_value = NS(
+        transform=NS(
+            translation=NS(x=1.2, y=-0.4),
+            rotation=NS(x=0.0, y=0.0, z=math.sin(0.25), w=math.cos(0.25)),
+        )
+    )
+    scan = NS(header=NS(stamp=NS(sec=100, nanosec=123)))
+
+    fake_time = MagicMock()
+    fake_time.from_msg.return_value = "scan-time"
+    with patch.object(explorer_module, "Time", fake_time, create=True):
+        pose = node._scan_pose_from_tf(scan)
+
+    fake_time.from_msg.assert_called_once_with(scan.header.stamp)
+    node.tf_buffer.lookup_transform.assert_called_once_with("map", "base_link", "scan-time")
+    assert pose == pytest.approx((1.2, -0.4, 0.5))
+
+
 def test_slam_uses_gated_scan_topic():
     from pathlib import Path
     config = yaml.safe_load(Path("ros2/config/slam_toolbox_params.yaml").read_text())
     assert config["slam_toolbox"]["ros__parameters"]["scan_topic"] == "/scan/slam"
+
+
+def test_slam_cannot_apply_catastrophic_global_loop_closures():
+    from pathlib import Path
+    config = yaml.safe_load(Path("ros2/config/slam_toolbox_params.yaml").read_text())
+    params = config["slam_toolbox"]["ros__parameters"]
+    assert params["use_scan_matching"] is True
+    assert params["do_loop_closing"] is False
 
 
 def test_translation_publication_preserves_forwarded_laser_frame():
@@ -323,6 +420,10 @@ def mission_node():
     node.start_pose = (1., 2., 0.5)
     node.robot_pose = node.start_pose
     node.home_captured = True
+    node.pre_return_map_saved = False
+    node.pre_return_graph_saved = False
+    node.map_export_locked = False
+    node.slam_measurements_paused = False
     node._pose_fresh = MagicMock(return_value=True)
     node._hold_motion = MagicMock()
     node._cancel_active_nav_goal = MagicMock()
@@ -363,22 +464,33 @@ def test_failed_measurement_reset_never_resets_filter_or_starts_slam():
     node._hold_motion.assert_called()
 
 
-def test_saved_checkpoint_does_not_change_navigation_or_localization_state():
+def test_saved_occupancy_map_serializes_graph_without_starting_return():
     node = mission_node()
     node.pre_return_map_base = "checkpoint"
     node._queue_reachable_dock_selection = MagicMock()
+    node.serialize_client = MagicMock()
+    graph_future = MagicMock()
+    node.serialize_client.call_async.return_value = graph_future
     result = MagicMock()
     result.result.return_value.result = True
-    with patch.object(explorer_module, "SaveMap", NS(Response=NS(RESULT_SUCCESS=0)), create=True):
+    with patch.object(
+        explorer_module,
+        "SerializePoseGraph",
+        NS(Request=lambda: NS(filename=None), Response=NS(RESULT_SUCCESS=0)),
+        create=True,
+    ):
         node._on_pre_return_map_saved(result, 7)
     node._queue_reachable_dock_selection.assert_not_called()
     assert node.pre_return_map_saved
+    node.serialize_client.call_async.assert_called_once()
+    assert node.serialize_client.call_async.call_args.args[0].filename == "checkpoint"
     node._hold_motion.assert_not_called()
 
 
 def checkpoint_wait_node():
     node = mission_node()
     node.pre_return_map_saved = False
+    node.pre_return_graph_saved = False
     node.return_localization_pending = True
     node.return_ready_since = None
     node.operation_deadline = time.time()+20
@@ -495,6 +607,7 @@ def test_checkpoint_save_tolerates_stale_localization_only_while_stopped():
 def test_checkpoint_recovery_requires_continuously_fresh_pose_before_return():
     node = checkpoint_wait_node()
     node.pre_return_map_saved = True
+    node.pre_return_graph_saved = True
     node._safety_tick()
     node._queue_reachable_dock_selection.assert_not_called()
     node._pose_fresh.return_value = True
@@ -512,23 +625,21 @@ def test_checkpoint_recovery_requires_continuously_fresh_pose_before_return():
     assert not node.return_localization_pending
 
 
-@pytest.mark.parametrize("save_outcome", ["pending", "failed", "unavailable", "success"])
-def test_return_planning_proceeds_independently_of_checkpoint(save_outcome):
+@pytest.mark.parametrize(
+    "map_saved,graph_saved,should_return",
+    [(False, False, False), (True, False, False), (True, True, True)],
+)
+def test_return_waits_until_complete_snapshot_is_durable(
+    map_saved, graph_saved, should_return
+):
     node = checkpoint_wait_node()
-    node.pre_return_map_base = "checkpoint"
+    node.pre_return_map_saved = map_saved
+    node.pre_return_graph_saved = graph_saved
     node._pose_fresh.return_value = True
-    node.save_map_client = MagicMock()
-    node.save_map_client.service_is_ready.return_value = False
-    if save_outcome == "unavailable":
-        node._request_pre_return_map_save()
-    elif save_outcome != "pending":
-        response = MagicMock()
-        response.result.return_value.result = save_outcome == "success"
-        node._on_pre_return_map_saved(response, 7)
     node._safety_tick()
     node.return_ready_since = time.monotonic()-1
     node._safety_tick()
-    node._queue_reachable_dock_selection.assert_called_once()
+    assert node._queue_reachable_dock_selection.call_count == int(should_return)
     node._fail_mission.assert_not_called()
     assert node.state == "RETURNING_TO_DOCK"
 
@@ -541,10 +652,11 @@ def test_map_save_request_uses_persistent_nav2_service_fields():
     assert (req.image_format, req.map_mode, req.free_thresh, req.occupied_thresh) == ("pgm", "trinary", .25, .65)
 
 
-@pytest.mark.parametrize("saved", [False, True])
-def test_checkpoint_save_and_localization_wait_are_bounded(saved):
+@pytest.mark.parametrize("map_saved,graph_saved", [(False, False), (True, False), (True, True)])
+def test_checkpoint_save_and_localization_wait_are_bounded(map_saved, graph_saved):
     node = checkpoint_wait_node()
-    node.pre_return_map_saved = saved
+    node.pre_return_map_saved = map_saved
+    node.pre_return_graph_saved = graph_saved
     node.operation_deadline = time.time()-1
     node._safety_tick()
     node._fail_mission.assert_called_once()
@@ -559,15 +671,38 @@ def test_old_checkpoint_callback_cannot_start_a_new_missions_return():
     node._queue_reachable_dock_selection.assert_not_called()
 
 
-def test_arrival_saves_final_map_even_when_a_checkpoint_exists(tmp_path):
+def test_arrival_uses_map_sealed_before_return(tmp_path):
     node = mission_node()
     node.map_save_dir = str(tmp_path)
     node.pre_return_map_saved = True
+    node.pre_return_graph_saved = True
+    node.pre_return_map_base = str(tmp_path/"sealed")
     node._save_final_map = MagicMock()
-    node._complete_mapping = MagicMock()
+    node._write_session_metadata = MagicMock()
+    node._pause_slam_after_completion = MagicMock()
     node._initiate_map_finalization(at_dock=True)
-    node._save_final_map.assert_called_once()
+    node._save_final_map.assert_not_called()
+    node._write_session_metadata.assert_called_once()
+    node._pause_slam_after_completion.assert_called_once()
+    assert node.final_map_base == str(tmp_path/"sealed")
+
+
+def test_completed_map_pauses_slam_before_reporting_completion():
+    node = mission_node()
+    node.state = "FINALIZING_MAP"
+    node.pause_slam_client = MagicMock()
+    pause_future = MagicMock()
+    node.pause_slam_client.call_async.return_value = pause_future
+    node._complete_mapping = MagicMock()
+    with patch.object(explorer_module, "Pause", NS(Request=lambda: NS()), create=True):
+        node._pause_slam_after_completion()
     node._complete_mapping.assert_not_called()
+    callback = pause_future.add_done_callback.call_args.args[0]
+    response = MagicMock()
+    response.result.return_value.status = True
+    callback(response)
+    assert node.slam_measurements_paused
+    node._complete_mapping.assert_called_once()
 
 
 def test_pose_export_expires_independently_of_static_map(tmp_path):

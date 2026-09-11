@@ -66,6 +66,8 @@ class CubeyOdometryNode(Node):
         self.prev_points = None
         self.prev_scan_yaw = 0.0
         self.x = self.y = self.wz = 0.0
+        self.slam_scan_gate_reason = ""
+        self.slam_scan_forwarded = 0
         self.position_variance = 0.0001
         self.filtered_pose = None
         self.filtered_stamp = 0.0
@@ -89,7 +91,11 @@ class CubeyOdometryNode(Node):
                 and 0 <= now-self.last_imu_time <= 0.2
                 and 0 <= now-self.last_translation_time <= 0.25
                 and self._filter_consistent(heading)):
+            self.slam_scan_gate_reason = ""
             self.pub_slam_scan.publish(msg)
+            self.slam_scan_forwarded += 1
+        else:
+            self.slam_scan_gate_reason = "Waiting for fresh, consistent IMU and LiDAR measurements"
 
     def _handle_reset_odometry(self, request, response):
         self._reset_state()
@@ -232,6 +238,9 @@ class CubeyOdometryNode(Node):
                                "imu_available": self.imu_healthy and now-self.imu_status_time < 0.3,
                                "imu_ok": imu_ok, "scan_ok": scan_ok,
                                "filter_ok": filter_ok,
+                               "slam_scan_gate": self.slam_scan_gate_reason or "open",
+                               "mapping_yaw_rate_rad_s": round(float(self.wz), 3),
+                               "slam_scan_forwarded": self.slam_scan_forwarded,
                                "fault": self.fault,
                                "reason": self.fault or ("Waiting for fresh IMU and observable LiDAR translation" if not (imu_ok and scan_ok) else ("" if filter_ok else "Waiting for filtered pose to agree with measurements")),
                                "reset_time": self.reset_time, "timestamp": now})
