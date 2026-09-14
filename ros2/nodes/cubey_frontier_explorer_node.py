@@ -20,6 +20,7 @@ import json
 import math
 import os
 import queue
+import re
 import select
 import socket
 import sys
@@ -44,7 +45,7 @@ try:
     from std_srvs.srv import Trigger
     from nav2_msgs.action import BackUp, ComputePathToPose, NavigateToPose
     from action_msgs.msg import GoalStatus
-    from slam_toolbox.srv import Pause, Reset, SerializePoseGraph
+    from slam_toolbox.srv import DeserializePoseGraph, Pause, Reset, SerializePoseGraph
     from nav2_msgs.srv import SaveMap
     from robot_localization.srv import SetPose
     from tf2_ros import Buffer, TransformException, TransformListener
@@ -61,6 +62,7 @@ class CubeyFrontierExplorerNode(Node):
     GOAL_SURVEY = "SURVEY"
     GOAL_MANUAL = "MANUAL"
     GOAL_RETURN = "RETURN_TO_DOCK"
+    _MAP_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
     def __init__(self):
         super().__init__("cubey_frontier_explorer")
@@ -153,6 +155,8 @@ class CubeyFrontierExplorerNode(Node):
         self.slam_measurements_paused: bool = False
         self.pre_return_save_attempts: int = 0
         self.map_save_succeeded: bool = False
+        self.loaded_map_id: Optional[str] = None
+        self._awaiting_loaded_map: bool = False
         self.recovery_generation: int = 0
         self.active_recovery_handle = None
         self.recovery_purpose: Optional[str] = None
@@ -221,6 +225,7 @@ class CubeyFrontierExplorerNode(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.reset_filter_client = self.create_client(SetPose, "/set_pose")
         self.serialize_client = self.create_client(SerializePoseGraph, "/slam_toolbox/serialize_map")
+        self.deserialize_client = self.create_client(DeserializePoseGraph, "/slam_toolbox/deserialize_map")
         self.pause_slam_client = self.create_client(Pause, "/slam_toolbox/pause_new_measurements")
         self.reset_slam_client = self.create_client(Reset, "/slam_toolbox/reset")
         self.save_map_client = self.create_client(SaveMap, "/map_saver/save_map")
@@ -296,6 +301,9 @@ class CubeyFrontierExplorerNode(Node):
             elif command == "reset":
                 self.mission_id = message.get("mission_id")
                 self._reset_mapping(start_after_reset=False)
+            elif command == "load_map":
+                self.mission_id = message.get("mission_id")
+                self._load_saved_map(str(message.get("map_id", "")))
             elif command == "navigate":
                 if not self._sensors_ready() or not self._pose_fresh():
                     self._fail_mission("Cannot navigate without fresh IMU, LiDAR and localization")
@@ -367,6 +375,8 @@ class CubeyFrontierExplorerNode(Node):
         self.map_export_locked = False
         self.pre_return_save_attempts = 0
         self.map_save_succeeded = False
+        self.loaded_map_id = None
+        self._awaiting_loaded_map = False
         self.recovery_generation += 1
         self.active_recovery_handle = None
         self.recovery_purpose = None
@@ -447,6 +457,104 @@ class CubeyFrontierExplorerNode(Node):
         self.tf_buffer.clear()
         self.last_motion_time = time.time()
 
+    def _saved_map_base(self, map_id: str) -> Optional[str]:
+        """Resolve a web-selected map ID without accepting arbitrary paths."""
+        if not self._MAP_ID_RE.fullmatch(map_id):
+            return None
+        map_dir = os.path.realpath(self.map_save_dir)
+        base = os.path.realpath(os.path.join(map_dir, map_id))
+        try:
+            if os.path.commonpath((map_dir, base)) != map_dir:
+                return None
+        except ValueError:
+            return None
+        if not (os.path.isfile(base+".posegraph") and os.path.isfile(base+".data")):
+            return None
+        return base
+
+    def _load_saved_map(self, map_id: str) -> None:
+        """Restore a native serialized graph while Cubey is stationary.
+
+        A deserialized map is view-only until a future localization workflow
+        establishes Cubey's physical pose.  Keeping SLAM paused prevents a
+        robot picked up or moved elsewhere from corrupting the recovered map.
+        """
+        base = self._saved_map_base(map_id)
+        if base is None:
+            self._fail_mission("Saved map is missing, incomplete, or outside the approved map directory.")
+            return
+        if not self.deserialize_client.service_is_ready() or not self.pause_slam_client.service_is_ready():
+            self._fail_mission("SLAM Toolbox map-load service is unavailable.")
+            return
+
+        self.mission_generation += 1
+        generation = self.mission_generation
+        self._cancel_active_nav_goal()
+        self.state = "LOADING_MAP"
+        self.failure_reason = ""
+        self.current_goal_coord = None
+        self.current_frontier_coord = None
+        self.latest_map = None
+        self.robot_pose = None
+        self.trajectory = []
+        self.latest_scan_hits = []
+        self.home_captured = False
+        self.loaded_map_id = None
+        self._awaiting_loaded_map = False
+        self.map_export_locked = False
+        self.awaiting_home_settle = False
+        self._hold_motion()
+        self.operation_deadline = time.time()+12.0
+        try:
+            os.remove("/tmp/cubey_nav2_live_map.json")
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            self.get_logger().warn(f"Could not clear old live map before loading: {error}")
+
+        operation = self.pause_slam_client.call_async(Pause.Request())
+        operation.add_done_callback(
+            lambda future: self._on_slam_paused_for_map_load(future, base, map_id, generation)
+        )
+
+    def _on_slam_paused_for_map_load(self, future, base: str, map_id: str, generation: int) -> None:
+        if generation != self.mission_generation or self.state != "LOADING_MAP":
+            return
+        try:
+            if not future.result().status:
+                raise RuntimeError("SLAM pause request was rejected")
+        except Exception as error:
+            self._fail_mission(f"Saved map was not loaded because SLAM could not be paused: {error}")
+            return
+
+        self.slam_measurements_paused = True
+        request = DeserializePoseGraph.Request()
+        request.filename = base
+        request.match_type = DeserializePoseGraph.Request.START_AT_FIRST_NODE
+        request.initial_pose.orientation.w = 1.0
+        operation = self.deserialize_client.call_async(request)
+        operation.add_done_callback(
+            lambda future: self._on_saved_map_deserialized(future, map_id, generation)
+        )
+
+    def _on_saved_map_deserialized(self, future, map_id: str, generation: int) -> None:
+        if generation != self.mission_generation or self.state != "LOADING_MAP":
+            return
+        try:
+            if future.result().result != DeserializePoseGraph.Response.RESULT_SUCCESS:
+                raise RuntimeError(f"SLAM Toolbox returned result code {future.result().result}")
+        except Exception as error:
+            self._fail_mission(f"Saved map could not be restored: {error}")
+            return
+
+        # Ignore every retained map message from the previous graph.  A fresh
+        # /map publication following this successful deserialize is required
+        # before the API reports that loading has completed.
+        self.latest_map = None
+        self.loaded_map_id = map_id
+        self._awaiting_loaded_map = True
+        self.get_logger().info(f"SLAM graph restored for saved map: {map_id}")
+
     # ------------------------------------------------------------------
     # Telemetry & Callbacks
     # ------------------------------------------------------------------
@@ -492,6 +600,10 @@ class CubeyFrontierExplorerNode(Node):
             return self._readiness_reason() or "Preparing: holding still to record home"
         if self.state in ("RECOVERING_NAVIGATION", "RECOVERING_LOCALIZATION"):
             return "Paused: " + (self._readiness_reason() or "checking stability before resuming")
+        if self.state == "LOADING_MAP":
+            return "Loading saved Nav2 map and waiting for its first fresh publication"
+        if self.state == "MAP_LOADED":
+            return "Saved map loaded · SLAM scans are paused to protect it"
         if self.failure_reason:
             return self.failure_reason
         if self.state == "IDLE":
@@ -521,6 +633,17 @@ class CubeyFrontierExplorerNode(Node):
         now = time.time()
         if self.state in ("RECOVERING_LOCALIZATION", "RECOVERING_NAVIGATION"):
             self._recover_localization_tick(ready and now-self.last_map_time <= 5.0 and self._navigation_ready())
+            self._export_live_pose()
+            return
+        if self.state == "LOADING_MAP":
+            self._hold_motion()
+            if self._awaiting_loaded_map and self.latest_map is not None and now-self.last_map_time <= 5.0:
+                self._awaiting_loaded_map = False
+                self.state = "MAP_LOADED"
+                self.failure_reason = ""
+                self.get_logger().info(f"Saved map ready for viewing: {self.loaded_map_id}")
+            elif now > self.operation_deadline:
+                self._fail_mission("Saved map was restored, but no fresh occupancy grid was published.")
             self._export_live_pose()
             return
         if self.state in ("PREPARING", "RESETTING"):
@@ -809,6 +932,10 @@ class CubeyFrontierExplorerNode(Node):
     def _on_map(self, msg: OccupancyGrid):
         if self.state == "RESETTING":
             return
+        # /map uses transient-local delivery. During a restore it can first
+        # replay the previous graph, which must never make a load look done.
+        if self.state == "LOADING_MAP" and not self._awaiting_loaded_map:
+            return
         self.latest_map = msg
         self.last_map_time = time.time()
         self._update_robot_pose_from_tf()
@@ -838,6 +965,10 @@ class CubeyFrontierExplorerNode(Node):
                     "theta_deg": round(math.degrees(self.robot_pose[2]), 1) if self.robot_pose else 0.0,
                 },
                 "trajectory": self.trajectory,
+                "map_name": (
+                    self.loaded_map_id.replace("_", " ")
+                    if self.loaded_map_id else "Live Floorplan"
+                ),
                 "timestamp": time.time(),
             }
             tmp_map = "/tmp/cubey_nav2_live_map.json"

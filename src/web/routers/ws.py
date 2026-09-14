@@ -146,6 +146,7 @@ async def websocket_live_map(websocket: WebSocket, token: Optional[str] = Query(
                         payload["resolution_cm"] = nav2_data.get("resolution_cm", payload["resolution_cm"])
                         payload["origin_x_m"] = nav2_data.get("origin_x_m", payload["origin_x_m"])
                         payload["origin_y_m"] = nav2_data.get("origin_y_m", payload["origin_y_m"])
+                        payload["map_name"] = nav2_data.get("map_name", payload["map_name"])
                         payload["grid_compressed_b64"] = None
                         if send_grid and nav2_data.get("grid_compressed_b64"):
                             payload["grid_compressed_b64"] = nav2_data["grid_compressed_b64"]
