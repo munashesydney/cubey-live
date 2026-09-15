@@ -58,9 +58,6 @@
         <button id="btn-toggle-mapping" class="btn btn-primary">
           <span class="btn-icon">▶</span> <span id="btn-mapping-text">Start Mapping</span>
         </button>
-        <button id="btn-save-map" class="btn btn-secondary">
-          <span class="btn-icon">💾</span> Save Map
-        </button>
         <button id="btn-open-library" class="btn btn-secondary">
           <span class="btn-icon">🗺️</span> Maps
         </button>
@@ -151,19 +148,6 @@
       </div>
     </div>
 
-    <!-- Save Map Modal -->
-    <div id="modal-save" class="modal-backdrop hidden">
-      <div class="modal-card glass-panel">
-        <h3>💾 Save Floor Plan to SQLite</h3>
-        <p>Enter a descriptive name for your house map (e.g. "Main Floor", "Kitchen"):</p>
-        <input type="text" id="input-map-name" class="modal-input" placeholder="e.g. Ground Floor" value="My House Map">
-        <div class="modal-actions">
-          <button id="btn-confirm-save" class="btn btn-primary">Save Floorplan</button>
-          <button id="btn-cancel-save" class="btn btn-secondary">Cancel</button>
-        </div>
-      </div>
-    </div>
-
     <!-- Map Library Modal -->
     <div id="modal-library" class="modal-backdrop hidden">
       <div class="modal-card modal-card-wide glass-panel">
@@ -171,6 +155,7 @@
           <h3>🗺️ Saved House Maps</h3>
           <button id="btn-close-library" class="btn-close">✕</button>
         </div>
+        <p class="modal-subtitle">Loads the native Nav2/SLAM map read-only, with new scan intake paused to protect it.</p>
         <div id="maps-list-container" class="maps-grid">
           <!-- Loaded dynamically from /api/maps -->
         </div>

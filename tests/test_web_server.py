@@ -33,16 +33,35 @@ class WebServerApiTests(unittest.TestCase):
         self.assertIn("lidar", data)
         self.assertIn("mapping", data)
 
-    def test_maps_list_and_save(self):
-        res = self.client.get("/api/maps", auth=self.auth)
+    def test_maps_list_uses_native_library_and_rejects_legacy_saves(self):
+        library = MagicMock()
+        library.list.return_value = []
+        with patch("src.web.routers.api_maps.get_native_map_library", return_value=library):
+            res = self.client.get("/api/maps", auth=self.auth)
         self.assertEqual(res.status_code, 200)
-        self.assertIsInstance(res.json(), list)
+        self.assertEqual(res.json(), [])
 
-        save_res = self.client.post(
-            "/api/maps", json={"name": "Web Test Map"}, auth=self.auth
-        )
-        self.assertEqual(save_res.status_code, 200)
-        self.assertEqual(save_res.json().get("status"), "saved")
+        save_res = self.client.post("/api/maps", auth=self.auth)
+        self.assertEqual(save_res.status_code, 409)
+        self.assertIn("automatically", save_res.json().get("detail", ""))
+
+    def test_loads_a_native_map_through_ros_navigation_service(self):
+        native_map = MagicMock()
+        native_map.loadable = True
+        native_map.map_id = "cubey_floorplan_20260914_120000"
+        native_map.display_name = "cubey floorplan 20260914 120000"
+        library = MagicMock()
+        library.get.return_value = native_map
+        nav_service = MagicMock()
+        nav_service.load_saved_map.return_value = True
+        with patch("src.web.routers.api_maps.get_native_map_library", return_value=library), \
+             patch("src.web.routers.api_maps.get_nav_service", return_value=nav_service):
+            response = self.client.post(
+                "/api/maps/cubey_floorplan_20260914_120000/load", auth=self.auth
+            )
+        self.assertEqual(response.status_code, 200)
+        nav_service.load_saved_map.assert_called_once_with("cubey_floorplan_20260914_120000")
+        self.assertEqual(response.json().get("status"), "loaded")
 
     def test_mapping_lifecycle_endpoints(self):
         nav_service = MagicMock()

@@ -1,67 +1,61 @@
-"""
-House floorplan map persistence and management endpoints (SQLite).
-"""
+"""Native Nav2 / SLAM Toolbox saved-map endpoints."""
 
-from typing import List, Optional
+import asyncio
+
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
 
-from src.db.repositories.map_repository import delete_map, list_maps
-from src.services.mapping_service import get_mapping_service
+from src.services.navigation.cubey_nav_service import get_nav_service
+from src.services.navigation.map_library import get_native_map_library
 from src.web.auth import verify_credentials
 
 router = APIRouter(prefix="/api/maps", tags=["maps"])
 
 
-class SaveMapRequest(BaseModel):
-    name: str = "House Floorplan"
-
-
 @router.get("")
 async def list_house_maps(_: str = Depends(verify_credentials)):
-    """List all saved maps stored in SQLite."""
-    maps = list_maps(limit=100)
-    return [
-        {
-            "id": m.id,
-            "name": m.name,
-            "width": m.width,
-            "height": m.height,
-            "resolution_cm": m.resolution_cm,
-            "is_active": m.is_active,
-            "created_at": m.created_at.isoformat() if m.created_at else None,
-            "updated_at": m.updated_at.isoformat() if m.updated_at else None,
-        }
-        for m in maps
-    ]
+    """List maps actually written by the live Nav2/SLAM mission."""
+    return [native_map.to_dict() for native_map in get_native_map_library().list()]
 
 
 @router.post("")
-async def save_current_map(req: SaveMapRequest, _: str = Depends(verify_credentials)):
-    """Save the active occupancy grid map to SQLite."""
-    mapping_svc = get_mapping_service()
-    map_obj = mapping_svc.save_current_map(name=req.name)
-    return {
-        "status": "saved",
-        "id": map_obj.id,
-        "name": map_obj.name,
-    }
+async def save_current_map(_: str = Depends(verify_credentials)):
+    """Prevent the UI from silently saving the obsolete display-grid cache."""
+    raise HTTPException(
+        status_code=409,
+        detail="Native maps are sealed automatically when an autonomous mapping mission completes.",
+    )
 
 
 @router.post("/{map_id}/load")
-async def load_saved_map(map_id: int, _: str = Depends(verify_credentials)):
-    """Load a previously saved map into the SLAM engine."""
-    mapping_svc = get_mapping_service()
-    success = mapping_svc.load_map(map_id)
-    if not success:
-        raise HTTPException(status_code=404, detail="Map not found")
-    return {"status": "loaded", "map_id": map_id, "name": mapping_svc.map_name}
+async def load_saved_map(map_id: str, _: str = Depends(verify_credentials)):
+    """Restore an approved serialized SLAM Toolbox pose graph, read-only."""
+    native_map = get_native_map_library().get(map_id)
+    if native_map is None:
+        raise HTTPException(status_code=404, detail="Saved Nav2 map not found")
+    if not native_map.loadable:
+        raise HTTPException(
+            status_code=409,
+            detail="Map is incomplete: its SLAM Toolbox .data file is missing.",
+        )
+
+    nav_svc = get_nav_service()
+    if not await asyncio.to_thread(nav_svc.load_saved_map, map_id):
+        raise HTTPException(
+            status_code=503,
+            detail=nav_svc.last_load_error or "Nav2/SLAM could not load the saved map.",
+        )
+    return {
+        "status": "loaded",
+        "map_id": native_map.map_id,
+        "name": native_map.display_name,
+        "message": "Saved map loaded and locked against new scans.",
+    }
 
 
 @router.delete("/{map_id}")
-async def delete_saved_map(map_id: int, _: str = Depends(verify_credentials)):
-    """Delete a saved map from SQLite."""
-    success = delete_map(map_id)
-    if not success:
-        raise HTTPException(status_code=404, detail="Map not found")
-    return {"status": "deleted", "map_id": map_id}
+async def delete_saved_map(map_id: str, _: str = Depends(verify_credentials)):
+    """Keep deletion out of the web UI until it can atomically remove all artifacts."""
+    raise HTTPException(
+        status_code=405,
+        detail="Map deletion is intentionally unavailable from the web panel.",
+    )

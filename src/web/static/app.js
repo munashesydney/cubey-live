@@ -3,7 +3,7 @@
  *
  * Handles WebSocket streaming, zlib decompression of occupancy grids,
  * smooth 2D Canvas pan/zoom rendering, virtual touch joystick, keyboard driving,
- * and SQLite floorplan management.
+ * and native Nav2 / SLAM Toolbox floorplan management.
  */
 
 (function () {
@@ -55,7 +55,6 @@
   const btnToggleMapping = document.getElementById("btn-toggle-mapping");
   const btnMappingText = document.getElementById("btn-mapping-text");
 
-  const btnSaveMap = document.getElementById("btn-save-map");
   const btnOpenLibrary = document.getElementById("btn-open-library");
   const btnResetMap = document.getElementById("btn-reset-map");
   const btnRecenter = document.getElementById("btn-recenter");
@@ -71,11 +70,6 @@
   const btnCloseModeModal = document.getElementById("btn-close-mode-modal");
   const btnStartAuto = document.getElementById("btn-start-auto");
   const btnStartManual = document.getElementById("btn-start-manual");
-
-  const modalSave = document.getElementById("modal-save");
-  const inputMapName = document.getElementById("input-map-name");
-  const btnConfirmSave = document.getElementById("btn-confirm-save");
-  const btnCancelSave = document.getElementById("btn-cancel-save");
 
   const modalLibrary = document.getElementById("modal-library");
   const btnCloseLibrary = document.getElementById("btn-close-library");
@@ -725,33 +719,6 @@
     }
   });
 
-  // Save Map Modal
-  btnSaveMap.addEventListener("click", () => {
-    modalSave.classList.remove("hidden");
-    inputMapName.focus();
-  });
-
-  btnCancelSave.addEventListener("click", () => {
-    modalSave.classList.add("hidden");
-  });
-
-  btnConfirmSave.addEventListener("click", async () => {
-    const name = inputMapName.value.trim() || "House Floorplan";
-    try {
-      const res = await fetch("/api/maps", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: name }),
-      });
-      if (res.ok) {
-        modalSave.classList.add("hidden");
-        alert(`Floorplan '${name}' saved successfully to SQLite!`);
-      }
-    } catch (err) {
-      alert("Error saving map: " + err);
-    }
-  });
-
   // Map Library Modal
   btnOpenLibrary.addEventListener("click", async () => {
     modalLibrary.classList.remove("hidden");
@@ -766,10 +733,14 @@
     mapsListContainer.innerHTML = "<p>Loading saved floorplans...</p>";
     try {
       const res = await fetch("/api/maps");
+      if (!res.ok) {
+        const error = await res.json().catch(() => ({}));
+        throw new Error(error.detail || "Could not retrieve saved Nav2 maps");
+      }
       const maps = await res.json();
 
       if (!maps || maps.length === 0) {
-        mapsListContainer.innerHTML = "<p>No saved house maps found in database.</p>";
+        mapsListContainer.innerHTML = "<p>No completed Nav2 maps found yet.</p>";
         return;
       }
 
@@ -777,34 +748,48 @@
       maps.forEach((m) => {
         const row = document.createElement("div");
         row.className = "map-card-row";
-        row.innerHTML = `
-          <div class="map-card-info">
-            <div class="map-card-title">${m.name} ${m.is_active ? "🟢 (Active)" : ""}</div>
-            <div class="map-card-meta">${m.width}x${m.height} cells · ${m.resolution_cm} cm/px · ${new Date(m.updated_at).toLocaleString()}</div>
-          </div>
-          <div class="map-card-actions">
-            <button class="btn btn-primary btn-sm btn-load-map" data-id="${m.id}">Load</button>
-            <button class="btn btn-danger-outline btn-sm btn-del-map" data-id="${m.id}">Delete</button>
-          </div>
-        `;
+        const info = document.createElement("div");
+        info.className = "map-card-info";
+        const title = document.createElement("div");
+        title.className = "map-card-title";
+        title.textContent = m.name;
+        const meta = document.createElement("div");
+        meta.className = "map-card-meta";
+        const resolution = m.resolution_cm ? `${m.resolution_cm} cm/px · ` : "";
+        const artifacts = m.has_image ? "map image + SLAM graph" : "SLAM graph";
+        meta.textContent = `${resolution}${artifacts} · ${new Date(m.updated_at).toLocaleString()}`;
+        info.append(title, meta);
+        const actions = document.createElement("div");
+        actions.className = "map-card-actions";
+        const load = document.createElement("button");
+        load.className = "btn btn-primary btn-sm btn-load-map";
+        load.dataset.id = m.id;
+        load.textContent = m.loadable ? "Load" : "Incomplete";
+        load.disabled = !m.loadable;
+        actions.appendChild(load);
+        row.append(info, actions);
         mapsListContainer.appendChild(row);
       });
 
       // Bind actions
       document.querySelectorAll(".btn-load-map").forEach((btn) => {
-        btn.addEventListener("click", async (e) => {
-          const mapId = e.target.getAttribute("data-id");
-          await fetch(`/api/maps/${mapId}/load`, { method: "POST" });
-          modalLibrary.classList.add("hidden");
-        });
-      });
-
-      document.querySelectorAll(".btn-del-map").forEach((btn) => {
-        btn.addEventListener("click", async (e) => {
-          const mapId = e.target.getAttribute("data-id");
-          if (confirm("Delete this house map from database?")) {
-            await fetch(`/api/maps/${mapId}`, { method: "DELETE" });
-            loadMapsList();
+        btn.addEventListener("click", async () => {
+          const mapId = btn.dataset.id;
+          btn.disabled = true;
+          const originalText = btn.textContent;
+          btn.textContent = "Loading…";
+          try {
+            const res = await fetch(`/api/maps/${encodeURIComponent(mapId)}/load`, { method: "POST" });
+            const result = await res.json().catch(() => ({}));
+            if (!res.ok) {
+              throw new Error(result.detail || "Saved map could not be loaded");
+            }
+            modalLibrary.classList.add("hidden");
+            alert(result.message || "Saved map loaded.");
+          } catch (err) {
+            alert(`Map load failed: ${err.message || err}`);
+            btn.disabled = false;
+            btn.textContent = originalText;
           }
         });
       });

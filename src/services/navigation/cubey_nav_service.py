@@ -83,6 +83,7 @@ class CubeyNavService:
         self._pending_mission_id = None
         self._request_generation = 0
         self.last_reset_error = ""
+        self.last_load_error = ""
 
     @property
     def is_active(self) -> bool:
@@ -340,6 +341,57 @@ class CubeyNavService:
             self.telemetry.distance_remaining_m = 0.0
 
         self._emit_log("SLAM map and robot pose reset to a blank origin.")
+        self._emit_telemetry()
+        return True
+
+    def load_saved_map(self, map_id: str) -> bool:
+        """Ask the ROS explorer to restore one native SLAM Toolbox map safely.
+
+        The explorer, rather than the web process, owns the ROS service call so
+        the pose graph is restored on its rclpy executor thread.  A successful
+        load intentionally leaves SLAM measurement intake paused: a map cannot
+        be safely resumed without establishing where Cubey is in that map.
+        """
+        self.stop_navigation()
+        self.last_load_error = ""
+
+        if not self.is_ros2_ready():
+            self.last_load_error = "ROS navigation service is unavailable."
+            self._emit_log(self.last_load_error)
+            return False
+
+        load_id = str(uuid.uuid4())
+        self._pending_mission_id = load_id
+        with self._lock:
+            self.telemetry.state = "LOADING_MAP"
+            self.telemetry.mode = "manual"
+            self.telemetry.current_goal = None
+            self.telemetry.failure_reason = ""
+
+        sent_at = time.time()
+        sent = self._send_ros2_command("load_map", mission_id=load_id, map_id=map_id)
+        loaded = sent and self._wait_for_ros2_state(
+            {"MAP_LOADED"}, sent_at, timeout_s=20.0, mission_id=load_id
+        )
+        if not loaded:
+            status = self._read_ros2_status() or {}
+            reason = status.get("failure_reason") if status.get("mission_id") == load_id else None
+            self.last_load_error = reason or "Timed out waiting for SLAM Toolbox to restore the saved map."
+            with self._lock:
+                self.telemetry.state = "ERROR"
+                self.telemetry.failure_reason = self.last_load_error
+            self._emit_log(self.last_load_error)
+            self._emit_telemetry()
+            return False
+
+        # The browser must stay on the native ROS map path after loading; the
+        # legacy display-grid cache is deliberately paused and ignored.
+        get_mapping_service().pause_mapping()
+        with self._lock:
+            self.telemetry.state = "MAP_LOADED"
+            self.telemetry.mode = "manual"
+            self.telemetry.failure_reason = ""
+        self._emit_log("Saved Nav2 map loaded; SLAM scans remain paused until a new mapping session starts.")
         self._emit_telemetry()
         return True
 
