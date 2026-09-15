@@ -880,6 +880,19 @@ def test_global_localization_refuses_to_turn_without_clearance():
     assert "clearance" in node._fail_mission.call_args.args[0]
 
 
+def test_global_localization_hypotheses_are_not_drawn_as_motion():
+    node = mission_node()
+    node.trajectory = []
+    node.state = "LOCALIZING_GLOBAL"
+    node._record_trajectory_point(-2.0, 1.0)
+    node._record_trajectory_point(3.0, -4.0)
+    assert node.trajectory == []
+
+    node.state = "LOCALIZED"
+    node._record_trajectory_point(1.2345, 2.3456)
+    assert node.trajectory == [[1.234, 2.346]]
+
+
 def test_ekf_fuses_no_command_or_duplicate_orientation():
     from pathlib import Path
     config = yaml.safe_load(Path("ros2/config/ekf_params.yaml").read_text())["ekf_filter_node"]["ros__parameters"]

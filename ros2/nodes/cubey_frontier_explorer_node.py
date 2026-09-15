@@ -773,6 +773,12 @@ class CubeyFrontierExplorerNode(Node):
             self.state = "LOCALIZED"
             self.failure_reason = ""
             self.localization_confidence = 100
+            # Candidate AMCL hypotheses are not physical motion. Begin the
+            # visible trail only at the pose that passed the convergence gate.
+            self.trajectory = (
+                [[round(self.robot_pose[0], 3), round(self.robot_pose[1], 3)]]
+                if self.robot_pose is not None else []
+            )
             self._hold_motion()
             self.get_logger().info(
                 f"Global localization converged after {math.degrees(self.localization_rotation_rad):.0f} degrees"
@@ -1188,12 +1194,23 @@ class CubeyFrontierExplorerNode(Node):
         yaw = math.atan2(siny_cosp, cosy_cosp)
         self.robot_pose = (translation.x, translation.y, yaw)
 
-        # Track trajectory for web canvas
+        self._record_trajectory_point(translation.x, translation.y)
+
+    def _record_trajectory_point(self, x_m: float, y_m: float) -> None:
+        """Record confirmed map-frame motion, excluding AMCL hypotheses."""
+        # AMCL deliberately jumps between hypotheses during a global search.
+        # Those candidate poses are useful internally but are not robot motion
+        # and must never be connected into the visible trajectory.
+        if self.state in (
+            "PREPARING_LOCALIZATION", "LOADING_LOCALIZATION_MAP",
+            "INITIALIZING_GLOBAL_LOCALIZATION", "LOCALIZING_GLOBAL",
+        ):
+            return
         if not self.trajectory or math.hypot(
-            translation.x - self.trajectory[-1][0],
-            translation.y - self.trajectory[-1][1],
+            x_m - self.trajectory[-1][0],
+            y_m - self.trajectory[-1][1],
         ) > 0.05:
-            self.trajectory.append([round(translation.x, 3), round(translation.y, 3)])
+            self.trajectory.append([round(x_m, 3), round(y_m, 3)])
             if len(self.trajectory) > 5000:
                 self.trajectory = self.trajectory[-4000:]
 
