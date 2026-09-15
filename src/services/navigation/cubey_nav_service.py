@@ -85,6 +85,7 @@ class CubeyNavService:
         self.last_reset_error = ""
         self.last_load_error = ""
         self.last_localization_error = ""
+        self.last_navigation_error = ""
 
     @property
     def is_active(self) -> bool:
@@ -454,10 +455,25 @@ class CubeyNavService:
 
     def navigate_to(self, x_m: float, y_m: float, theta_deg: float = 0.0) -> bool:
         """Send a waypoint to the real Nav2 NavigateToPose action client."""
+        self.last_navigation_error = ""
+
+        status = self._read_ros2_status() or {}
+        if not (
+            status.get("ready") is True
+            and status.get("loaded_map_id")
+            and status.get("state") in ("LOCALIZED", "REACHED", "NAVIGATING")
+        ):
+            self.last_navigation_error = (
+                "Load a saved map and Localize Cubey before selecting a destination."
+            )
+            self._emit_log(self.last_navigation_error)
+            return False
+
         self.stop_navigation()
 
         if not self.is_ros2_ready():
-            self._emit_log("Nav2 is not ready. Waypoint was not sent.")
+            self.last_navigation_error = "Nav2 is not ready. Waypoint was not sent."
+            self._emit_log(self.last_navigation_error)
             return False
 
         goal = NavGoal(x_m=x_m, y_m=y_m, theta_deg=theta_deg)
@@ -479,7 +495,11 @@ class CubeyNavService:
             with self._lock:
                 self._is_navigating_goal = False
                 self.telemetry.state = "ERROR"
-            self._emit_log("Nav2 did not acknowledge the waypoint.")
+            status = self._read_ros2_status() or {}
+            self.last_navigation_error = (
+                status.get("failure_reason") or "Nav2 did not acknowledge the waypoint."
+            )
+            self._emit_log(self.last_navigation_error)
             return False
 
         self._emit_log(f"Navigating to waypoint ({x_m:.2f}m, {y_m:.2f}m)...")

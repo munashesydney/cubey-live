@@ -221,6 +221,10 @@ body, html {
   display: block;
 }
 
+#map-canvas.goal-picker {
+  cursor: crosshair;
+}
+
 /* Floating Action Controls */
 .floating-controls {
   position: absolute;

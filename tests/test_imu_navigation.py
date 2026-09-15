@@ -841,6 +841,22 @@ def test_global_localization_command_waits_for_matching_success():
     assert service.telemetry.state == "LOCALIZED"
 
 
+def test_navigation_goal_requires_a_ready_localized_saved_map():
+    service = CubeyNavService()
+    with patch.object(service, "_read_ros2_status", return_value={"state": "IDLE", "ready": True}):
+        assert not service.navigate_to(1.0, 2.0)
+    assert "Localize" in service.last_navigation_error
+
+    ready = {"state": "LOCALIZED", "ready": True, "loaded_map_id": "saved-map"}
+    with patch.object(service, "_read_ros2_status", return_value=ready), \
+         patch.object(service, "stop_navigation"), \
+         patch.object(service, "is_ros2_ready", return_value=True), \
+         patch.object(service, "_send_ros2_command", return_value=True) as send, \
+         patch.object(service, "_wait_for_ros2_state", return_value=True):
+        assert service.navigate_to(1.25, -0.5, 30.0)
+    send.assert_called_once_with("navigate", x_m=1.25, y_m=-0.5, theta_deg=30.0)
+
+
 def test_amcl_confidence_requires_low_covariance_and_stable_position():
     node = mission_node()
     node.localization_xy_history = deque(maxlen=30)

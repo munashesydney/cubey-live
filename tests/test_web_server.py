@@ -98,6 +98,25 @@ class WebServerApiTests(unittest.TestCase):
             self.assertEqual(res_reset.status_code, 200)
             nav_service.reset_mapping.assert_called_once_with()
 
+    def test_navigation_goal_returns_conflict_until_localization_is_ready(self):
+        nav_service = MagicMock()
+        nav_service.navigate_to.return_value = False
+        nav_service.last_navigation_error = "Load a saved map and Localize Cubey before selecting a destination."
+        with patch("src.web.routers.api_navigation.get_nav_service", return_value=nav_service):
+            blocked = self.client.post(
+                "/api/navigation/goal", json={"x_m": 1.0, "y_m": 2.0}, auth=self.auth
+            )
+        self.assertEqual(blocked.status_code, 409)
+        self.assertIn("Localize", blocked.json().get("detail", ""))
+
+        nav_service.navigate_to.return_value = True
+        with patch("src.web.routers.api_navigation.get_nav_service", return_value=nav_service):
+            accepted = self.client.post(
+                "/api/navigation/goal", json={"x_m": 1.0, "y_m": 2.0, "theta_deg": 45.0}, auth=self.auth
+            )
+        self.assertEqual(accepted.status_code, 200)
+        self.assertEqual(accepted.json().get("status"), "navigating")
+
     def test_autonomous_mapping_returns_503_when_nav2_is_down(self):
         nav_service = MagicMock()
         nav_service.start_exploration.return_value = False

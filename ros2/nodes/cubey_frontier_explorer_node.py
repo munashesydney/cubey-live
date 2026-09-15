@@ -329,8 +329,13 @@ class CubeyFrontierExplorerNode(Node):
                 self.mission_id = message.get("mission_id")
                 self._localize_on_saved_map(str(message.get("map_id", "")))
             elif command == "navigate":
-                if not self._sensors_ready() or not self._pose_fresh():
-                    self._fail_mission("Cannot navigate without fresh IMU, LiDAR and localization")
+                if (not self._sensors_ready() or not self._pose_fresh()
+                        or not self._navigation_ready()
+                        or self.navigation_health.mode != "localization"
+                        or not self.loaded_map_id):
+                    self._fail_mission(
+                        "Cannot navigate until a saved map is loaded and Cubey is localized"
+                    )
                     continue
                 try:
                     x_m = float(message["x_m"])

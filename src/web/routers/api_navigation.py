@@ -81,10 +81,18 @@ async def reset_mapping_grid(_: str = Depends(verify_credentials)):
 
 @router.post("/navigation/goal")
 async def send_navigation_goal(req: NavGoalRequest, _: str = Depends(verify_credentials)):
-    """Command robot to navigate toward a 2D floorplan coordinate."""
+    """Command Nav2 to reach a selected coordinate on a localized saved map."""
     nav_svc = get_nav_service()
-    success = nav_svc.navigate_to(x_m=req.x_m, y_m=req.y_m, theta_deg=req.theta_deg or 0.0)
-    return {"status": "navigating" if success else "failed", "goal": req.dict()}
+    success = await asyncio.to_thread(
+        nav_svc.navigate_to, x_m=req.x_m, y_m=req.y_m,
+        theta_deg=req.theta_deg or 0.0,
+    )
+    if not success:
+        raise HTTPException(
+            status_code=409,
+            detail=nav_svc.last_navigation_error or "Nav2 could not accept that destination.",
+        )
+    return {"status": "navigating", "goal": req.dict()}
 
 
 @router.post("/navigation/stop")

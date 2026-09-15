@@ -16,6 +16,9 @@
   let activeMapName = "Live Floorplan";
   let loadedMapId = null;
   let navState = "IDLE";
+  let navigationReady = false;
+  let goalPickerActive = false;
+  let selectedNavGoal = null;
 
   let robotPose = { x_m: 0.0, y_m: 0.0, theta_deg: 0.0 };
   let homePose = null;
@@ -58,6 +61,8 @@
   const btnMappingText = document.getElementById("btn-mapping-text");
   const btnLocalize = document.getElementById("btn-localize");
   const btnLocalizeText = document.getElementById("btn-localize-text");
+  const btnGoTo = document.getElementById("btn-go-to");
+  const btnGoToText = document.getElementById("btn-go-to-text");
 
   const btnOpenLibrary = document.getElementById("btn-open-library");
   const btnResetMap = document.getElementById("btn-reset-map");
@@ -188,6 +193,7 @@
     // Update Header Badges
     navState = data.nav_state || "IDLE";
     const navMode = data.nav_mode || "manual";
+    navigationReady = data.navigation_ready === true;
     loadedMapId = data.loaded_map_id ?? loadedMapId;
     if (["PREPARING", "RESETTING", "EXPLORING"].includes(navState)) loadedMapId = null;
     const localizationBusy = ["PREPARING_LOCALIZATION", "LOADING_LOCALIZATION_MAP", "INITIALIZING_GLOBAL_LOCALIZATION", "LOCALIZING_GLOBAL"].includes(navState);
@@ -195,6 +201,11 @@
     btnLocalizeText.textContent = localizationBusy
       ? `Localizing ${data.localization_confidence || 0}%`
       : (navState === "LOCALIZED" ? "Relocalize" : "Localize");
+    const canPickGoal = loadedMapId && poseFresh && navigationReady
+      && ["LOCALIZED", "REACHED"].includes(navState);
+    if (!canPickGoal && goalPickerActive) setGoalPicker(false);
+    btnGoTo.disabled = !canPickGoal;
+    btnGoToText.textContent = goalPickerActive ? "Cancel Go To" : "Go To";
 
     lblActiveMapName.textContent = activeMapName;
     const activeStates = ["PREPARING", "RESETTING", "EXPLORING", "NAVIGATING", "RETURNING_TO_DOCK", "RECOVERING_STUCK", "RECOVERING_LOCALIZATION", "RECOVERING_NAVIGATION", "FINALIZING_MAP"];
@@ -371,6 +382,31 @@
       }
     }
 
+    // A selected waypoint is only a request. Nav2 performs the actual
+    // collision-aware path planning and may reject an unreachable point.
+    if (selectedNavGoal) {
+      const gx = selectedNavGoal.x_m * viewScale;
+      const gy = -selectedNavGoal.y_m * viewScale;
+      const markerRadius = Math.max(10, viewScale * 0.14);
+      ctx.save();
+      ctx.strokeStyle = "#F9E2AF";
+      ctx.fillStyle = "#F9E2AF";
+      ctx.lineWidth = Math.max(2, viewScale * 0.025);
+      ctx.setLineDash([Math.max(4, viewScale * 0.08), Math.max(3, viewScale * 0.05)]);
+      ctx.beginPath();
+      ctx.arc(gx, gy, markerRadius, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.moveTo(gx-markerRadius*1.5, gy);
+      ctx.lineTo(gx+markerRadius*1.5, gy);
+      ctx.moveTo(gx, gy-markerRadius*1.5);
+      ctx.lineTo(gx, gy+markerRadius*1.5);
+      ctx.stroke();
+      ctx.fillText("Nav goal", gx+markerRadius+6, gy-markerRadius-4);
+      ctx.restore();
+    }
+
     // 6. Draw Robot Pose Avatar
     const rx = robotPose.x_m * viewScale;
     const ry = -robotPose.y_m * viewScale;
@@ -436,6 +472,7 @@
 
   viewport.addEventListener("mousedown", (e) => {
     if (e.target !== canvas) return;
+    if (goalPickerActive) return;
     isDragging = true;
     dragStartX = e.clientX * window.devicePixelRatio - viewPanX;
     dragStartY = e.clientY * window.devicePixelRatio - viewPanY;
@@ -452,10 +489,60 @@
     isDragging = false;
   });
 
+  function canvasPointToMap(clientX, clientY) {
+    const rect = canvas.getBoundingClientRect();
+    const px = (clientX - rect.left) * (canvas.width / rect.width);
+    const py = (clientY - rect.top) * (canvas.height / rect.height);
+    return {
+      x_m: (px - viewPanX) / viewScale,
+      y_m: -((py - viewPanY) / viewScale),
+    };
+  }
+
+  function setGoalPicker(enabled) {
+    goalPickerActive = enabled;
+    canvas.classList.toggle("goal-picker", enabled);
+    if (!enabled) isDragging = false;
+    btnGoToText.textContent = enabled ? "Cancel Go To" : "Go To";
+  }
+
+  async function submitNavGoal(clientX, clientY) {
+    if (!goalPickerActive || !loadedMapId || !navigationReady || !poseFresh) return;
+    const goal = canvasPointToMap(clientX, clientY);
+    if (!Number.isFinite(goal.x_m) || !Number.isFinite(goal.y_m)) return;
+    selectedNavGoal = goal;
+    setGoalPicker(false);
+    render();
+    const distance = Math.hypot(goal.x_m-robotPose.x_m, goal.y_m-robotPose.y_m);
+    const goalHeading = distance > 0.05
+      ? Math.atan2(goal.y_m-robotPose.y_m, goal.x_m-robotPose.x_m) * 180.0 / Math.PI
+      : robotPose.theta_deg;
+    try {
+      const response = await fetch("/api/navigation/goal", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ x_m: goal.x_m, y_m: goal.y_m, theta_deg: goalHeading }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.detail || "Nav2 could not reach that point");
+    } catch (error) {
+      alert(`Destination was not accepted: ${error.message || error}`);
+    }
+  }
+
+  canvas.addEventListener("click", (e) => submitNavGoal(e.clientX, e.clientY));
+
   // Touch Pan/Zoom
   let touchStartDist = 0;
+  let goalTouch = null;
   viewport.addEventListener("touchstart", (e) => {
     if (e.touches.length === 1 && e.target === canvas) {
+      if (goalPickerActive) {
+        const touch = e.touches[0];
+        goalTouch = { x: touch.clientX, y: touch.clientY };
+        e.preventDefault();
+        return;
+      }
       isDragging = true;
       dragStartX = e.touches[0].clientX * window.devicePixelRatio - viewPanX;
       dragStartY = e.touches[0].clientY * window.devicePixelRatio - viewPanY;
@@ -486,6 +573,11 @@
   });
 
   viewport.addEventListener("touchend", () => {
+    if (goalTouch) {
+      const touch = goalTouch;
+      goalTouch = null;
+      submitNavGoal(touch.x, touch.y);
+    }
     isDragging = false;
     touchStartDist = 0;
   });
@@ -749,6 +841,11 @@
     } finally {
       btnLocalize.disabled = false;
     }
+  });
+
+  btnGoTo.addEventListener("click", () => {
+    if (btnGoTo.disabled) return;
+    setGoalPicker(!goalPickerActive);
   });
 
   // Map Library Modal
