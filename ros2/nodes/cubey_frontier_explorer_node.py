@@ -523,19 +523,21 @@ class CubeyFrontierExplorerNode(Node):
         try:
             if not future.result().status:
                 raise RuntimeError("SLAM pause request was rejected")
+            self.slam_measurements_paused = True
+            request = DeserializePoseGraph.Request()
+            request.filename = base
+            request.match_type = DeserializePoseGraph.Request.START_AT_FIRST_NODE
+            # Cubey's installed Jazzy interface uses geometry_msgs/Pose2D here.
+            # START_AT_FIRST_NODE ignores initial_pose, so leave its generated
+            # zero-valued default intact instead of assuming a Pose schema.
+            operation = self.deserialize_client.call_async(request)
+            operation.add_done_callback(
+                lambda future: self._on_saved_map_deserialized(future, map_id, generation)
+            )
         except Exception as error:
-            self._fail_mission(f"Saved map was not loaded because SLAM could not be paused: {error}")
-            return
-
-        self.slam_measurements_paused = True
-        request = DeserializePoseGraph.Request()
-        request.filename = base
-        request.match_type = DeserializePoseGraph.Request.START_AT_FIRST_NODE
-        request.initial_pose.orientation.w = 1.0
-        operation = self.deserialize_client.call_async(request)
-        operation.add_done_callback(
-            lambda future: self._on_saved_map_deserialized(future, map_id, generation)
-        )
+            # ROS response callbacks execute on the node's executor. Never let
+            # a version/schema mismatch escape and kill the whole supervisor.
+            self._fail_mission(f"Saved map could not be prepared for loading: {error}")
 
     def _on_saved_map_deserialized(self, future, map_id: str, generation: int) -> None:
         if generation != self.mission_generation or self.state != "LOADING_MAP":

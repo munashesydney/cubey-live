@@ -58,9 +58,6 @@
         <button id="btn-toggle-mapping" class="btn btn-primary">
           <span class="btn-icon">▶</span> <span id="btn-mapping-text">Start Mapping</span>
         </button>
-        <button id="btn-save-map" class="btn btn-secondary">
-          <span class="btn-icon">💾</span> Map Saving
-        </button>
         <button id="btn-open-library" class="btn btn-secondary">
           <span class="btn-icon">🗺️</span> Maps
         </button>
@@ -147,19 +144,6 @@
               ▶ Start Manual
             </button>
           </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Save Map Modal -->
-    <div id="modal-save" class="modal-backdrop hidden">
-      <div class="modal-card glass-panel">
-        <h3>💾 Native Map Saving</h3>
-        <p>Completed autonomous missions are saved automatically as Nav2 occupancy maps and SLAM pose graphs. Open the map library to load one safely.</p>
-        <input type="text" id="input-map-name" class="modal-input" value="Auto-saved after mapping completes" disabled>
-        <div class="modal-actions">
-          <button id="btn-confirm-save" class="btn btn-primary">Open Saved Maps</button>
-          <button id="btn-cancel-save" class="btn btn-secondary">Cancel</button>
         </div>
       </div>
     </div>

@@ -55,7 +55,6 @@
   const btnToggleMapping = document.getElementById("btn-toggle-mapping");
   const btnMappingText = document.getElementById("btn-mapping-text");
 
-  const btnSaveMap = document.getElementById("btn-save-map");
   const btnOpenLibrary = document.getElementById("btn-open-library");
   const btnResetMap = document.getElementById("btn-reset-map");
   const btnRecenter = document.getElementById("btn-recenter");
@@ -71,11 +70,6 @@
   const btnCloseModeModal = document.getElementById("btn-close-mode-modal");
   const btnStartAuto = document.getElementById("btn-start-auto");
   const btnStartManual = document.getElementById("btn-start-manual");
-
-  const modalSave = document.getElementById("modal-save");
-  const inputMapName = document.getElementById("input-map-name");
-  const btnConfirmSave = document.getElementById("btn-confirm-save");
-  const btnCancelSave = document.getElementById("btn-cancel-save");
 
   const modalLibrary = document.getElementById("modal-library");
   const btnCloseLibrary = document.getElementById("btn-close-library");
@@ -723,22 +717,6 @@
         alert(`Map reset failed: ${e.message}`);
       }
     }
-  });
-
-  // Save Map Modal
-  btnSaveMap.addEventListener("click", () => {
-    modalSave.classList.remove("hidden");
-    inputMapName.focus();
-  });
-
-  btnCancelSave.addEventListener("click", () => {
-    modalSave.classList.add("hidden");
-  });
-
-  btnConfirmSave.addEventListener("click", async () => {
-    modalSave.classList.add("hidden");
-    modalLibrary.classList.remove("hidden");
-    loadMapsList();
   });
 
   // Map Library Modal
