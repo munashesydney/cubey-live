@@ -84,11 +84,18 @@ class CubeyNavService:
         self._request_generation = 0
         self.last_reset_error = ""
         self.last_load_error = ""
+        self.last_localization_error = ""
 
     @property
     def is_active(self) -> bool:
         with self._lock:
-            return self.telemetry.state in ("PREPARING", "RESETTING", "NAVIGATING", "EXPLORING", "RETURNING_TO_DOCK", "RECOVERING_STUCK", "RECOVERING_LOCALIZATION", "RECOVERING_NAVIGATION", "FINALIZING_MAP")
+            return self.telemetry.state in (
+                "PREPARING", "RESETTING", "NAVIGATING", "EXPLORING",
+                "RETURNING_TO_DOCK", "RECOVERING_STUCK", "RECOVERING_LOCALIZATION",
+                "RECOVERING_NAVIGATION", "FINALIZING_MAP", "PREPARING_LOCALIZATION",
+                "LOADING_LOCALIZATION_MAP", "INITIALIZING_GLOBAL_LOCALIZATION",
+                "LOCALIZING_GLOBAL",
+            )
 
     @property
     def is_autonomous(self) -> bool:
@@ -371,7 +378,7 @@ class CubeyNavService:
         sent_at = time.time()
         sent = self._send_ros2_command("load_map", mission_id=load_id, map_id=map_id)
         loaded = sent and self._wait_for_ros2_state(
-            {"MAP_LOADED"}, sent_at, timeout_s=20.0, mission_id=load_id
+            {"MAP_LOADED"}, sent_at, timeout_s=32.0, mission_id=load_id
         )
         if not loaded:
             status = self._read_ros2_status() or {}
@@ -392,6 +399,56 @@ class CubeyNavService:
             self.telemetry.mode = "manual"
             self.telemetry.failure_reason = ""
         self._emit_log("Saved Nav2 map loaded; SLAM scans remain paused until a new mapping session starts.")
+        self._emit_telemetry()
+        return True
+
+    def localize_saved_map(self, map_id: str) -> bool:
+        """Find Cubey's global pose and heading on a selected sealed map."""
+        self.stop_navigation()
+        self.last_localization_error = ""
+
+        if not self.is_ros2_ready():
+            self.last_localization_error = "ROS navigation service is unavailable."
+            self._emit_log(self.last_localization_error)
+            return False
+
+        localization_id = str(uuid.uuid4())
+        self._pending_mission_id = localization_id
+        with self._lock:
+            self.telemetry.state = "PREPARING_LOCALIZATION"
+            self.telemetry.mode = "localization"
+            self.telemetry.current_goal = None
+            self.telemetry.failure_reason = ""
+
+        sent_at = time.time()
+        sent = self._send_ros2_command(
+            "localize", mission_id=localization_id, map_id=map_id
+        )
+        localized = sent and self._wait_for_ros2_state(
+            {"LOCALIZED"}, sent_at, timeout_s=62.0, mission_id=localization_id
+        )
+        if not localized:
+            status = self._read_ros2_status() or {}
+            reason = (
+                status.get("failure_reason")
+                if status.get("mission_id") == localization_id else None
+            )
+            self.last_localization_error = reason or (
+                "Global localization timed out. Give Cubey clear turning room and try again."
+            )
+            with self._lock:
+                self.telemetry.state = "ERROR"
+                self.telemetry.failure_reason = self.last_localization_error
+            self._emit_log(self.last_localization_error)
+            self._emit_telemetry()
+            return False
+
+        get_mapping_service().pause_mapping()
+        with self._lock:
+            self.telemetry.state = "LOCALIZED"
+            self.telemetry.mode = "localization"
+            self.telemetry.failure_reason = ""
+        self._emit_log("Cubey localized on the saved map; position and heading are live.")
         self._emit_telemetry()
         return True
 

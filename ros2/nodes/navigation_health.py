@@ -5,7 +5,13 @@ from lifecycle_msgs.srv import ChangeState, GetState
 
 
 class NavigationHealth:
-    NODES = ("slam_toolbox", "map_saver", "controller_server", "planner_server", "behavior_server", "bt_navigator")
+    NODES = (
+        "slam_toolbox", "map_server", "amcl", "map_saver",
+        "controller_server", "planner_server", "behavior_server", "bt_navigator",
+    )
+    MAPPING_SOURCE = ("slam_toolbox",)
+    LOCALIZATION_SOURCE = ("map_server", "amcl")
+    COMMON_NODES = ("map_saver", "controller_server", "planner_server", "behavior_server", "bt_navigator")
 
     def __init__(self, node, localization_ready):
         self.node = node
@@ -18,7 +24,27 @@ class NavigationHealth:
         self.attempts = {}
         self.retry_at = 0.0
         self.error = ""
+        self.mode = "mapping"
         self.timer = node.create_timer(0.5, self.tick)
+
+    def set_mode(self, mode):
+        if mode not in ("mapping", "localization"):
+            raise ValueError(f"Unsupported navigation mode: {mode}")
+        if self.mode != mode:
+            self.node.get_logger().info(f"Navigation source mode: {self.mode} -> {mode}")
+            self.mode = mode
+            self.reset_retries()
+
+    def _desired_nodes(self):
+        source = self.MAPPING_SOURCE if self.mode == "mapping" else self.LOCALIZATION_SOURCE
+        return source + self.COMMON_NODES
+
+    def source_ready(self):
+        snapshot = self.snapshot()
+        desired = self.MAPPING_SOURCE if self.mode == "mapping" else self.LOCALIZATION_SOURCE
+        undesired = self.LOCALIZATION_SOURCE if self.mode == "mapping" else self.MAPPING_SOURCE
+        return (all(snapshot[name] == "active" for name in desired)
+                and all(snapshot[name] != "active" for name in undesired))
 
     def reset_retries(self):
         self.attempts.clear()
@@ -30,14 +56,17 @@ class NavigationHealth:
                 else "unavailable" for name in self.NODES}
 
     def ready(self):
-        return all(state == "active" for state in self.snapshot().values())
+        snapshot = self.snapshot()
+        return self.source_ready() and all(snapshot[name] == "active" for name in self._desired_nodes())
 
     def reason(self):
         if self.error:
             return self.error
         if self.pending:
             return f"Starting navigation: {self.pending[0]}"
-        missing = [f"{name}: {state}" for name, state in self.snapshot().items() if state != "active"]
+        snapshot = self.snapshot()
+        missing = [f"{name}: {snapshot[name]}" for name in self._desired_nodes()
+                   if snapshot[name] != "active"]
         return "Waiting for navigation — " + ", ".join(missing) if missing else ""
 
     def tick(self):
@@ -72,6 +101,12 @@ class NavigationHealth:
             except Exception as exc:
                 self.error = f"Navigation startup failed at {name}: {exc}"
                 self.node.get_logger().error(self.error)
+            # A state query may have been issued just before the transition
+            # completed. Discard it so its stale pre-transition answer cannot
+            # undo the post-transition observation requirement.
+            query = self.queries.pop(name, None)
+            if query and not query[0].done():
+                query[0].cancel()
             self.states.pop(name, None)  # Require a post-transition observation.
             self.pending = None
             self.retry_at = now+1.0
@@ -79,14 +114,35 @@ class NavigationHealth:
 
         if now < self.retry_at:
             return
-        for name, state in self.snapshot().items():
+
+        snapshot = self.snapshot()
+        undesired = self.LOCALIZATION_SOURCE if self.mode == "mapping" else self.MAPPING_SOURCE
+        # A single node must own map->odom. Deactivate the old source before
+        # configuring or activating its replacement.
+        for name in undesired:
+            state = snapshot[name]
+            if state != "active":
+                continue
+            client = self.writers[name]
+            if not client.service_is_ready():
+                return
+            request = ChangeState.Request()
+            request.transition.id = 4  # active -> inactive
+            self.node.get_logger().info(f"Navigation lifecycle: {name} active -> deactivate")
+            self.pending = (name, client.call_async(request), now)
+            return
+
+        for name in self._desired_nodes():
+            state = snapshot[name]
             if state == "active":
                 continue
             if state not in ("unconfigured", "inactive"):
                 return
             # Configuration is harmless before a map exists. Activation of
             # navigation waits for real map/odom TF; the saver needs no TF.
-            if state == "inactive" and name not in ("slam_toolbox", "map_saver") and not self.localization_ready():
+            if (state == "inactive" and name not in
+                    ("slam_toolbox", "map_server", "amcl", "map_saver")
+                    and not self.localization_ready()):
                 return
             key = (name, state)
             if self.attempts.get(key, 0) >= 3:

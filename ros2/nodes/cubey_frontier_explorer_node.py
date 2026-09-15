@@ -40,13 +40,13 @@ try:
     from rclpy.time import Time
     from nav_msgs.msg import OccupancyGrid, Odometry
     from sensor_msgs.msg import LaserScan
-    from geometry_msgs.msg import PoseStamped, Twist
+    from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
     from std_msgs.msg import String
-    from std_srvs.srv import Trigger
+    from std_srvs.srv import Empty, Trigger
     from nav2_msgs.action import BackUp, ComputePathToPose, NavigateToPose
     from action_msgs.msg import GoalStatus
     from slam_toolbox.srv import DeserializePoseGraph, Pause, Reset, SerializePoseGraph
-    from nav2_msgs.srv import SaveMap
+    from nav2_msgs.srv import LoadMap, SaveMap
     from robot_localization.srv import SetPose
     from tf2_ros import Buffer, TransformException, TransformListener
 except ImportError as e:
@@ -157,6 +157,17 @@ class CubeyFrontierExplorerNode(Node):
         self.map_save_succeeded: bool = False
         self.loaded_map_id: Optional[str] = None
         self._awaiting_loaded_map: bool = False
+        self.pending_map_load: Optional[Tuple[str, str, int]] = None
+        self.localization_map_base: Optional[str] = None
+        self.localization_load_requested: bool = False
+        self.localization_confidence: int = 0
+        self.localization_good_since: Optional[float] = None
+        self.localization_xy_history = deque(maxlen=30)
+        self.latest_amcl_time: float = 0.0
+        self.latest_scan_time: float = 0.0
+        self.nearest_scan_range: float = float("inf")
+        self.localization_last_odom_yaw: Optional[float] = None
+        self.localization_rotation_rad: float = 0.0
         self.recovery_generation: int = 0
         self.active_recovery_handle = None
         self.recovery_purpose: Optional[str] = None
@@ -187,6 +198,12 @@ class CubeyFrontierExplorerNode(Node):
             OccupancyGrid,
             "/global_costmap/costmap",
             self._on_global_costmap,
+            10,
+        )
+        self.sub_amcl_pose = self.create_subscription(
+            PoseWithCovarianceStamped,
+            "/amcl_pose",
+            self._on_amcl_pose,
             10,
         )
 
@@ -229,6 +246,10 @@ class CubeyFrontierExplorerNode(Node):
         self.pause_slam_client = self.create_client(Pause, "/slam_toolbox/pause_new_measurements")
         self.reset_slam_client = self.create_client(Reset, "/slam_toolbox/reset")
         self.save_map_client = self.create_client(SaveMap, "/map_saver/save_map")
+        self.load_static_map_client = self.create_client(LoadMap, "/map_server/load_map")
+        self.global_localization_client = self.create_client(
+            Empty, "/reinitialize_global_localization"
+        )
         self.reset_odom_client = self.create_client(Trigger, "/cubey/reset_odometry")
         from navigation_health import NavigationHealth
         self.navigation_health = NavigationHealth(self, self._localization_ready)
@@ -304,6 +325,9 @@ class CubeyFrontierExplorerNode(Node):
             elif command == "load_map":
                 self.mission_id = message.get("mission_id")
                 self._load_saved_map(str(message.get("map_id", "")))
+            elif command == "localize":
+                self.mission_id = message.get("mission_id")
+                self._localize_on_saved_map(str(message.get("map_id", "")))
             elif command == "navigate":
                 if not self._sensors_ready() or not self._pose_fresh():
                     self._fail_mission("Cannot navigate without fresh IMU, LiDAR and localization")
@@ -341,6 +365,7 @@ class CubeyFrontierExplorerNode(Node):
     def _reset_mapping(self, start_after_reset: bool):
         """Reset real SLAM Toolbox state and local odometry, then optionally explore."""
         self._cancel_active_nav_goal()
+        self.navigation_health.set_mode("mapping")
         self.navigation_health.reset_retries()
         self.mission_generation += 1
         self.localization_interruptions = []
@@ -377,6 +402,12 @@ class CubeyFrontierExplorerNode(Node):
         self.map_save_succeeded = False
         self.loaded_map_id = None
         self._awaiting_loaded_map = False
+        self.pending_map_load = None
+        self.localization_map_base = None
+        self.localization_load_requested = False
+        self.localization_confidence = 0
+        self.localization_good_since = None
+        self.localization_xy_history.clear()
         self.recovery_generation += 1
         self.active_recovery_handle = None
         self.recovery_purpose = None
@@ -396,6 +427,8 @@ class CubeyFrontierExplorerNode(Node):
             self.get_logger().warn(f"Could not clear live scan IPC file: {e}")
 
     def _begin_reset(self):
+        if not self.navigation_health.source_ready():
+            return
         clients = (self.reset_odom_client, self.reset_filter_client, self.reset_slam_client)
         if not all(client.service_is_ready() for client in clients):
             return  # Preparation deadline bounds service startup.
@@ -457,7 +490,7 @@ class CubeyFrontierExplorerNode(Node):
         self.tf_buffer.clear()
         self.last_motion_time = time.time()
 
-    def _saved_map_base(self, map_id: str) -> Optional[str]:
+    def _approved_map_base(self, map_id: str) -> Optional[str]:
         """Resolve a web-selected map ID without accepting arbitrary paths."""
         if not self._MAP_ID_RE.fullmatch(map_id):
             return None
@@ -468,7 +501,21 @@ class CubeyFrontierExplorerNode(Node):
                 return None
         except ValueError:
             return None
+        return base
+
+    def _saved_map_base(self, map_id: str) -> Optional[str]:
+        base = self._approved_map_base(map_id)
+        if base is None:
+            return None
         if not (os.path.isfile(base+".posegraph") and os.path.isfile(base+".data")):
+            return None
+        return base
+
+    def _saved_occupancy_map_base(self, map_id: str) -> Optional[str]:
+        base = self._approved_map_base(map_id)
+        if base is None:
+            return None
+        if not (os.path.isfile(base+".yaml") and os.path.isfile(base+".pgm")):
             return None
         return base
 
@@ -483,14 +530,11 @@ class CubeyFrontierExplorerNode(Node):
         if base is None:
             self._fail_mission("Saved map is missing, incomplete, or outside the approved map directory.")
             return
-        if not self.deserialize_client.service_is_ready() or not self.pause_slam_client.service_is_ready():
-            self._fail_mission("SLAM Toolbox map-load service is unavailable.")
-            return
-
         self.mission_generation += 1
         generation = self.mission_generation
         self._cancel_active_nav_goal()
-        self.state = "LOADING_MAP"
+        self.navigation_health.set_mode("mapping")
+        self.state = "PREPARING_MAP_LOAD"
         self.failure_reason = ""
         self.current_goal_coord = None
         self.current_frontier_coord = None
@@ -501,10 +545,11 @@ class CubeyFrontierExplorerNode(Node):
         self.home_captured = False
         self.loaded_map_id = None
         self._awaiting_loaded_map = False
+        self.pending_map_load = (base, map_id, generation)
         self.map_export_locked = False
         self.awaiting_home_settle = False
         self._hold_motion()
-        self.operation_deadline = time.time()+12.0
+        self.operation_deadline = time.time()+25.0
         try:
             os.remove("/tmp/cubey_nav2_live_map.json")
         except FileNotFoundError:
@@ -512,6 +557,14 @@ class CubeyFrontierExplorerNode(Node):
         except OSError as error:
             self.get_logger().warn(f"Could not clear old live map before loading: {error}")
 
+    def _begin_saved_map_view_load(self) -> None:
+        if self.pending_map_load is None:
+            return
+        if not self.deserialize_client.service_is_ready() or not self.pause_slam_client.service_is_ready():
+            return
+        base, map_id, generation = self.pending_map_load
+        self.pending_map_load = None
+        self.state = "LOADING_MAP"
         operation = self.pause_slam_client.call_async(Pause.Request())
         operation.add_done_callback(
             lambda future: self._on_slam_paused_for_map_load(future, base, map_id, generation)
@@ -562,6 +615,169 @@ class CubeyFrontierExplorerNode(Node):
         self._awaiting_loaded_map = True
         self.get_logger().info(f"SLAM graph restored for saved map: {map_id}")
 
+    def _localize_on_saved_map(self, map_id: str) -> None:
+        """Globally localize Cubey against a sealed occupancy map.
+
+        SLAM is deactivated before AMCL is activated so only one component can
+        publish map->odom. AMCL starts with a global particle distribution;
+        Cubey then turns in place to collect a distinctive 360-degree scan.
+        """
+        base = self._saved_occupancy_map_base(map_id)
+        if base is None:
+            self._fail_mission("Saved map is missing its Nav2 occupancy image or metadata.")
+            return
+
+        self.mission_generation += 1
+        self._cancel_active_nav_goal()
+        self.navigation_health.set_mode("localization")
+        self.state = "PREPARING_LOCALIZATION"
+        self.failure_reason = ""
+        self.loaded_map_id = map_id
+        self.pending_map_load = None
+        self.localization_map_base = base
+        self.localization_load_requested = False
+        self.localization_confidence = 0
+        self.localization_good_since = None
+        self.localization_xy_history.clear()
+        self.latest_amcl_time = 0.0
+        self.localization_last_odom_yaw = None
+        self.localization_rotation_rad = 0.0
+        self.trajectory = []
+        self.robot_pose = None
+        self.tf_buffer.clear()
+        self.operation_deadline = time.time()+55.0
+        self._hold_motion()
+        self.get_logger().info(f"Preparing global localization on saved map: {map_id}")
+
+    def _begin_static_map_load(self) -> None:
+        if self.localization_load_requested or self.localization_map_base is None:
+            return
+        if not self.load_static_map_client.service_is_ready():
+            return
+        self.localization_load_requested = True
+        self.state = "LOADING_LOCALIZATION_MAP"
+        request = LoadMap.Request()
+        request.map_url = self.localization_map_base+".yaml"
+        generation = self.mission_generation
+        operation = self.load_static_map_client.call_async(request)
+        operation.add_done_callback(
+            lambda future: self._on_static_map_loaded(future, generation)
+        )
+
+    def _on_static_map_loaded(self, future, generation: int) -> None:
+        if generation != self.mission_generation or self.state != "LOADING_LOCALIZATION_MAP":
+            return
+        try:
+            response = future.result()
+            success = getattr(LoadMap.Response, "RESULT_SUCCESS", 0)
+            if getattr(response, "result", success) != success:
+                raise RuntimeError(f"map server returned result code {response.result}")
+        except Exception as error:
+            self._fail_mission(f"Static map could not be loaded for localization: {error}")
+            return
+        if not self.global_localization_client.service_is_ready():
+            self._fail_mission("AMCL global-localization service is unavailable.")
+            return
+
+        self.latest_map = getattr(response, "map", None) or self.latest_map
+        self.last_map_time = time.time()
+        self.state = "INITIALIZING_GLOBAL_LOCALIZATION"
+        operation = self.global_localization_client.call_async(Empty.Request())
+        operation.add_done_callback(
+            lambda completed: self._on_global_localization_started(completed, generation)
+        )
+
+    def _on_global_localization_started(self, future, generation: int) -> None:
+        if generation != self.mission_generation or self.state != "INITIALIZING_GLOBAL_LOCALIZATION":
+            return
+        try:
+            future.result()
+        except Exception as error:
+            self._fail_mission(f"AMCL global localization could not start: {error}")
+            return
+        self.state = "LOCALIZING_GLOBAL"
+        self.localization_last_odom_yaw = self.odom_pose[2] if self.odom_pose else None
+        self.localization_rotation_rad = 0.0
+        self.localization_good_since = None
+        self.localization_xy_history.clear()
+        self.get_logger().info("AMCL global search started; rotating for a full LiDAR signature")
+
+    def _on_amcl_pose(self, msg: PoseWithCovarianceStamped) -> None:
+        covariance = msg.pose.covariance
+        try:
+            xy_sigma = math.sqrt(max(0.0, float(covariance[0]), float(covariance[7])))
+            yaw_sigma = math.sqrt(max(0.0, float(covariance[35])))
+        except (IndexError, TypeError, ValueError):
+            return
+
+        position = msg.pose.pose.position
+        now = time.time()
+        self.latest_amcl_time = now
+        self.localization_xy_history.append((now, float(position.x), float(position.y)))
+        xy_score = max(0.0, min(1.0, (1.20-xy_sigma)/1.05))
+        yaw_score = max(0.0, min(1.0, (math.radians(55)-yaw_sigma)/math.radians(45)))
+        self.localization_confidence = int(round(100.0*min(xy_score, yaw_score)))
+
+        recent = [sample for sample in self.localization_xy_history if now-sample[0] <= 1.5]
+        stable_xy = False
+        if len(recent) >= 5:
+            xs = [sample[1] for sample in recent]
+            ys = [sample[2] for sample in recent]
+            stable_xy = math.hypot(max(xs)-min(xs), max(ys)-min(ys)) <= 0.12
+        confident = xy_sigma <= 0.30 and yaw_sigma <= math.radians(15) and stable_xy
+        if confident:
+            if self.localization_good_since is None:
+                self.localization_good_since = now
+        else:
+            self.localization_good_since = None
+
+    def _global_localization_tick(self, now: float) -> None:
+        if now > self.operation_deadline:
+            self._fail_mission(
+                "Global localization timed out. Move Cubey to a more distinctive open spot and try again."
+            )
+            return
+        if not self._sensors_ready() or now-self.latest_scan_time > 0.5:
+            self._hold_motion()
+            return
+        if self.nearest_scan_range < 0.22:
+            self._fail_mission(
+                "Localization turn is blocked: Cubey needs at least 22 cm clearance around its LiDAR."
+            )
+            return
+
+        if self.odom_pose is not None:
+            yaw = self.odom_pose[2]
+            if self.localization_last_odom_yaw is not None:
+                delta = (yaw-self.localization_last_odom_yaw+math.pi) % (2.0*math.pi)-math.pi
+                self.localization_rotation_rad += abs(delta)
+            self.localization_last_odom_yaw = yaw
+
+        motion = String()
+        motion.data = json.dumps({
+            "ready": True,
+            "state": self.state,
+            "timestamp": self.get_clock().now().nanoseconds/1e9,
+        })
+        self.pub_motion.publish(motion)
+        turn = Twist()
+        turn.angular.z = 0.22
+        self.pub_stop.publish(turn)
+
+        confidence_stable = (
+            self.localization_good_since is not None
+            and now-self.localization_good_since >= 1.5
+            and now-self.latest_amcl_time <= 0.5
+        )
+        if self.localization_rotation_rad >= math.radians(350) and confidence_stable:
+            self.state = "LOCALIZED"
+            self.failure_reason = ""
+            self.localization_confidence = 100
+            self._hold_motion()
+            self.get_logger().info(
+                f"Global localization converged after {math.degrees(self.localization_rotation_rad):.0f} degrees"
+            )
+
     # ------------------------------------------------------------------
     # Telemetry & Callbacks
     # ------------------------------------------------------------------
@@ -593,9 +809,9 @@ class CubeyFrontierExplorerNode(Node):
         if not self._sensors_ready():
             return self.odom_health.get("reason") or "Waiting for fresh sensor measurements"
         if not self._pose_fresh():
-            return "Waiting for SLAM localization (map → robot transform)"
+            return "Waiting for localization (map → robot transform)"
         if self.latest_map is None or time.time()-self.last_map_time > 5.0:
-            return "Waiting for a fresh SLAM map"
+            return "Waiting for a fresh Nav2 map"
         return self.navigation_health.reason()
 
     def _status_message(self):
@@ -609,8 +825,21 @@ class CubeyFrontierExplorerNode(Node):
             return "Paused: " + (self._readiness_reason() or "checking stability before resuming")
         if self.state == "LOADING_MAP":
             return "Loading saved Nav2 map and waiting for its first fresh publication"
+        if self.state == "PREPARING_MAP_LOAD":
+            return "Switching Nav2 back to the mapping source before loading the saved graph"
         if self.state == "MAP_LOADED":
-            return "Saved map loaded · SLAM scans are paused to protect it"
+            return "Saved map loaded · Place Cubey anywhere on it, then press Localize"
+        if self.state == "PREPARING_LOCALIZATION":
+            return "Preparing saved map for global localization"
+        if self.state == "LOADING_LOCALIZATION_MAP":
+            return "Loading the sealed occupancy map into Nav2"
+        if self.state == "INITIALIZING_GLOBAL_LOCALIZATION":
+            return "Spreading AMCL hypotheses across the entire map"
+        if self.state == "LOCALIZING_GLOBAL":
+            degrees = min(360, int(round(math.degrees(self.localization_rotation_rad))))
+            return f"Localizing · {self.localization_confidence}% confidence · scan turn {degrees}°/360°"
+        if self.state == "LOCALIZED":
+            return "Localized · Cubey's map position and heading are live"
         if self.failure_reason:
             return self.failure_reason
         if self.state == "IDLE":
@@ -638,6 +867,30 @@ class CubeyFrontierExplorerNode(Node):
         self._update_robot_pose_from_tf()
         ready = self._sensors_ready() and self._pose_fresh()
         now = time.time()
+        if self.state == "PREPARING_MAP_LOAD":
+            self._hold_motion()
+            if self.navigation_health.source_ready():
+                self._begin_saved_map_view_load()
+            elif now > self.operation_deadline:
+                self._fail_mission("Timed out while preparing SLAM Toolbox to load the saved map.")
+            self._export_live_pose()
+            return
+        if self.state in (
+            "PREPARING_LOCALIZATION", "LOADING_LOCALIZATION_MAP",
+            "INITIALIZING_GLOBAL_LOCALIZATION", "LOCALIZING_GLOBAL",
+        ):
+            if self.state == "PREPARING_LOCALIZATION":
+                self._hold_motion()
+                if self.navigation_health.source_ready():
+                    self._begin_static_map_load()
+            elif self.state in ("LOADING_LOCALIZATION_MAP", "INITIALIZING_GLOBAL_LOCALIZATION"):
+                self._hold_motion()
+            else:
+                self._global_localization_tick(now)
+            if now > self.operation_deadline and self.state != "ERROR":
+                self._fail_mission("Global localization setup timed out; Cubey remained stopped.")
+            self._export_live_pose()
+            return
         if self.state in ("RECOVERING_LOCALIZATION", "RECOVERING_NAVIGATION"):
             self._recover_localization_tick(ready and now-self.last_map_time <= 5.0 and self._navigation_ready())
             self._export_live_pose()
@@ -814,6 +1067,8 @@ class CubeyFrontierExplorerNode(Node):
                 "nav_state": self.state, "failure_reason": self.failure_reason or (self.odom_health.get("reason", "") if not healthy else ""),
                 "mission_id": self.mission_id, "timestamp": time.time(),
                 "status_message": self._status_message(),
+                "loaded_map_id": self.loaded_map_id,
+                "localization_confidence": self.localization_confidence,
                 "navigation_nodes": self.navigation_health.snapshot(),
                 "navigation_ready": self._navigation_ready()}
         try:
@@ -839,6 +1094,12 @@ class CubeyFrontierExplorerNode(Node):
     def _on_scan(self, msg: LaserScan):
         """Export a scan-time-correct LiDAR snapshot for the web canvas."""
         now = time.time()
+        self.latest_scan_time = now
+        self.nearest_scan_range = min(
+            (float(value) for value in msg.ranges
+             if math.isfinite(float(value)) and max(0.14, msg.range_min) <= value <= msg.range_max),
+            default=float("inf"),
+        )
         if now - self.last_scan_export_time < 0.20:
             return
         self.last_scan_export_time = now
@@ -2145,6 +2406,8 @@ class CubeyFrontierExplorerNode(Node):
             "goal_y": self.current_goal_coord[1] if self.current_goal_coord else None,
             "distance_remaining_m": dist_m, "frontiers_completed": self.total_frontiers_mapped,
             "mission_id": self.mission_id, "failure_reason": self.failure_reason,
+            "loaded_map_id": self.loaded_map_id,
+            "localization_confidence": self.localization_confidence,
             "imu_ok": self.odom_health.get("imu_ok", False),
             "ready": self._localization_ready() and self._navigation_ready(),
             "status_message": self._status_message(), "navigation_nodes": self.navigation_health.snapshot(),

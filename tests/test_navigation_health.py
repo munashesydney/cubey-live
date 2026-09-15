@@ -29,7 +29,7 @@ def harness():
                 future.set_result(NS(current_state=NS(label=states[name])))
             else:
                 calls.append((name, request.transition.id))
-                states[name] = "inactive" if request.transition.id == 1 else "active"
+                states[name] = "inactive" if request.transition.id in (1, 4) else "active"
                 future.set_result(NS(success=True))
             return future
         result.call_async.side_effect = invoke
@@ -54,7 +54,9 @@ def test_cold_start_waits_for_localization_then_activates_every_component():
             clock.return_value = tick
             health.tick()
         assert health.ready()
-        assert [name for name, transition in calls if transition == 3] == list(health.NODES)
+        assert [name for name, transition in calls if transition == 3] == list(health._desired_nodes())
+        assert states["map_server"] == "unconfigured"
+        assert states["amcl"] == "unconfigured"
         clock.return_value = 65
         assert not health.ready()  # A cached active state is not a heartbeat.
 
@@ -62,7 +64,9 @@ def test_cold_start_waits_for_localization_then_activates_every_component():
 def test_inactive_navigator_is_detected_and_reactivated_without_motion():
     module, health, states, calls, localized = harness()
     localized[0] = True
-    states.update({name: "active" for name in states})
+    states.update({name: "active" for name in health._desired_nodes()})
+    states["map_server"] = "unconfigured"
+    states["amcl"] = "unconfigured"
     states["bt_navigator"] = "inactive"
     with patch.object(module.time, "monotonic", return_value=10.):
         health.tick()
@@ -80,6 +84,27 @@ def test_unavailable_services_never_report_ready_or_attempt_activation():
     assert not health.ready()
     assert "unavailable" in health.reason()
     assert calls == []
+
+
+def test_switch_to_global_localization_deactivates_slam_before_amcl():
+    module, health, states, calls, localized = harness()
+    localized[0] = True
+    states.update({name: "active" for name in health._desired_nodes()})
+    states["map_server"] = "unconfigured"
+    states["amcl"] = "unconfigured"
+    health.set_mode("localization")
+    with patch.object(module.time, "monotonic", return_value=10.) as clock:
+        for tick in range(80):
+            clock.return_value = 10+tick
+            health.tick()
+        assert health.source_ready()
+        assert health.ready()
+    assert states["slam_toolbox"] == "inactive"
+    assert states["map_server"] == "active"
+    assert states["amcl"] == "active"
+    slam_off = calls.index(("slam_toolbox", 4))
+    assert slam_off < calls.index(("map_server", 3))
+    assert slam_off < calls.index(("amcl", 3))
 
 
 def test_supervisor_covers_every_launched_lifecycle_node():

@@ -63,6 +63,26 @@ class WebServerApiTests(unittest.TestCase):
         nav_service.load_saved_map.assert_called_once_with("cubey_floorplan_20260914_120000")
         self.assertEqual(response.json().get("status"), "loaded")
 
+    def test_global_localization_uses_native_map_and_navigation_service(self):
+        native_map = MagicMock()
+        native_map.has_image = True
+        native_map.map_id = "cubey_floorplan_20260914_120000"
+        native_map.display_name = "cubey floorplan 20260914 120000"
+        library = MagicMock()
+        library.get.return_value = native_map
+        nav_service = MagicMock()
+        nav_service.localize_saved_map.return_value = True
+        with patch("src.web.routers.api_maps.get_native_map_library", return_value=library), \
+             patch("src.web.routers.api_maps.get_nav_service", return_value=nav_service):
+            response = self.client.post(
+                "/api/maps/cubey_floorplan_20260914_120000/localize", auth=self.auth
+            )
+        self.assertEqual(response.status_code, 200)
+        nav_service.localize_saved_map.assert_called_once_with(
+            "cubey_floorplan_20260914_120000"
+        )
+        self.assertEqual(response.json().get("status"), "localized")
+
     def test_mapping_lifecycle_endpoints(self):
         nav_service = MagicMock()
         nav_service.start_manual_mapping.return_value = True

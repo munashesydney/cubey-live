@@ -52,6 +52,33 @@ async def load_saved_map(map_id: str, _: str = Depends(verify_credentials)):
     }
 
 
+@router.post("/{map_id}/localize")
+async def localize_on_saved_map(map_id: str, _: str = Depends(verify_credentials)):
+    """Globally determine Cubey's pose and heading on a sealed Nav2 map."""
+    native_map = get_native_map_library().get(map_id)
+    if native_map is None:
+        raise HTTPException(status_code=404, detail="Saved Nav2 map not found")
+    if not native_map.has_image:
+        raise HTTPException(
+            status_code=409,
+            detail="Map cannot be localized: its .pgm or .yaml artifact is missing.",
+        )
+
+    nav_svc = get_nav_service()
+    if not await asyncio.to_thread(nav_svc.localize_saved_map, map_id):
+        raise HTTPException(
+            status_code=503,
+            detail=(nav_svc.last_localization_error
+                    or "Cubey could not determine its pose on the saved map."),
+        )
+    return {
+        "status": "localized",
+        "map_id": native_map.map_id,
+        "name": native_map.display_name,
+        "message": "Cubey found its position and heading on the saved map.",
+    }
+
+
 @router.delete("/{map_id}")
 async def delete_saved_map(map_id: str, _: str = Depends(verify_credentials)):
     """Keep deletion out of the web UI until it can atomically remove all artifacts."""

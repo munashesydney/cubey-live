@@ -314,8 +314,13 @@ class CmdVelSerialBridgeNode(Node):
         if not self.motion_ready or time.monotonic()-self.motion_status_time > 0.5:
             return False
         if source == "ros":
-            return self.motion_state in ("EXPLORING", "NAVIGATING", "RETURNING_TO_DOCK", "RECOVERING_STUCK")
-        return self.motion_state in ("IDLE", "MANUAL", "COMPLETED", "COMPLETED_AWAY_FROM_DOCK")
+            return self.motion_state in (
+                "EXPLORING", "NAVIGATING", "RETURNING_TO_DOCK",
+                "RECOVERING_STUCK", "LOCALIZING_GLOBAL",
+            )
+        return self.motion_state in (
+            "IDLE", "MANUAL", "LOCALIZED", "COMPLETED", "COMPLETED_AWAY_FROM_DOCK"
+        )
 
     def _publish_imu(self):
         now = self.get_clock().now().nanoseconds/1e9

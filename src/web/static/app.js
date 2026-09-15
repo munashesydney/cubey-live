@@ -14,6 +14,8 @@
   let isConnected = false;
   let isMapping = false;
   let activeMapName = "Live Floorplan";
+  let loadedMapId = null;
+  let navState = "IDLE";
 
   let robotPose = { x_m: 0.0, y_m: 0.0, theta_deg: 0.0 };
   let homePose = null;
@@ -54,6 +56,8 @@
   const lblPoseText = document.getElementById("lbl-pose-text");
   const btnToggleMapping = document.getElementById("btn-toggle-mapping");
   const btnMappingText = document.getElementById("btn-mapping-text");
+  const btnLocalize = document.getElementById("btn-localize");
+  const btnLocalizeText = document.getElementById("btn-localize-text");
 
   const btnOpenLibrary = document.getElementById("btn-open-library");
   const btnResetMap = document.getElementById("btn-reset-map");
@@ -182,8 +186,15 @@
     }
 
     // Update Header Badges
-    const navState = data.nav_state || "IDLE";
+    navState = data.nav_state || "IDLE";
     const navMode = data.nav_mode || "manual";
+    loadedMapId = data.loaded_map_id ?? loadedMapId;
+    if (["PREPARING", "RESETTING", "EXPLORING"].includes(navState)) loadedMapId = null;
+    const localizationBusy = ["PREPARING_LOCALIZATION", "LOADING_LOCALIZATION_MAP", "INITIALIZING_GLOBAL_LOCALIZATION", "LOCALIZING_GLOBAL"].includes(navState);
+    btnLocalize.disabled = !loadedMapId || localizationBusy;
+    btnLocalizeText.textContent = localizationBusy
+      ? `Localizing ${data.localization_confidence || 0}%`
+      : (navState === "LOCALIZED" ? "Relocalize" : "Localize");
 
     lblActiveMapName.textContent = activeMapName;
     const activeStates = ["PREPARING", "RESETTING", "EXPLORING", "NAVIGATING", "RETURNING_TO_DOCK", "RECOVERING_STUCK", "RECOVERING_LOCALIZATION", "RECOVERING_NAVIGATION", "FINALIZING_MAP"];
@@ -210,6 +221,11 @@
       EXPLORING: "Mapping room", RETURNING_TO_DOCK: "Returning home",
       RECOVERING_STUCK: "Finding a clear route", FINALIZING_MAP: "Saving map",
       RECOVERING_LOCALIZATION: "Paused · Waiting for localization to recover",
+      PREPARING_LOCALIZATION: "Preparing global localization…",
+      LOADING_LOCALIZATION_MAP: "Loading sealed map into Nav2…",
+      INITIALIZING_GLOBAL_LOCALIZATION: "Searching the whole map…",
+      LOCALIZING_GLOBAL: `Localizing · ${data.localization_confidence || 0}%`,
+      LOCALIZED: "Localized · Position and heading live",
       COMPLETED: "Home · Map saved", COMPLETED_AWAY_FROM_DOCK: "Map saved · Could not reach home",
       ERROR: data.failure_reason || "Mapping stopped: check sensors"
     };
@@ -716,6 +732,22 @@
         console.error("Failed to reset SLAM map:", e);
         alert(`Map reset failed: ${e.message}`);
       }
+    }
+  });
+
+  btnLocalize.addEventListener("click", async () => {
+    if (!loadedMapId || btnLocalize.disabled) return;
+    if (!confirm("Place Cubey on the loaded map with at least 22 cm clearance around it. It will slowly rotate once to find its exact position and heading. Continue?")) return;
+    btnLocalize.disabled = true;
+    btnLocalizeText.textContent = "Localizing 0%";
+    try {
+      const response = await fetch(`/api/maps/${encodeURIComponent(loadedMapId)}/localize`, { method: "POST" });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.detail || "Global localization failed");
+    } catch (error) {
+      alert(`Localization failed: ${error.message || error}`);
+    } finally {
+      btnLocalize.disabled = false;
     }
   });
 

@@ -2,6 +2,7 @@
 import json
 import math
 import time
+from collections import deque
 from types import SimpleNamespace as NS
 from unittest.mock import MagicMock, patch
 
@@ -400,6 +401,12 @@ def test_bridge_blocks_stale_supervisor_and_old_autonomous_commands():
     node.motion_state = "RETURNING_TO_DOCK"
     assert node._motion_allowed("ros")
     assert not node._motion_allowed("teleop")
+    node.motion_state = "LOCALIZING_GLOBAL"
+    assert node._motion_allowed("ros")
+    assert not node._motion_allowed("teleop")
+    node.motion_state = "LOCALIZED"
+    assert not node._motion_allowed("ros")
+    assert node._motion_allowed("teleop")
     node.motion_state = "IDLE"
     assert not node._motion_allowed("ros")
     assert node._motion_allowed("teleop")
@@ -817,6 +824,60 @@ def test_acknowledgement_requires_current_mission_id():
     old = {"timestamp": now, "state": "EXPLORING", "mission_id": "previous"}
     with patch.object(service, "_read_ros2_status", return_value=old):
         assert not service._wait_for_ros2_state({"EXPLORING"}, now-1, timeout_s=0.01, mission_id="current")
+
+
+def test_global_localization_command_waits_for_matching_success():
+    service = CubeyNavService()
+    with patch.object(service, "stop_navigation"), \
+         patch.object(service, "is_ros2_ready", return_value=True), \
+         patch("src.services.navigation.cubey_nav_service.uuid.uuid4", return_value="loc-test"), \
+         patch.object(service, "_send_ros2_command", return_value=True) as send, \
+         patch.object(service, "_wait_for_ros2_state", return_value=True) as wait, \
+         patch("src.services.navigation.cubey_nav_service.get_mapping_service"):
+        assert service.localize_saved_map("saved-map")
+    send.assert_called_once_with("localize", mission_id="loc-test", map_id="saved-map")
+    assert wait.call_args.args[0] == {"LOCALIZED"}
+    assert wait.call_args.kwargs["mission_id"] == "loc-test"
+    assert service.telemetry.state == "LOCALIZED"
+
+
+def test_amcl_confidence_requires_low_covariance_and_stable_position():
+    node = mission_node()
+    node.localization_xy_history = deque(maxlen=30)
+    node.localization_good_since = None
+    node.localization_confidence = 0
+    node.latest_amcl_time = 0.0
+    covariance = [0.0] * 36
+    covariance[0] = covariance[7] = 0.04
+    covariance[35] = math.radians(10) ** 2
+    message = NS(
+        pose=NS(
+            covariance=covariance,
+            pose=NS(position=NS(x=1.0, y=2.0)),
+        )
+    )
+    samples = [10.0, 10.3, 10.6, 10.9, 11.2]
+    with patch.object(explorer_module.time, "time", side_effect=samples):
+        for _ in samples:
+            node._on_amcl_pose(message)
+    assert node.localization_confidence >= 80
+    assert node.localization_good_since == pytest.approx(11.2)
+
+    covariance[0] = 4.0
+    with patch.object(explorer_module.time, "time", return_value=11.3):
+        node._on_amcl_pose(message)
+    assert node.localization_good_since is None
+
+
+def test_global_localization_refuses_to_turn_without_clearance():
+    node = mission_node()
+    node.operation_deadline = 100.0
+    node.latest_scan_time = 10.0
+    node.nearest_scan_range = 0.18
+    node._fail_mission = MagicMock()
+    node._global_localization_tick(10.1)
+    node._fail_mission.assert_called_once()
+    assert "clearance" in node._fail_mission.call_args.args[0]
 
 
 def test_ekf_fuses_no_command_or_duplicate_orientation():

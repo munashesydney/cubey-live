@@ -29,6 +29,8 @@ def generate_launch_description():
 
     lifecycle_nodes = [
         "slam_toolbox",
+        "map_server",
+        "amcl",
         "map_saver",
         "controller_server",
         "planner_server",
@@ -138,6 +140,20 @@ def generate_launch_description():
             package="nav2_bt_navigator",
             executable="bt_navigator",
             name="bt_navigator",
+            parameters=[nav2_params_file, {"use_sim_time": use_sim_time}],
+            output="screen",
+        ),
+        Node(
+            package="nav2_map_server",
+            executable="map_server",
+            name="map_server",
+            parameters=[nav2_params_file, {"use_sim_time": use_sim_time}],
+            output="screen",
+        ),
+        Node(
+            package="nav2_amcl",
+            executable="amcl",
+            name="amcl",
             parameters=[nav2_params_file, {"use_sim_time": use_sim_time}],
             output="screen",
         ),
