@@ -543,8 +543,13 @@ class CubeyFrontierExplorerNode(Node):
         if generation != self.mission_generation or self.state != "LOADING_MAP":
             return
         try:
-            if future.result().result != DeserializePoseGraph.Response.RESULT_SUCCESS:
-                raise RuntimeError(f"SLAM Toolbox returned result code {future.result().result}")
+            response = future.result()
+            # Cubey's current Jazzy service response is empty; newer
+            # slam_toolbox releases add a numeric result code. Support both.
+            result = getattr(response, "result", None)
+            success_code = getattr(DeserializePoseGraph.Response, "RESULT_SUCCESS", 0)
+            if result is not None and result != success_code:
+                raise RuntimeError(f"SLAM Toolbox returned result code {result}")
         except Exception as error:
             self._fail_mission(f"Saved map could not be restored: {error}")
             return

@@ -763,6 +763,46 @@ def test_saved_map_schema_error_cannot_crash_navigation_supervisor():
     node.deserialize_client.call_async.assert_not_called()
 
 
+def test_saved_map_load_accepts_cubeys_empty_deserialize_response():
+    node = mission_node()
+    node.state = "LOADING_MAP"
+    node.latest_map = NS(old_map=True)
+    node.loaded_map_id = None
+    node._awaiting_loaded_map = False
+    response_future = MagicMock()
+    response_future.result.return_value = NS()
+
+    with patch.object(
+        explorer_module,
+        "DeserializePoseGraph",
+        NS(Response=NS()),
+        create=True,
+    ):
+        node._on_saved_map_deserialized(response_future, "saved", 7)
+
+    assert node.latest_map is None
+    assert node.loaded_map_id == "saved"
+    assert node._awaiting_loaded_map
+
+
+def test_saved_map_load_rejects_newer_service_failure_code():
+    node = mission_node()
+    node.state = "LOADING_MAP"
+    node._fail_mission = MagicMock()
+    response_future = MagicMock()
+    response_future.result.return_value = NS(result=3)
+
+    with patch.object(
+        explorer_module,
+        "DeserializePoseGraph",
+        NS(Response=NS(RESULT_SUCCESS=0)),
+        create=True,
+    ):
+        node._on_saved_map_deserialized(response_future, "saved", 7)
+
+    node._fail_mission.assert_called_once()
+
+
 def test_pose_export_expires_independently_of_static_map(tmp_path):
     path = tmp_path/"pose.json"
     path.write_text(json.dumps({"timestamp": 100, "pose_fresh": True, "pose": {"theta_deg": 90}, "imu_ok": True}))
